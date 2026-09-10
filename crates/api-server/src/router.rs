@@ -483,6 +483,7 @@ async fn custom_resource_fallback(
                         plural.to_string(),
                         namespace.map(|s| s.to_string()),
                     )),
+                    req.headers().clone(),
                 )
                 .await
                 {
@@ -506,6 +507,7 @@ async fn custom_resource_fallback(
                     namespace.map(|s| s.to_string()),
                     name.to_string(),
                 )),
+                req.headers().clone(),
             )
             .await
             {

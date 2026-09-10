@@ -8,7 +8,8 @@ use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
     body::Bytes,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
     Extension, Json,
 };
 use rusternetes_common::{
@@ -294,6 +295,57 @@ pub async fn create_custom_resource(
     Ok((StatusCode::CREATED, Json(created)))
 }
 
+/// Core "fetch one custom resource, checking authz and applying schema
+/// defaults" logic, shared by the public HTTP handler below and internal
+/// callers (e.g. `get_custom_resource_status`) that want the typed
+/// `CustomResource` directly rather than an HTTP response — those callers
+/// have no `Accept` header to branch on and never want Table format.
+/// Also returns the matched `CustomResourceDefinition`, since callers that
+/// *do* need Table format (the HTTP handler) need it for
+/// `additionalPrinterColumns` without a second lookup.
+async fn fetch_custom_resource(
+    state: &ApiServerState,
+    auth_ctx: AuthContext,
+    group: &str,
+    version: &str,
+    plural: &str,
+    namespace: Option<&str>,
+    name: &str,
+) -> Result<(CustomResource, CustomResourceDefinition)> {
+    let crd_name = format!("{}.{}", plural, group);
+    let crd = get_crd_for_resource(state, &crd_name).await?;
+
+    let attrs = if let Some(ns) = namespace {
+        RequestAttributes::new(auth_ctx.user.clone(), "get", plural)
+            .with_api_group(group)
+            .with_namespace(ns)
+            .with_name(name)
+    } else {
+        RequestAttributes::new(auth_ctx.user, "get", plural)
+            .with_api_group(group)
+            .with_name(name)
+    };
+
+    match state.authorizer.authorize(&attrs).await? {
+        Decision::Allow => {}
+        Decision::Deny(reason) => {
+            return Err(rusternetes_common::Error::Forbidden(reason));
+        }
+    }
+
+    let resource_type = format!("{}_{}", group.replace('.', "_"), plural);
+    let key = if let Some(ns) = namespace {
+        build_key(&resource_type, Some(ns), name)
+    } else {
+        build_key(&resource_type, None, name)
+    };
+
+    let mut cr: CustomResource = state.storage.get(&key).await?;
+    apply_schema_defaults(&crd, version, &mut cr);
+
+    Ok((cr, crd))
+}
+
 /// Get a specific custom resource instance
 pub async fn get_custom_resource(
     State(state): State<Arc<ApiServerState>>,
@@ -305,49 +357,44 @@ pub async fn get_custom_resource(
         Option<String>,
         String,
     )>,
-) -> Result<Json<CustomResource>> {
+    headers: HeaderMap,
+) -> Result<axum::response::Response> {
     info!(
         "Getting custom resource {}/{}/{}: {}",
         group, version, plural, name
     );
 
-    // Find the CRD for this resource type
-    let crd_name = format!("{}.{}", plural, group);
-    let crd = get_crd_for_resource(&state, &crd_name).await?;
+    let (cr, crd) = fetch_custom_resource(
+        &state,
+        auth_ctx,
+        &group,
+        &version,
+        &plural,
+        namespace.as_deref(),
+        &name,
+    )
+    .await?;
 
-    // Check authorization
-    let attrs = if let Some(ref ns) = namespace {
-        RequestAttributes::new(auth_ctx.user.clone(), "get", &plural)
-            .with_api_group(&group)
-            .with_namespace(ns)
-            .with_name(&name)
-    } else {
-        RequestAttributes::new(auth_ctx.user, "get", &plural)
-            .with_api_group(&group)
-            .with_name(&name)
-    };
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
-        }
+    // Table format (kubectl get <cr> <name>) — use the CRD version's own
+    // additionalPrinterColumns when declared, same as list_custom_resources.
+    let accept = headers.get("accept").and_then(|v| v.to_str().ok());
+    if crate::handlers::table::wants_table(accept) {
+        let columns = crd
+            .spec
+            .versions
+            .iter()
+            .find(|v| v.name == version)
+            .and_then(|v| v.additional_printer_columns.as_deref());
+        let table = crate::handlers::table::custom_resource_table(
+            columns,
+            vec![cr],
+            None,
+            &crd.spec.names.kind,
+        );
+        return Ok(Json(table).into_response());
     }
 
-    // Build storage key
-    let resource_type = format!("{}_{}", group.replace('.', "_"), plural);
-    let key = if let Some(ref ns) = namespace {
-        build_key(&resource_type, Some(ns), &name)
-    } else {
-        build_key(&resource_type, None, &name)
-    };
-
-    let mut cr: CustomResource = state.storage.get(&key).await?;
-
-    // Apply schema defaults on read (K8s "defaulting on read")
-    apply_schema_defaults(&crd, &version, &mut cr);
-
-    Ok(Json(cr))
+    Ok(Json(cr).into_response())
 }
 
 /// List custom resource instances
@@ -355,7 +402,8 @@ pub async fn list_custom_resources(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((group, version, plural, namespace)): Path<(String, String, String, Option<String>)>,
-) -> Result<Json<List<CustomResource>>> {
+    headers: HeaderMap,
+) -> Result<axum::response::Response> {
     debug!("Listing custom resources {}/{}/{}", group, version, plural);
 
     // Find the CRD for this resource type
@@ -393,8 +441,37 @@ pub async fn list_custom_resources(
         apply_schema_defaults(&crd, &version, cr);
     }
 
+    // Table format (kubectl get <cr>) — use the CRD version's own
+    // additionalPrinterColumns when declared, instead of always falling
+    // back to a generic NAME+AGE view. Previously never checked at all:
+    // kubectl always requests Table format, and getting a plain JSON List
+    // back instead means kubectl falls back to its own client-side
+    // default columns, never showing a CRD author's declared columns —
+    // found live wanting to see CNPG's Cluster status/instances columns
+    // on `kubectl get cluster.postgresql.cnpg.io`.
+    let accept = headers.get("accept").and_then(|v| v.to_str().ok());
+    if crate::handlers::table::wants_table(accept) {
+        let columns = crd
+            .spec
+            .versions
+            .iter()
+            .find(|v| v.name == version)
+            .and_then(|v| v.additional_printer_columns.as_deref());
+        let resource_version = match state.storage.current_revision().await {
+            Ok(rev) => Some(rev.to_string()),
+            Err(_) => None,
+        };
+        let table = crate::handlers::table::custom_resource_table(
+            columns,
+            crs,
+            resource_version,
+            &crd.spec.names.kind,
+        );
+        return Ok(Json(table).into_response());
+    }
+
     let list = List::new("List", "v1", crs);
-    Ok(Json(list))
+    Ok(Json(list).into_response())
 }
 
 /// Update a custom resource instance
@@ -1590,13 +1667,16 @@ pub async fn get_custom_resource_status(
     );
 
     // Get the full resource first
-    let cr: CustomResource = get_custom_resource(
-        State(state.clone()),
-        Extension(auth_ctx),
-        Path((group, version, plural, namespace, name)),
+    let (cr, _crd) = fetch_custom_resource(
+        &state,
+        auth_ctx,
+        &group,
+        &version,
+        &plural,
+        namespace.as_deref(),
+        &name,
     )
-    .await?
-    .0;
+    .await?;
 
     // Extract and return just the status field
     let status = cr.status.unwrap_or(serde_json::Value::Null);

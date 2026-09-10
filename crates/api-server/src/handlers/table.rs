@@ -275,6 +275,134 @@ fn format_age(metadata: &ObjectMeta) -> String {
     }
 }
 
+/// Build a `Table` for a list of custom resources, using the CRD version's
+/// own `additionalPrinterColumns` when declared — mirrors real Kubernetes'
+/// `kubectl get <cr>` behavior, where a CRD author's declared columns fully
+/// replace the generic NAME+AGE view (no automatic AGE column is added; a
+/// CRD wanting one declares it explicitly, e.g. pointing at
+/// `.metadata.creationTimestamp` with `type: date` — which is exactly what
+/// most real-world CRDs, including CNPG's, do). Falls back to
+/// [`generic_table`]'s plain NAME+AGE view when no columns are declared,
+/// matching a CRD with no `additionalPrinterColumns` at all.
+pub fn custom_resource_table(
+    columns: Option<&[rusternetes_common::resources::CustomResourceColumnDefinition]>,
+    resources: Vec<rusternetes_common::resources::CustomResource>,
+    resource_version: Option<String>,
+    resource_kind: &str,
+) -> Table {
+    let Some(columns) = columns.filter(|c| !c.is_empty()) else {
+        return generic_table(resources, resource_version, resource_kind);
+    };
+
+    let mut table = Table::new().add_column(
+        "NAME",
+        "string",
+        "name",
+        &format!(
+            "Name must be unique within a namespace for {}",
+            resource_kind
+        ),
+        0,
+    );
+    for col in columns {
+        table = table.add_column(
+            &col.name,
+            &col.type_,
+            col.format.as_deref().unwrap_or(""),
+            col.description.as_deref().unwrap_or(""),
+            col.priority.unwrap_or(0),
+        );
+    }
+
+    for resource in resources {
+        let metadata = resource.metadata.clone();
+        let object = serde_json::to_value(&resource).ok();
+        let mut cells = vec![serde_json::Value::String(metadata.name.clone())];
+        for col in columns {
+            let value = object
+                .as_ref()
+                .and_then(|v| resolve_json_path(v, &col.json_path))
+                .unwrap_or(serde_json::Value::Null);
+            let cell = if col.type_ == "date" {
+                match value.as_str() {
+                    Some(_) => serde_json::Value::String(format_age(&metadata)),
+                    None => serde_json::Value::String("<unknown>".to_string()),
+                }
+            } else {
+                value
+            };
+            cells.push(cell);
+        }
+        table = table.add_row(cells, object);
+    }
+
+    table.with_metadata(resource_version, None, None)
+}
+
+/// Resolve Kubernetes' restricted JSONPath subset used by
+/// `additionalPrinterColumns.jsonPath` (and `kubectl get -o
+/// jsonpath=...`'s single-path form) — dot-separated field names, with an
+/// optional `[<index>]` or `['<key>']`/`[<key>]` suffix per segment. Not
+/// full JSONPath (no wildcards, filters, or recursive descent) — real
+/// Kubernetes' own implementation is this same restricted subset.
+/// `path` is expected to start with `.` (e.g. `.status.phase`); `.` alone
+/// (or an empty string) resolves to the root value.
+fn resolve_json_path(root: &serde_json::Value, path: &str) -> Option<serde_json::Value> {
+    let path = path.trim();
+    if path.is_empty() || path == "." {
+        return Some(root.clone());
+    }
+    let path = path.strip_prefix('.').unwrap_or(path);
+
+    let mut current = root.clone();
+    for raw_segment in path.split('.') {
+        if raw_segment.is_empty() {
+            continue;
+        }
+        let (field, indices) = split_segment(raw_segment);
+        if !field.is_empty() {
+            current = current.as_object()?.get(field)?.clone();
+        }
+        for index in indices {
+            current = match index {
+                BracketIndex::Numeric(i) => current.as_array()?.get(i)?.clone(),
+                BracketIndex::Key(k) => current.as_object()?.get(&k)?.clone(),
+            };
+        }
+    }
+    Some(current)
+}
+
+enum BracketIndex {
+    Numeric(usize),
+    Key(String),
+}
+
+/// Splits `foo[0]['bar'][2]` into (`"foo"`, `[Numeric(0), Key("bar"),
+/// Numeric(2)]`) — a segment with no brackets returns an empty index list.
+fn split_segment(segment: &str) -> (&str, Vec<BracketIndex>) {
+    let Some(bracket_start) = segment.find('[') else {
+        return (segment, Vec::new());
+    };
+    let field = &segment[..bracket_start];
+    let mut indices = Vec::new();
+    let mut rest = &segment[bracket_start..];
+    while let Some(stripped) = rest.strip_prefix('[') {
+        let Some(end) = stripped.find(']') else {
+            break;
+        };
+        let inner = &stripped[..end];
+        let key = inner.trim_matches(|c| c == '\'' || c == '"');
+        if let Ok(i) = key.parse::<usize>() {
+            indices.push(BracketIndex::Numeric(i));
+        } else {
+            indices.push(BracketIndex::Key(key.to_string()));
+        }
+        rest = &stripped[end + 1..];
+    }
+    (field, indices)
+}
+
 /// Check if the request wants table format
 pub fn wants_table(accept_header: Option<&str>) -> bool {
     if let Some(accept) = accept_header {
@@ -293,6 +421,12 @@ impl HasMetadata for rusternetes_common::resources::Pod {
 }
 
 impl HasMetadata for rusternetes_common::resources::Deployment {
+    fn metadata(&self) -> &ObjectMeta {
+        &self.metadata
+    }
+}
+
+impl HasMetadata for rusternetes_common::resources::CustomResource {
     fn metadata(&self) -> &ObjectMeta {
         &self.metadata
     }
@@ -389,5 +523,141 @@ mod tests {
         assert!(wants_table(Some("application/json;as=Table;v=v1")));
         assert!(!wants_table(Some("application/json")));
         assert!(!wants_table(None));
+    }
+
+    #[test]
+    fn resolve_json_path_reads_a_simple_nested_field() {
+        let v = serde_json::json!({"status": {"phase": "Running"}});
+        assert_eq!(
+            resolve_json_path(&v, ".status.phase"),
+            Some(serde_json::json!("Running"))
+        );
+    }
+
+    #[test]
+    fn resolve_json_path_root_alone_returns_the_whole_value() {
+        let v = serde_json::json!({"a": 1});
+        assert_eq!(resolve_json_path(&v, "."), Some(v.clone()));
+        assert_eq!(resolve_json_path(&v, ""), Some(v));
+    }
+
+    #[test]
+    fn resolve_json_path_returns_none_for_a_missing_field() {
+        let v = serde_json::json!({"status": {}});
+        assert_eq!(resolve_json_path(&v, ".status.phase"), None);
+        assert_eq!(resolve_json_path(&v, ".spec.doesNotExist"), None);
+    }
+
+    #[test]
+    fn resolve_json_path_supports_numeric_array_index() {
+        let v = serde_json::json!({"spec": {"containers": [{"image": "a"}, {"image": "b"}]}});
+        assert_eq!(
+            resolve_json_path(&v, ".spec.containers[1].image"),
+            Some(serde_json::json!("b"))
+        );
+    }
+
+    #[test]
+    fn resolve_json_path_supports_bracketed_map_key() {
+        let v = serde_json::json!({"metadata": {"labels": {"app": "cnpg"}}});
+        assert_eq!(
+            resolve_json_path(&v, ".metadata.labels['app']"),
+            Some(serde_json::json!("cnpg"))
+        );
+        assert_eq!(
+            resolve_json_path(&v, ".metadata.labels[app]"),
+            Some(serde_json::json!("cnpg"))
+        );
+    }
+
+    #[test]
+    fn custom_resource_table_falls_back_to_name_and_age_with_no_columns_declared() {
+        let cr = rusternetes_common::resources::CustomResource {
+            api_version: "stable.example.com/v1".to_string(),
+            kind: "CronTab".to_string(),
+            metadata: ObjectMeta::new("my-crontab"),
+            spec: Some(serde_json::json!({"cronSpec": "* * * * */5"})),
+            status: None,
+            extra: Default::default(),
+        };
+        let table = custom_resource_table(None, vec![cr], None, "CronTab");
+        assert_eq!(
+            table
+                .column_definitions
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["NAME", "AGE"]
+        );
+    }
+
+    #[test]
+    fn custom_resource_table_uses_declared_additional_printer_columns() {
+        let cr = rusternetes_common::resources::CustomResource {
+            api_version: "postgresql.cnpg.io/v1".to_string(),
+            kind: "Cluster".to_string(),
+            metadata: ObjectMeta::new("platform-db-cluster"),
+            spec: Some(serde_json::json!({"instances": 1})),
+            status: Some(serde_json::json!({"phase": "Cluster in healthy state"})),
+            extra: Default::default(),
+        };
+        let columns = vec![
+            rusternetes_common::resources::CustomResourceColumnDefinition {
+                name: "Instances".to_string(),
+                type_: "integer".to_string(),
+                format: None,
+                description: None,
+                priority: None,
+                json_path: ".spec.instances".to_string(),
+            },
+            rusternetes_common::resources::CustomResourceColumnDefinition {
+                name: "Status".to_string(),
+                type_: "string".to_string(),
+                format: None,
+                description: None,
+                priority: None,
+                json_path: ".status.phase".to_string(),
+            },
+        ];
+        let table = custom_resource_table(Some(&columns), vec![cr], None, "Cluster");
+
+        assert_eq!(
+            table
+                .column_definitions
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["NAME", "Instances", "Status"]
+        );
+        assert_eq!(
+            table.rows[0].cells,
+            vec![
+                serde_json::json!("platform-db-cluster"),
+                serde_json::json!(1),
+                serde_json::json!("Cluster in healthy state"),
+            ]
+        );
+    }
+
+    #[test]
+    fn custom_resource_table_renders_null_for_a_missing_column_value() {
+        let cr = rusternetes_common::resources::CustomResource {
+            api_version: "stable.example.com/v1".to_string(),
+            kind: "CronTab".to_string(),
+            metadata: ObjectMeta::new("my-crontab"),
+            spec: Some(serde_json::json!({})),
+            status: None,
+            extra: Default::default(),
+        };
+        let columns = vec![rusternetes_common::resources::CustomResourceColumnDefinition {
+            name: "Schedule".to_string(),
+            type_: "string".to_string(),
+            format: None,
+            description: None,
+            priority: None,
+            json_path: ".spec.cronSpec".to_string(),
+        }];
+        let table = custom_resource_table(Some(&columns), vec![cr], None, "CronTab");
+        assert_eq!(table.rows[0].cells[1], serde_json::Value::Null);
     }
 }
