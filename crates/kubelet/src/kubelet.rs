@@ -146,6 +146,31 @@ fn should_forget_pod_worker(pod_has_deletion_timestamp: bool) -> bool {
     pod_has_deletion_timestamp
 }
 
+/// CrashLoopBackOff delay for a container about to be restarted for the
+/// `restart_count`th time — real Kubernetes' own sequence: 10s, 20s, 40s,
+/// 80s, 160s, 300s (capped at 5 minutes).
+///
+/// `restart_count == 0` (the container's very first restart, not yet
+/// recorded as one) maps to the same 10s base delay as `restart_count ==
+/// 1` — there's no "restart -1" to derive a smaller exponent from. Before
+/// this function existed, the inline expression here computed
+/// `(restart_count as i64 - 1).min(5)` directly: with `restart_count ==
+/// 0` that's `-1`, and `1_i64 << -1` panics ("attempt to shift left with
+/// overflow", checked in a debug build) — a real, reproducible crash.
+/// `all_terminations_already_recorded`'s own fix (this file, just above)
+/// made `restart_count` correctly stay at 0 across many reconciles while
+/// backoff is pending, before the very first real restart happens —
+/// which is exactly the condition this bug needed, and made it a
+/// sustained, every-reconcile panic on every worker thread that reached
+/// this code path, not a one-off. Found live: kubelet crashed overnight,
+/// confirmed via its own log (`thread 'tokio-rt-worker' (...) panicked
+/// at crates/kubelet/src/kubelet.rs:3580:48: attempt to shift left with
+/// overflow`, repeated across five worker threads).
+fn crash_loop_backoff_secs(restart_count: u32) -> i64 {
+    let exponent = (restart_count as i64 - 1).max(0).min(5);
+    std::cmp::min(10 * (1_i64 << exponent), 300)
+}
+
 impl Kubelet {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
@@ -3576,8 +3601,7 @@ impl Kubelet {
 
                         // CrashLoopBackOff: compute backoff delay based on restart count
                         // K8s uses: 10s, 20s, 40s, 80s, 160s, 300s (capped at 5m)
-                        let backoff_secs: i64 =
-                            std::cmp::min(10 * (1_i64 << (current_restart as i64 - 1).min(5)), 300);
+                        let backoff_secs: i64 = crash_loop_backoff_secs(current_restart);
                         // Check if enough time has passed since the container finished
                         let should_restart = container_statuses
                             .as_ref()
@@ -4181,7 +4205,7 @@ impl Kubelet {
 mod tests {
     use super::{
         all_terminations_already_recorded, container_termination_already_recorded,
-        should_forget_pod_worker,
+        crash_loop_backoff_secs, should_forget_pod_worker,
     };
     use rusternetes_common::resources::pod::PodSpec;
     use rusternetes_common::resources::{
@@ -4401,6 +4425,31 @@ mod tests {
         // should ever be reported "already recorded" for an empty list.
         assert!(!all_terminations_already_recorded(None, Some(&[])));
         assert!(!all_terminations_already_recorded(None, None));
+    }
+
+    #[test]
+    fn crash_loop_backoff_secs_does_not_panic_on_a_zero_restart_count() {
+        // The actual regression: restart_count == 0 (the container's very
+        // first restart, not yet recorded) used to compute a negative
+        // shift exponent and panic. Same 10s base delay as restart_count
+        // == 1 — there's no "restart -1" to derive a smaller one from.
+        assert_eq!(crash_loop_backoff_secs(0), 10);
+    }
+
+    #[test]
+    fn crash_loop_backoff_secs_matches_real_kubernetes_sequence() {
+        assert_eq!(crash_loop_backoff_secs(1), 10);
+        assert_eq!(crash_loop_backoff_secs(2), 20);
+        assert_eq!(crash_loop_backoff_secs(3), 40);
+        assert_eq!(crash_loop_backoff_secs(4), 80);
+        assert_eq!(crash_loop_backoff_secs(5), 160);
+        assert_eq!(crash_loop_backoff_secs(6), 300);
+    }
+
+    #[test]
+    fn crash_loop_backoff_secs_caps_at_300_for_a_large_restart_count() {
+        assert_eq!(crash_loop_backoff_secs(100), 300);
+        assert_eq!(crash_loop_backoff_secs(u32::MAX), 300);
     }
 
     #[test]
