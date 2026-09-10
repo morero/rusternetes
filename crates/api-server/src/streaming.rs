@@ -8,6 +8,66 @@ use futures::{SinkExt, StreamExt};
 use rusternetes_common::resources::Pod;
 use tracing::{debug, error, info};
 
+/// A client→server binary WebSocket frame, decoded per the
+/// `v5.channel.k8s.io` (and back-compat `v4`) exec/attach protocol.
+#[derive(Debug, PartialEq, Eq)]
+enum ClientFrame<'a> {
+    /// A data frame: `[<channel>, ...payload]`, non-empty payload.
+    Data(u8, &'a [u8]),
+    /// The CLOSE_STREAM control frame: `[0xFF, <channel>]` — exactly 2
+    /// bytes, first byte `0xFF`. Distinct from an empty-payload data frame
+    /// (`[<channel>]` alone) — client-go sends *this* form, not that one,
+    /// to signal "done writing to this stream" (e.g. local stdin hit EOF).
+    /// Verified against a live client-go v1.34 exec session: closing
+    /// stdin sent exactly `[0xFF, 0]`.
+    CloseStream(u8),
+    /// Anything else: empty frame, or a single byte with no payload.
+    Other,
+}
+
+fn parse_client_frame(data: &[u8]) -> ClientFrame<'_> {
+    if data.len() == 2 && data[0] == 0xFF {
+        ClientFrame::CloseStream(data[1])
+    } else if data.len() > 1 {
+        ClientFrame::Data(data[0], &data[1..])
+    } else {
+        ClientFrame::Other
+    }
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+
+    #[test]
+    fn test_close_stream_control_frame() {
+        assert_eq!(parse_client_frame(&[0xFF, 0]), ClientFrame::CloseStream(0));
+        assert_eq!(parse_client_frame(&[0xFF, 2]), ClientFrame::CloseStream(2));
+    }
+
+    #[test]
+    fn test_data_frame_on_stdin_channel() {
+        assert_eq!(
+            parse_client_frame(&[0, b'h', b'i']),
+            ClientFrame::Data(0, b"hi")
+        );
+    }
+
+    #[test]
+    fn test_two_byte_frame_starting_with_non_ff_is_data_not_close() {
+        // Regression guard: only [0xFF, channel] is a close-stream signal.
+        // A 2-byte data frame (channel + 1 payload byte) must still parse
+        // as Data, not be mistaken for a control frame.
+        assert_eq!(parse_client_frame(&[0, b'x']), ClientFrame::Data(0, b"x"));
+    }
+
+    #[test]
+    fn test_empty_and_single_byte_frames_are_other() {
+        assert_eq!(parse_client_frame(&[]), ClientFrame::Other);
+        assert_eq!(parse_client_frame(&[0]), ClientFrame::Other);
+    }
+}
+
 /// Handle WebSocket exec by proxying to the kubelet
 ///
 /// Implements the Kubernetes `v5.channel.k8s.io` (and back-compat `v4`/`v1`)
@@ -143,19 +203,14 @@ pub async fn handle_ws_exec(
                     }
                     break;
                 }
-                Ok(Message::Binary(data)) if !data.is_empty() => {
-                    let channel = data[0];
-                    let payload = &data[1..];
-                    // Channel 0 is stdin; channels 1-3 are server→client only,
-                    // channel 4 (resize) is accepted but not acted on since
-                    // bollard doesn't expose resize_exec here.
-                    if channel == 0 {
-                        if payload.is_empty() {
-                            // v5 close-stream signal for stdin
-                            if let Some(mut w) = exec_input.take() {
-                                let _ = w.shutdown().await;
-                            }
-                        } else if let Some(w) = exec_input.as_mut() {
+                Ok(Message::Binary(data)) => match parse_client_frame(&data) {
+                    ClientFrame::CloseStream(0) => {
+                        if let Some(mut w) = exec_input.take() {
+                            let _ = w.shutdown().await;
+                        }
+                    }
+                    ClientFrame::Data(0, payload) => {
+                        if let Some(w) = exec_input.as_mut() {
                             if w.write_all(payload).await.is_err() {
                                 let _ = w.shutdown().await;
                                 exec_input = None;
@@ -164,7 +219,13 @@ pub async fn handle_ws_exec(
                             }
                         }
                     }
-                }
+                    // Channels 1-3 are server→client only; channel 4
+                    // (resize) is accepted but not acted on since bollard
+                    // doesn't expose resize_exec here; anything else (or a
+                    // close-stream for a channel other than stdin) needs no
+                    // action from this loop.
+                    _ => {}
+                },
                 _ => {} // ignore text frames, pings, pongs
             }
         }
