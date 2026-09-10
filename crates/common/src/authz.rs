@@ -1,6 +1,8 @@
 use crate::auth::UserInfo;
 use crate::error::Result;
-use crate::resources::rbac::{ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding};
+use crate::resources::rbac::{
+    ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, Subject,
+};
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
@@ -125,6 +127,39 @@ pub trait Authorizer: Send + Sync {
     )>;
 }
 
+/// Does a (Cluster)RoleBinding `subject` resolve to the requesting user?
+///
+/// Real Kubernetes identifies a `ServiceAccount` subject by the synthesized
+/// username `system:serviceaccount:<namespace>:<name>` (the same shape a
+/// service account token's `sub` claim carries) — never by comparing the
+/// subject's own bare `name` field directly against the request's username.
+/// The previous version of this function did exactly that bare comparison,
+/// so a `ServiceAccount`-kind subject could never match a real bound
+/// token's username and every such binding was silently inert.
+///
+/// `default_namespace` is the binding's own namespace (`RoleBinding`s
+/// default an unset `subject.namespace` to it, matching real Kubernetes;
+/// `ClusterRoleBinding`s have none, so callers pass `None` and an unset
+/// `subject.namespace` never matches — a `ServiceAccount` subject on a
+/// `ClusterRoleBinding` must name its namespace explicitly).
+fn subject_matches(
+    subject: &Subject,
+    attrs: &RequestAttributes,
+    default_namespace: Option<&str>,
+) -> bool {
+    match subject.kind.as_str() {
+        "ServiceAccount" => {
+            let Some(ns) = subject.namespace.as_deref().or(default_namespace) else {
+                return false;
+            };
+            attrs.user.username == format!("system:serviceaccount:{ns}:{}", subject.name)
+        }
+        "Group" => attrs.user.groups.contains(&subject.name),
+        // "User" and anything else: compare the plain identity name.
+        _ => subject.name == attrs.user.username,
+    }
+}
+
 /// RBAC Authorizer that uses Role and RoleBinding resources
 pub struct RBACAuthorizer<S: AuthzStorage> {
     storage: Arc<S>,
@@ -204,9 +239,11 @@ impl<S: AuthzStorage> RBACAuthorizer<S> {
         Ok(all_bindings
             .into_iter()
             .filter(|binding| {
-                binding.subjects.iter().any(|subject| {
-                    subject.name == attrs.user.username || attrs.user.groups.contains(&subject.name)
-                })
+                let default_ns = binding.metadata.namespace.as_deref();
+                binding
+                    .subjects
+                    .iter()
+                    .any(|subject| subject_matches(subject, attrs, default_ns))
             })
             .collect())
     }
@@ -221,63 +258,81 @@ impl<S: AuthzStorage> RBACAuthorizer<S> {
         Ok(all_bindings
             .into_iter()
             .filter(|binding| {
-                binding.subjects.iter().any(|subject| {
-                    subject.name == attrs.user.username || attrs.user.groups.contains(&subject.name)
-                })
+                binding
+                    .subjects
+                    .iter()
+                    .any(|subject| subject_matches(subject, attrs, None))
             })
             .collect())
     }
 
     /// Check if policy rules allow the requested action
     fn check_policy_rules(&self, rules: &[PolicyRule], attrs: &RequestAttributes) -> bool {
-        rules.iter().any(|rule| self.rule_allows(rule, attrs))
+        rules.iter().any(|rule| rule_allows(rule, attrs))
+    }
+}
+
+/// Does a single policy rule allow the requested action? A free function
+/// (no storage access needed) so it's directly unit-testable without a
+/// mock `AuthzStorage`.
+fn rule_allows(rule: &PolicyRule, attrs: &RequestAttributes) -> bool {
+    // Check verb
+    if !rule.verbs.contains(&attrs.verb) && !rule.verbs.contains(&"*".to_string()) {
+        return false;
     }
 
-    /// Check if a single policy rule allows the requested action
-    fn rule_allows(&self, rule: &PolicyRule, attrs: &RequestAttributes) -> bool {
-        // Check verb
-        if !rule.verbs.contains(&attrs.verb) && !rule.verbs.contains(&"*".to_string()) {
-            return false;
-        }
-
-        // Handle non-resource requests
-        if attrs.is_non_resource_request {
-            if let Some(ref non_resource_urls) = rule.non_resource_urls {
-                if let Some(ref path) = attrs.path {
-                    // Check if the path matches any of the non-resource URLs
-                    return non_resource_urls
-                        .iter()
-                        .any(|url| url == "*" || url == path || path.starts_with(url));
-                }
+    // Handle non-resource requests
+    if attrs.is_non_resource_request {
+        if let Some(ref non_resource_urls) = rule.non_resource_urls {
+            if let Some(ref path) = attrs.path {
+                // Check if the path matches any of the non-resource URLs
+                return non_resource_urls
+                    .iter()
+                    .any(|url| url == "*" || url == path || path.starts_with(url));
             }
+        }
+        return false;
+    }
+
+    // Check API group
+    if let Some(ref api_groups) = rule.api_groups {
+        if !api_groups.contains(&attrs.api_group) && !api_groups.contains(&"*".to_string()) {
             return false;
         }
+    }
 
-        // Check API group
-        if let Some(ref api_groups) = rule.api_groups {
-            if !api_groups.contains(&attrs.api_group) && !api_groups.contains(&"*".to_string()) {
+    // Check resource. Real Kubernetes RBAC represents a subresource
+    // grant as one combined string ("workflows/status", not resource
+    // "workflows" with an implicit "status" subresource) — a rule
+    // naming "workflows" grants only the main resource, and a
+    // request for its "status" subresource needs its own separate
+    // "workflows/status" rule (matching this project's own RBAC
+    // manifests, which always list `<resource>` and `<resource>/status`
+    // as two distinct rules). Comparing `attrs.resource` alone here
+    // (ignoring `attrs.subresource` entirely) meant a subresource
+    // request could never match a rule written the only way real
+    // Kubernetes RBAC ever writes one, nor could it be scoped
+    // narrower than its parent resource.
+    if let Some(ref resources) = rule.resources {
+        let requested = match &attrs.subresource {
+            Some(sub) => format!("{}/{}", attrs.resource, sub),
+            None => attrs.resource.clone(),
+        };
+        if !resources.contains(&requested) && !resources.contains(&"*".to_string()) {
+            return false;
+        }
+    }
+
+    // Check resource name if specified
+    if let Some(ref name) = attrs.name {
+        if let Some(ref resource_names) = rule.resource_names {
+            if !resource_names.contains(name) && !resource_names.contains(&"*".to_string()) {
                 return false;
             }
         }
-
-        // Check resource
-        if let Some(ref resources) = rule.resources {
-            if !resources.contains(&attrs.resource) && !resources.contains(&"*".to_string()) {
-                return false;
-            }
-        }
-
-        // Check resource name if specified
-        if let Some(ref name) = attrs.name {
-            if let Some(ref resource_names) = rule.resource_names {
-                if !resource_names.contains(name) && !resource_names.contains(&"*".to_string()) {
-                    return false;
-                }
-            }
-        }
-
-        true
     }
+
+    true
 }
 
 #[async_trait]
@@ -821,5 +876,113 @@ mod tests {
         // This would need a mock storage implementation to fully test
         // Just testing the rule matching logic
         assert!(rule.verbs.contains(&attrs.verb));
+    }
+
+    #[test]
+    fn rule_naming_only_the_parent_resource_does_not_grant_its_status_subresource() {
+        let rule = PolicyRule {
+            verbs: vec!["get".to_string(), "update".to_string(), "patch".to_string()],
+            api_groups: Some(vec!["platform.ertia.io".to_string()]),
+            resources: Some(vec!["workflows".to_string()]),
+            resource_names: None,
+            non_resource_urls: None,
+        };
+        let attrs = RequestAttributes::new(user_with_username("u"), "patch", "workflows")
+            .with_api_group("platform.ertia.io")
+            .with_subresource("status");
+        assert!(!rule_allows(&rule, &attrs));
+    }
+
+    #[test]
+    fn rule_naming_the_status_subresource_grants_only_that() {
+        let rule = PolicyRule {
+            verbs: vec!["get".to_string(), "update".to_string(), "patch".to_string()],
+            api_groups: Some(vec!["platform.ertia.io".to_string()]),
+            resources: Some(vec!["workflows/status".to_string()]),
+            resource_names: None,
+            non_resource_urls: None,
+        };
+        let status_attrs = RequestAttributes::new(user_with_username("u"), "patch", "workflows")
+            .with_api_group("platform.ertia.io")
+            .with_subresource("status");
+        assert!(rule_allows(&rule, &status_attrs));
+
+        let main_attrs = RequestAttributes::new(user_with_username("u"), "patch", "workflows")
+            .with_api_group("platform.ertia.io");
+        assert!(!rule_allows(&rule, &main_attrs));
+    }
+
+    fn user_with_username(username: &str) -> UserInfo {
+        UserInfo {
+            username: username.to_string(),
+            uid: "uid".to_string(),
+            groups: vec![],
+            extra: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn service_account_subject_matches_the_synthesized_username() {
+        let subject = Subject {
+            kind: "ServiceAccount".to_string(),
+            name: "bundle-operator".to_string(),
+            namespace: Some("platform-system".to_string()),
+            api_group: None,
+        };
+        let attrs = RequestAttributes::new(
+            user_with_username("system:serviceaccount:platform-system:bundle-operator"),
+            "list",
+            "bundles",
+        );
+        assert!(subject_matches(&subject, &attrs, None));
+    }
+
+    #[test]
+    fn service_account_subject_does_not_match_its_own_bare_name() {
+        // The bug this test guards against: comparing subject.name
+        // directly to the request's username, which is never the bare
+        // name for a real ServiceAccount token (it's always the
+        // system:serviceaccount:<ns>:<name> form) — so every
+        // ServiceAccount-kind binding was previously silently inert.
+        let subject = Subject {
+            kind: "ServiceAccount".to_string(),
+            name: "bundle-operator".to_string(),
+            namespace: Some("platform-system".to_string()),
+            api_group: None,
+        };
+        let attrs =
+            RequestAttributes::new(user_with_username("bundle-operator"), "list", "bundles");
+        assert!(!subject_matches(&subject, &attrs, None));
+    }
+
+    #[test]
+    fn service_account_subject_falls_back_to_the_default_namespace() {
+        let subject = Subject {
+            kind: "ServiceAccount".to_string(),
+            name: "bundle-operator".to_string(),
+            namespace: None,
+            api_group: None,
+        };
+        let attrs = RequestAttributes::new(
+            user_with_username("system:serviceaccount:platform-system:bundle-operator"),
+            "list",
+            "bundles",
+        );
+        assert!(subject_matches(&subject, &attrs, Some("platform-system")));
+        assert!(!subject_matches(&subject, &attrs, None));
+    }
+
+    #[test]
+    fn group_subject_matches_by_membership() {
+        let subject = Subject {
+            kind: "Group".to_string(),
+            name: "system:masters".to_string(),
+            namespace: None,
+            api_group: None,
+        };
+        let mut user = user_with_username("someone");
+        user.groups.push("system:masters".to_string());
+        let attrs = RequestAttributes::new(user, "list", "bundles");
+        assert!(subject_matches(&subject, &attrs, None));
     }
 }
