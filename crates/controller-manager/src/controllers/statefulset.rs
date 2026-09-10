@@ -1096,13 +1096,21 @@ impl<S: Storage + 'static> StatefulSetController<S> {
             }
         }
 
+        let mut pod_spec = template.spec.clone();
+        Self::inject_volume_claim_template_volumes(
+            &mut pod_spec,
+            statefulset,
+            statefulset_name,
+            ordinal,
+        );
+
         let pod = Pod {
             type_meta: rusternetes_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
             },
             metadata,
-            spec: Some(template.spec.clone()),
+            spec: Some(pod_spec),
             status: Some(PodStatus {
                 phase: Some(Phase::Pending),
                 message: None,
@@ -1135,6 +1143,63 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                 Ok(())
             }
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Real, live-confirmed bug this fixes: a pod built straight from the
+    /// StatefulSet's pod template (`template.spec.clone()`, both call
+    /// sites that do this) never got a `spec.volumes` entry for any of
+    /// `volumeClaimTemplates` — correct that the *template* itself
+    /// doesn't declare one (the whole point of `volumeClaimTemplates` is
+    /// a fresh, per-ordinal `PersistentVolumeClaim`, not a fixed one
+    /// baked into the shared template), but nothing then added the
+    /// corresponding `persistentVolumeClaim`-typed volume real
+    /// Kubernetes always synthesizes alongside it. `ensure_pvcs_for_ordinal`
+    /// (above) already computes the exact same PVC name this needs —
+    /// this just needs to also land in the pod's own volume list, or
+    /// kubelet has no volume to find at all for a `volumeMounts` entry
+    /// referencing it. Found live: Bitnami's real Valkey chart's `dir
+    /// /data: No such file or directory` — its PVC was correctly created
+    /// and even correctly bound to a real dynamically-provisioned PV, and
+    /// kubelet's own PVC-volume-resolution code path (which does handle
+    /// this case, once reached) never even ran, because the pod's
+    /// `spec.volumes` had no entry pointing it there in the first place.
+    fn inject_volume_claim_template_volumes(
+        pod_spec: &mut rusternetes_common::resources::PodSpec,
+        statefulset: &StatefulSet,
+        statefulset_name: &str,
+        ordinal: i32,
+    ) {
+        let Some(templates) = &statefulset.spec.volume_claim_templates else {
+            return;
+        };
+        let volumes = pod_spec.volumes.get_or_insert_with(Vec::new);
+        for template in templates {
+            let volume_name = &template.metadata.name;
+            if volumes.iter().any(|v| &v.name == volume_name) {
+                continue; // template author already declared one explicitly
+            }
+            let pvc_name = format!("{}-{}-{}", volume_name, statefulset_name, ordinal);
+            volumes.push(rusternetes_common::resources::pod::Volume {
+                name: volume_name.clone(),
+                empty_dir: None,
+                host_path: None,
+                config_map: None,
+                secret: None,
+                persistent_volume_claim: Some(
+                    rusternetes_common::resources::pod::PersistentVolumeClaimVolumeSource {
+                        claim_name: pvc_name,
+                        read_only: None,
+                    },
+                ),
+                downward_api: None,
+                csi: None,
+                ephemeral: None,
+                nfs: None,
+                iscsi: None,
+                projected: None,
+                image: None,
+            });
         }
     }
 
@@ -1181,13 +1246,21 @@ impl<S: Storage + 'static> StatefulSetController<S> {
             }
         }
 
+        let mut pod_spec = template.spec.clone();
+        Self::inject_volume_claim_template_volumes(
+            &mut pod_spec,
+            statefulset,
+            statefulset_name,
+            ordinal,
+        );
+
         let pod = Pod {
             type_meta: rusternetes_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
             },
             metadata,
-            spec: Some(template.spec.clone()),
+            spec: Some(pod_spec),
             status: Some(PodStatus {
                 phase: Some(Phase::Pending),
                 message: None,
@@ -1532,6 +1605,79 @@ mod tests {
             Some(3),
             "All replicas should be updated"
         );
+    }
+
+    /// Real, live-confirmed bug: a pod created from a StatefulSet with
+    /// `volumeClaimTemplates` never got a `spec.volumes` entry for any of
+    /// them — the PVC itself was created correctly (`ensure_pvcs_for_ordinal`
+    /// already worked), but the pod had nothing pointing at it, so
+    /// kubelet's own PVC-volume-resolution code (which does handle this
+    /// case, once reached) never ran — found live via Bitnami's real
+    /// Valkey chart failing with `dir /data: No such file or directory`
+    /// despite its PVC being correctly bound to a real, dynamically
+    /// provisioned PV.
+    #[tokio::test]
+    async fn pod_created_from_volume_claim_templates_gets_a_matching_volume() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = StatefulSetController::new(storage.clone());
+
+        let ns = "default";
+        let mut ss = make_statefulset("data-app", ns, 1, "valkey:9.1.2");
+        ss.spec.volume_claim_templates = Some(vec![
+            rusternetes_common::resources::volume::PersistentVolumeClaim {
+                type_meta: TypeMeta {
+                    kind: "PersistentVolumeClaim".to_string(),
+                    api_version: "v1".to_string(),
+                },
+                metadata: ObjectMeta::new("data"),
+                spec: rusternetes_common::resources::volume::PersistentVolumeClaimSpec {
+                    access_modes: vec![
+                        rusternetes_common::resources::volume::PersistentVolumeAccessMode::ReadWriteOnce,
+                    ],
+                    resources: rusternetes_common::resources::volume::ResourceRequirements {
+                        limits: None,
+                        requests: Some({
+                            let mut r = HashMap::new();
+                            r.insert("storage".to_string(), "8Gi".to_string());
+                            r
+                        }),
+                    },
+                    volume_name: None,
+                    storage_class_name: None,
+                    volume_mode: None,
+                    selector: None,
+                    data_source: None,
+                    data_source_ref: None,
+                    volume_attributes_class_name: None,
+                },
+                status: None,
+            },
+        ]);
+
+        let key = format!("/registry/statefulsets/{}/{}", ns, "data-app");
+        storage.create(&key, &ss).await.unwrap();
+
+        let mut ss: StatefulSet = storage.get(&key).await.unwrap();
+        controller.reconcile(&mut ss).await.unwrap();
+
+        let pod: Pod = storage
+            .get(&format!("/registry/pods/{}/data-app-0", ns))
+            .await
+            .expect("pod should have been created");
+        let volumes = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.volumes.as_ref())
+            .expect("pod should have a volumes list");
+        let data_volume = volumes
+            .iter()
+            .find(|v| v.name == "data")
+            .expect("pod should have a 'data' volume matching the volumeClaimTemplate");
+        let pvc_source = data_volume
+            .persistent_volume_claim
+            .as_ref()
+            .expect("'data' volume should be a persistentVolumeClaim source");
+        assert_eq!(pvc_source.claim_name, "data-data-app-0");
     }
 
     /// Partition should be respected: only pods with ordinal >= partition are updated.
