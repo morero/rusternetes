@@ -85,9 +85,26 @@ pub struct IptablesManager {
     /// Chain names we create
     services_chain: String,
     nodeports_chain: String,
+    /// Filter-table chain used for service-traffic forwarding rules.
+    /// Defaults to "KUBE-FORWARD" (matches real Kubernetes' own name) —
+    /// unlike the SEP chains (see `sep_prefix`), this chain is only ever
+    /// written into and read, never flushed/reset, so sharing the name
+    /// with a real kube-proxy doesn't carry the same destructive risk. It
+    /// is still made configurable so two rusternetes instances (or a
+    /// deployment that wants to guarantee no sharing at all) can use
+    /// distinct names.
+    forward_chain: String,
+    /// Prefix for this instance's own per-endpoint (SEP) chains — see
+    /// `sep_prefix`/`np_sep_prefix`. Defaults to "RUSTERNETES", i.e.
+    /// "RUSTERNETES-SEP-*"/"RUSTERNETES-NP-SEP-*", chosen specifically to
+    /// never collide with real Kubernetes' "KUBE-SEP-*"/"KUBE-NP-SEP-*"
+    /// (see ISSUES.md #2 in the rinr repo for why that collision mattered).
+    /// Configurable so two rusternetes instances sharing a netns don't
+    /// collide with *each other* either.
+    chain_prefix: String,
     /// The iptables command to use (detected at init)
     iptables_cmd: String,
-    /// Track per-endpoint chains (KUBE-SEP-*) so we can clean them up on flush
+    /// Track per-endpoint chains (see `sep_prefix`) so we can clean them up on flush
     sep_chains: std::sync::Mutex<Vec<String>>,
     /// Whether the xt_recent kernel module is available
     recent_available: bool,
@@ -110,9 +127,19 @@ impl IptablesManager {
     /// session-affinity codepath the test wants to exercise.
     #[cfg(test)]
     pub fn for_testing(recent_available: bool) -> Self {
+        Self::for_testing_with_prefix("RUSTERNETES", recent_available)
+    }
+
+    /// Like [`Self::for_testing`], but with an instance-specific chain
+    /// prefix — for exercising [`Self::new_with_prefix`]'s configurability
+    /// without invoking the real `iptables` binary.
+    #[cfg(test)]
+    pub fn for_testing_with_prefix(prefix: &str, recent_available: bool) -> Self {
         Self {
-            services_chain: "RUSTERNETES-SERVICES".to_string(),
-            nodeports_chain: "RUSTERNETES-NODEPORTS".to_string(),
+            services_chain: format!("{}-SERVICES", prefix),
+            nodeports_chain: format!("{}-NODEPORTS", prefix),
+            forward_chain: "KUBE-FORWARD".to_string(),
+            chain_prefix: prefix.to_string(),
             iptables_cmd: "/usr/sbin/iptables".to_string(),
             sep_chains: std::sync::Mutex::new(Vec::new()),
             recent_available,
@@ -121,7 +148,28 @@ impl IptablesManager {
         }
     }
 
+    /// Prefix for this instance's per-endpoint chains, e.g. "RUSTERNETES-SEP-".
+    fn sep_prefix(&self) -> String {
+        format!("{}-SEP-", self.chain_prefix)
+    }
+
+    /// Prefix for this instance's per-NodePort-endpoint chains, e.g. "RUSTERNETES-NP-SEP-".
+    fn np_sep_prefix(&self) -> String {
+        format!("{}-NP-SEP-", self.chain_prefix)
+    }
+
     pub fn new() -> Self {
+        Self::new_with_prefix("RUSTERNETES")
+    }
+
+    /// Construct an IptablesManager whose services/nodeports/per-endpoint
+    /// chain names are all derived from `prefix` instead of the default
+    /// "RUSTERNETES" — so two instances configured with distinct prefixes
+    /// can run in the same network namespace without their chain
+    /// reset/populate cycles affecting each other. `forward_chain` is not
+    /// derived from `prefix` (it stays "KUBE-FORWARD" either way) since
+    /// nothing here flushes/resets it — see `forward_chain`'s doc comment.
+    pub fn new_with_prefix(prefix: &str) -> Self {
         let iptables_cmd = detect_iptables_cmd().to_string();
         let bridge_network = detect_bridge_network();
         // Probe whether the xt_recent module is available by trying a dummy check rule.
@@ -160,8 +208,10 @@ impl IptablesManager {
             None => (None, None),
         };
         Self {
-            services_chain: "RUSTERNETES-SERVICES".to_string(),
-            nodeports_chain: "RUSTERNETES-NODEPORTS".to_string(),
+            services_chain: format!("{}-SERVICES", prefix),
+            nodeports_chain: format!("{}-NODEPORTS", prefix),
+            forward_chain: "KUBE-FORWARD".to_string(),
+            chain_prefix: prefix.to_string(),
             iptables_cmd,
             sep_chains: std::sync::Mutex::new(Vec::new()),
             recent_available,
@@ -406,7 +456,7 @@ impl IptablesManager {
         // be dropped by the default FORWARD policy.
         // See: pkg/proxy/iptables/proxier.go — KUBE-FORWARD chain
         {
-            let forward_chain = "KUBE-FORWARD";
+            let forward_chain = self.forward_chain.as_str();
             self.ensure_chain("filter", forward_chain)?;
             self.ensure_jump_rule(
                 "filter",
@@ -595,11 +645,11 @@ impl IptablesManager {
         // Without these, Docker's default FORWARD policy (DROP) blocks all DNATed traffic,
         // making services unreachable from other containers on the bridge network.
         // K8s ref: pkg/proxy/iptables/proxier.go:384,1452-1466
-        self.ensure_chain("filter", "KUBE-FORWARD")?;
+        self.ensure_chain("filter", self.forward_chain.as_str())?;
         self.ensure_jump_rule(
             "filter",
             "FORWARD",
-            "KUBE-FORWARD",
+            self.forward_chain.as_str(),
             "kubernetes forwarding rules",
         )?;
 
@@ -611,7 +661,7 @@ impl IptablesManager {
                 "-t",
                 "filter",
                 "-C",
-                "KUBE-FORWARD",
+                self.forward_chain.as_str(),
                 "-m",
                 "conntrack",
                 "--ctstate",
@@ -627,7 +677,7 @@ impl IptablesManager {
                             "-t",
                             "filter",
                             "-A",
-                            "KUBE-FORWARD",
+                            self.forward_chain.as_str(),
                             "-m",
                             "comment",
                             "--comment",
@@ -651,7 +701,7 @@ impl IptablesManager {
                 "-t",
                 "filter",
                 "-C",
-                "KUBE-FORWARD",
+                self.forward_chain.as_str(),
                 "-m",
                 "comment",
                 "--comment",
@@ -667,7 +717,7 @@ impl IptablesManager {
                             "-t",
                             "filter",
                             "-A",
-                            "KUBE-FORWARD",
+                            self.forward_chain.as_str(),
                             "-m",
                             "comment",
                             "--comment",
@@ -685,7 +735,7 @@ impl IptablesManager {
         self.ensure_jump_rule(
             "filter",
             "OUTPUT",
-            "KUBE-FORWARD",
+            self.forward_chain.as_str(),
             "kubernetes forwarding rules",
         )?;
 
@@ -803,26 +853,37 @@ impl IptablesManager {
             debug!("Cleaned up SEP chain {}", chain);
         }
 
-        // Also clean up any leftover KUBE-SEP / KUBE-NP-SEP chains that might
-        // exist from a previous run (e.g., after a crash or restart).
+        // Also clean up any leftover RUSTERNETES-SEP / RUSTERNETES-NP-SEP
+        // chains that might exist from a previous run (e.g., after a crash
+        // or restart). This intentionally does NOT match "KUBE-SEP-"/
+        // "KUBE-NP-SEP-" (real Kubernetes' own per-endpoint chain naming) —
+        // this used to share that exact prefix, which meant this cleanup
+        // would strip a real kube-proxy's endpoint chains on any host also
+        // running one. See openspec/changes/rinr-nested-cluster (this repo)
+        // and ISSUES.md #2.
         if let Ok(output) = Command::new(&self.iptables_cmd)
             .args(["-t", "nat", "-L", "-n"])
             .output()
         {
             let stdout = String::from_utf8_lossy(&output.stdout);
+            let sep_prefix = self.sep_prefix();
+            let np_sep_prefix = self.np_sep_prefix();
             for line in stdout.lines() {
+                let chain_line_prefix = format!("Chain {}", sep_prefix);
+                let np_chain_line_prefix = format!("Chain {}", np_sep_prefix);
                 if let Some(rest) = line
-                    .strip_prefix("Chain KUBE-SEP-")
-                    .or_else(|| line.strip_prefix("Chain KUBE-NP-SEP-"))
+                    .strip_prefix(chain_line_prefix.as_str())
+                    .or_else(|| line.strip_prefix(np_chain_line_prefix.as_str()))
                 {
-                    // Extract chain name: "Chain KUBE-SEP-xxx (N references)"
-                    let full_line = if line.starts_with("Chain KUBE-NP-SEP-") {
+                    // Extract chain name: "Chain <prefix>xxx (N references)"
+                    let full_line = if line.starts_with(np_chain_line_prefix.as_str()) {
                         format!(
-                            "KUBE-NP-SEP-{}",
+                            "{}{}",
+                            np_sep_prefix,
                             rest.split_whitespace().next().unwrap_or("")
                         )
                     } else {
-                        format!("KUBE-SEP-{}", rest.split_whitespace().next().unwrap_or(""))
+                        format!("{}{}", sep_prefix, rest.split_whitespace().next().unwrap_or(""))
                     };
                     let _ = Command::new(&self.iptables_cmd)
                         .args(["-t", "nat", "-F", full_line.as_str()])
@@ -887,7 +948,7 @@ impl IptablesManager {
     ///
     /// Session affinity implementation:
     /// - When `recent_available` is true, uses xt_recent module to track client IPs.
-    ///   Each endpoint gets a per-endpoint chain (KUBE-SEP-*) with two separate rules:
+    ///   Each endpoint gets a per-endpoint chain (RUSTERNETES-SEP-*) with two separate rules:
     ///     1. `recent --set` to mark the source IP (always matches, does NOT terminate)
     ///     2. `DNAT` to redirect traffic (terminates)
     ///        The main chain has recent-check rules first (sticky routing), then
@@ -935,7 +996,7 @@ impl IptablesManager {
             let timeout_str = affinity_timeout.to_string();
             for (idx, (endpoint_ip, endpoint_port)) in endpoints.iter().enumerate() {
                 let sep_chain =
-                    format!("KUBE-SEP-{}-{}-{}", service_ip.replace('.', ""), port, idx);
+                    format!("{}{}-{}-{}", self.sep_prefix(), service_ip.replace('.', ""), port, idx);
                 let recent_name =
                     format!("AFFINITY-{}-{}-{}", service_ip.replace('.', ""), port, idx);
                 let dnat_target = format!("{}:{}", endpoint_ip, endpoint_port);
@@ -1005,7 +1066,7 @@ impl IptablesManager {
             for (idx, _) in endpoints.iter().enumerate() {
                 let is_last = idx == n - 1;
                 let sep_chain =
-                    format!("KUBE-SEP-{}-{}-{}", service_ip.replace('.', ""), port, idx);
+                    format!("{}{}-{}-{}", self.sep_prefix(), service_ip.replace('.', ""), port, idx);
                 let mut args = vec![
                     "-t",
                     "nat",
@@ -1102,7 +1163,7 @@ impl IptablesManager {
     /// Add rules for a NodePort service.
     ///
     /// Supports session affinity using the same xt_recent approach as ClusterIP rules.
-    /// Each endpoint gets a per-endpoint chain (KUBE-NP-SEP-*) with recent-set + DNAT.
+    /// Each endpoint gets a per-endpoint chain (RUSTERNETES-NP-SEP-*) with recent-set + DNAT.
     pub fn add_nodeport_rules(
         &self,
         node_port: u16,
@@ -1132,7 +1193,7 @@ impl IptablesManager {
             // Combine --set + DNAT so --set only fires for matching packets.
             let timeout_str = affinity_timeout.to_string();
             for (idx, (endpoint_ip, endpoint_port)) in endpoints.iter().enumerate() {
-                let sep_chain = format!("KUBE-NP-SEP-{}-{}", node_port, idx);
+                let sep_chain = format!("{}{}-{}", self.np_sep_prefix(), node_port, idx);
                 let recent_name = format!("NP-AFFINITY-{}-{}", node_port, idx);
                 let dnat_target = format!("{}:{}", endpoint_ip, endpoint_port);
 
@@ -1196,7 +1257,7 @@ impl IptablesManager {
             let node_port_str = node_port.to_string();
             for (idx, _) in endpoints.iter().enumerate() {
                 let is_last = idx == n - 1;
-                let sep_chain = format!("KUBE-NP-SEP-{}-{}", node_port, idx);
+                let sep_chain = format!("{}{}-{}", self.np_sep_prefix(), node_port, idx);
                 let mut args = vec![
                     "-t",
                     "nat",
@@ -1449,7 +1510,7 @@ impl IptablesManager {
                     // fires for packets that actually DNAT (correct protocol).
                     for (idx, (endpoint_ip, endpoint_port)) in endpoints.iter().enumerate() {
                         let sep_chain =
-                            format!("KUBE-SEP-{}-{}-{}", cluster_ip.replace('.', ""), port, idx);
+                            format!("{}{}-{}-{}", self.sep_prefix(), cluster_ip.replace('.', ""), port, idx);
                         let recent_name =
                             format!("AFFINITY-{}-{}-{}", cluster_ip.replace('.', ""), port, idx);
                         let dnat_target = format!("{}:{}", endpoint_ip, endpoint_port);
@@ -1477,7 +1538,7 @@ impl IptablesManager {
                     for (idx, (_endpoint_ip, _endpoint_port)) in endpoints.iter().enumerate() {
                         let is_last = idx == n - 1;
                         let sep_chain =
-                            format!("KUBE-SEP-{}-{}-{}", cluster_ip.replace('.', ""), port, idx);
+                            format!("{}{}-{}-{}", self.sep_prefix(), cluster_ip.replace('.', ""), port, idx);
 
                         let mut rule = format!(
                             "-A {} -d {}/32 -p {} --dport {}",
@@ -1524,7 +1585,7 @@ impl IptablesManager {
         }
 
         // NodePort rules — add DNAT rules to RUSTERNETES-NODEPORTS chain.
-        // Session affinity for NodePort reuses the same KUBE-SEP-* chains and
+        // Session affinity for NodePort reuses the same RUSTERNETES-SEP-* chains and
         // AFFINITY-* recent names created by the ClusterIP section above.
         // This matches K8s behavior where NodePort traffic goes through the same
         // KUBE-SVC chain and thus shares affinity state with ClusterIP traffic.
@@ -1591,14 +1652,14 @@ impl IptablesManager {
 
                 if session_affinity && self.recent_available {
                     // Session affinity for NodePort: reuse the same SEP chains and
-                    // recent names as ClusterIP. The SEP chains (KUBE-SEP-*) were
+                    // recent names as ClusterIP. The SEP chains (RUSTERNETES-SEP-*) were
                     // already defined in the ClusterIP section above and contain
                     // the --set + DNAT rules. We just need --rcheck rules and
                     // probability fallback rules in the nodeports chain.
                     let timeout_str = affinity_timeout.to_string();
                     for (idx, _) in endpoints.iter().enumerate() {
                         let sep_chain =
-                            format!("KUBE-SEP-{}-{}-{}", cluster_ip.replace('.', ""), port, idx);
+                            format!("{}{}-{}-{}", self.sep_prefix(), cluster_ip.replace('.', ""), port, idx);
                         let recent_name =
                             format!("AFFINITY-{}-{}-{}", cluster_ip.replace('.', ""), port, idx);
 
@@ -1614,7 +1675,7 @@ impl IptablesManager {
                     for (idx, _) in endpoints.iter().enumerate() {
                         let is_last = idx == n - 1;
                         let sep_chain =
-                            format!("KUBE-SEP-{}-{}-{}", cluster_ip.replace('.', ""), port, idx);
+                            format!("{}{}-{}-{}", self.sep_prefix(), cluster_ip.replace('.', ""), port, idx);
 
                         let mut rule = format!(
                             "-A {} -p {} --dport {}",
@@ -1833,16 +1894,16 @@ mod tests {
         let chains: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
         {
             let mut guard = chains.lock().unwrap();
-            guard.push("KUBE-SEP-10960001-80-0".to_string());
-            guard.push("KUBE-SEP-10960001-80-1".to_string());
+            guard.push("RUSTERNETES-SEP-10960001-80-0".to_string());
+            guard.push("RUSTERNETES-SEP-10960001-80-1".to_string());
         }
         let taken = {
             let mut guard = chains.lock().unwrap();
             std::mem::take(&mut *guard)
         };
         assert_eq!(taken.len(), 2);
-        assert_eq!(taken[0], "KUBE-SEP-10960001-80-0");
-        assert_eq!(taken[1], "KUBE-SEP-10960001-80-1");
+        assert_eq!(taken[0], "RUSTERNETES-SEP-10960001-80-0");
+        assert_eq!(taken[1], "RUSTERNETES-SEP-10960001-80-1");
 
         // After take, the vec should be empty
         let guard = chains.lock().unwrap();
@@ -1855,13 +1916,65 @@ mod tests {
         let service_ip = "10.96.0.1";
         let port: u16 = 80;
         let idx = 0;
-        let chain = format!("KUBE-SEP-{}-{}-{}", service_ip.replace('.', ""), port, idx);
-        assert_eq!(chain, "KUBE-SEP-109601-80-0");
+        let chain = format!("RUSTERNETES-SEP-{}-{}-{}", service_ip.replace('.', ""), port, idx);
+        assert_eq!(chain, "RUSTERNETES-SEP-109601-80-0");
 
         // Verify chain name format for NodePort
         let node_port: u16 = 30080;
-        let np_chain = format!("KUBE-NP-SEP-{}-{}", node_port, idx);
-        assert_eq!(np_chain, "KUBE-NP-SEP-30080-0");
+        let np_chain = format!("RUSTERNETES-NP-SEP-{}-{}", node_port, idx);
+        assert_eq!(np_chain, "RUSTERNETES-NP-SEP-30080-0");
+    }
+
+    /// Regression guard for ISSUES.md #2 / rinr-nested-cluster's
+    /// `kube-proxy-chain-isolation` capability: rusternetes' own per-endpoint
+    /// chain names must never collide with real Kubernetes' "KUBE-SEP-"/
+    /// "KUBE-NP-SEP-" naming, since flush_rules() matches on this exact
+    /// prefix to clean up its own leftover chains — if it ever matched the
+    /// real Kubernetes prefix again, that cleanup would strip a real
+    /// kube-proxy's endpoint chains on any host also running one.
+    #[test]
+    fn test_sep_chain_names_do_not_collide_with_real_kubernetes() {
+        let service_ip = "10.96.0.1";
+        let chain = format!("RUSTERNETES-SEP-{}-{}-{}", service_ip.replace('.', ""), 80, 0);
+        let np_chain = format!("RUSTERNETES-NP-SEP-{}-{}", 30080, 0);
+
+        assert!(!chain.starts_with("KUBE-SEP-"));
+        assert!(!chain.starts_with("KUBE-NP-SEP-"));
+        assert!(!np_chain.starts_with("KUBE-SEP-"));
+        assert!(!np_chain.starts_with("KUBE-NP-SEP-"));
+    }
+
+    // rinr-nested-cluster task 3.2/3.4: two instances configured with
+    // distinct chain-name prefixes must produce fully distinct chain sets
+    // (services, nodeports, and per-endpoint SEP prefixes) — so their sync
+    // loops can share a network namespace without one's chain reset/populate
+    // cycle touching the other's chains.
+    #[test]
+    fn test_distinct_prefixes_produce_fully_distinct_chain_names() {
+        let a = IptablesManager::for_testing_with_prefix("CLUSTER-A", false);
+        let b = IptablesManager::for_testing_with_prefix("CLUSTER-B", false);
+
+        assert_ne!(a.services_chain, b.services_chain);
+        assert_ne!(a.nodeports_chain, b.nodeports_chain);
+        assert_ne!(a.sep_prefix(), b.sep_prefix());
+        assert_ne!(a.np_sep_prefix(), b.np_sep_prefix());
+
+        assert_eq!(a.services_chain, "CLUSTER-A-SERVICES");
+        assert_eq!(a.nodeports_chain, "CLUSTER-A-NODEPORTS");
+        assert_eq!(a.sep_prefix(), "CLUSTER-A-SEP-");
+        assert_eq!(a.np_sep_prefix(), "CLUSTER-A-NP-SEP-");
+    }
+
+    // rinr-nested-cluster task 3.3: default (unconfigured) behavior must
+    // still produce the original chain names, unchanged.
+    #[test]
+    fn test_default_prefix_matches_original_chain_names() {
+        let default = IptablesManager::for_testing(false);
+        assert_eq!(default.services_chain, "RUSTERNETES-SERVICES");
+        assert_eq!(default.nodeports_chain, "RUSTERNETES-NODEPORTS");
+        assert_eq!(default.sep_prefix(), "RUSTERNETES-SEP-");
+        assert_eq!(default.np_sep_prefix(), "RUSTERNETES-NP-SEP-");
+        assert_eq!(default.forward_chain, "KUBE-FORWARD");
     }
 
     use super::IptablesManager;
@@ -1956,12 +2069,12 @@ mod tests {
         let rules = mgr.build_nat_rules(&[service], &ep_map).await;
 
         assert!(
-            rules.contains(":KUBE-SEP-109605-80-0 - [0:0]"),
+            rules.contains(":RUSTERNETES-SEP-109605-80-0 - [0:0]"),
             "missing SEP chain 0 declaration:\n{}",
             rules
         );
         assert!(
-            rules.contains(":KUBE-SEP-109605-80-1 - [0:0]"),
+            rules.contains(":RUSTERNETES-SEP-109605-80-1 - [0:0]"),
             "missing SEP chain 1 declaration:\n{}",
             rules
         );
@@ -1969,7 +2082,7 @@ mod tests {
         // --rcheck rules in services chain with custom timeout
         assert!(
             rules.contains(
-                "-A RUSTERNETES-SERVICES -d 10.96.0.5/32 -p tcp --dport 80 -m recent --name AFFINITY-109605-80-0 --rcheck --seconds 7200 --reap -j KUBE-SEP-109605-80-0"
+                "-A RUSTERNETES-SERVICES -d 10.96.0.5/32 -p tcp --dport 80 -m recent --name AFFINITY-109605-80-0 --rcheck --seconds 7200 --reap -j RUSTERNETES-SEP-109605-80-0"
             ),
             "missing --rcheck rule for endpoint 0:\n{}",
             rules
@@ -1983,14 +2096,14 @@ mod tests {
         // Combined --set + DNAT inside SEP chain (K8s style)
         assert!(
             rules.contains(
-                "-A KUBE-SEP-109605-80-0 -p tcp -m recent --name AFFINITY-109605-80-0 --set -j DNAT --to-destination 10.0.0.1:80"
+                "-A RUSTERNETES-SEP-109605-80-0 -p tcp -m recent --name AFFINITY-109605-80-0 --set -j DNAT --to-destination 10.0.0.1:80"
             ),
             "missing combined set+DNAT for endpoint 0:\n{}",
             rules
         );
         assert!(
             rules.contains(
-                "-A KUBE-SEP-109605-80-1 -p tcp -m recent --name AFFINITY-109605-80-1 --set -j DNAT --to-destination 10.0.0.2:80"
+                "-A RUSTERNETES-SEP-109605-80-1 -p tcp -m recent --name AFFINITY-109605-80-1 --set -j DNAT --to-destination 10.0.0.2:80"
             ),
             "missing combined set+DNAT for endpoint 1:\n{}",
             rules
@@ -2030,13 +2143,13 @@ mod tests {
         let rules = mgr.build_nat_rules(&[service], &ep_map).await;
 
         assert!(
-            rules.contains(":KUBE-SEP-109607-8080-0 - [0:0]"),
+            rules.contains(":RUSTERNETES-SEP-109607-8080-0 - [0:0]"),
             "single-endpoint SEP chain missing:\n{}",
             rules
         );
         assert!(
             rules.contains(
-                "-A KUBE-SEP-109607-8080-0 -p tcp -m recent --name AFFINITY-109607-8080-0 --set -j DNAT --to-destination 10.0.0.9:8080"
+                "-A RUSTERNETES-SEP-109607-8080-0 -p tcp -m recent --name AFFINITY-109607-8080-0 --set -j DNAT --to-destination 10.0.0.9:8080"
             ),
             "single-endpoint set+DNAT missing:\n{}",
             rules
@@ -2084,7 +2197,7 @@ mod tests {
 
         assert!(
             rules.contains(
-                "-A RUSTERNETES-NODEPORTS -p tcp --dport 30080 -m recent --name AFFINITY-1096011-80-0 --rcheck --seconds 600 --reap -j KUBE-SEP-1096011-80-0"
+                "-A RUSTERNETES-NODEPORTS -p tcp --dport 30080 -m recent --name AFFINITY-1096011-80-0 --rcheck --seconds 600 --reap -j RUSTERNETES-SEP-1096011-80-0"
             ),
             "missing NodePort --rcheck rule for endpoint 0:\n{}",
             rules

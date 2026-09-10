@@ -18,8 +18,15 @@ pub struct KubeProxy {
 }
 
 impl KubeProxy {
-    pub fn new(storage: Arc<StorageBackend>) -> Result<Self> {
-        let iptables = IptablesManager::new();
+    /// `chain_prefix`: `None` uses the default "RUSTERNETES" chain-name
+    /// prefix; `Some(prefix)` scopes this instance's chains to `prefix`
+    /// instead, so multiple instances can share a network namespace
+    /// without colliding — see `KubeProxyConfig::chain_prefix`.
+    pub fn new(storage: Arc<StorageBackend>, chain_prefix: Option<&str>) -> Result<Self> {
+        let iptables = match chain_prefix {
+            Some(prefix) => IptablesManager::new_with_prefix(prefix),
+            None => IptablesManager::new(),
+        };
         iptables.initialize()?;
 
         Ok(Self {
