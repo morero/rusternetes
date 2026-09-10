@@ -102,6 +102,49 @@ impl ProtoRegistry {
                 ]),
             },
         );
+        // Lease (coordination.k8s.io/v1) — real, live-confirmed bug: with no
+        // schema entry here, decode_k8s_resource() returns None for every
+        // Lease and every write falls through to the generic CRD-shaped
+        // fallback decoder, which blindly applies
+        // CustomResourceDefinitionSpec's own field layout (group/names/scope/
+        // versions) to Lease's completely different bytes — a coincidental
+        // field-number collision, not a real decode. Found live chasing a
+        // `guts-shell-bundle` blocker: a client-go leader-election Lease
+        // renewal decoded as
+        // `{"spec":{"group":"<holder-identity-string>","names":{...},"scope":
+        // "<raw protobuf bytes leaking into a string field>","versions":[...]}}`
+        // — garbage in every field, confirmed via temporary raw-JSON logging
+        // in middleware.rs (since removed). Field numbers verified against
+        // the real upstream k8s.io/api/coordination/v1 generated.proto.
+        schemas.insert(
+            "Lease".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (2, ("spec".into(), FieldType::Message("LeaseSpec".into()))),
+                ]),
+            },
+        );
+        schemas.insert(
+            "LeaseSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("holderIdentity".into(), FieldType::String)),
+                    (2, ("leaseDurationSeconds".into(), FieldType::Int)),
+                    (
+                        3,
+                        ("acquireTime".into(), FieldType::Message("Time".into())),
+                    ),
+                    (4, ("renewTime".into(), FieldType::Message("Time".into()))),
+                    (5, ("leaseTransitions".into(), FieldType::Int)),
+                    (6, ("strategy".into(), FieldType::String)),
+                    (7, ("preferredHolder".into(), FieldType::String)),
+                ]),
+            },
+        );
         schemas.insert(
             "ManagedFieldsEntry".into(),
             MessageSchema {
@@ -3309,6 +3352,54 @@ mod tests {
         assert_eq!(val.get("name"), Some(&Value::String("my-deploy".into())));
         assert_eq!(val.get("uid"), Some(&Value::String("abc-123".into())));
         assert_eq!(val.get("controller"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_decode_lease_uses_its_own_schema_not_crd_fallback() {
+        // Regression test for a real bug (found live chasing a
+        // `guts-shell-bundle` blocker: a client-go leader-election Lease
+        // renewal from a real operator, CloudNativePG): with no "Lease"
+        // entry in the schema registry at all, decode_k8s_resource()
+        // returned None for every Lease, and the caller (middleware.rs)
+        // fell through to the generic CRD-shaped fallback decoder — which
+        // applies CustomResourceDefinitionSpec's own field layout
+        // (group/names/scope/versions) to whatever bytes it's given,
+        // regardless of the real kind. Confirmed live via temporary raw-JSON
+        // logging: a real Lease decoded as
+        // `{"spec":{"group":"<holderIdentity string>","names":{...},
+        // "scope":"<raw protobuf bytes leaking into a string field>",
+        // "versions":[...]}}` — garbage in every field. Field numbers here
+        // verified against the real upstream
+        // k8s.io/api/coordination/v1 generated.proto.
+        let registry = ProtoRegistry::new();
+        let mut lease_spec = Vec::new();
+        // holderIdentity (field 1, string)
+        lease_spec.push(0x0a);
+        lease_spec.push(20);
+        lease_spec.extend_from_slice(b"cnpg-operator-abc123");
+        // leaseDurationSeconds (field 2, varint) = 15
+        lease_spec.push(0x10);
+        lease_spec.push(15);
+        // leaseTransitions (field 5, varint) = 3
+        lease_spec.push(0x28);
+        lease_spec.push(3);
+
+        let result = registry.decode_message("LeaseSpec", &lease_spec);
+        assert!(result.is_some());
+        let val = result.unwrap();
+        assert_eq!(
+            val.get("holderIdentity"),
+            Some(&Value::String("cnpg-operator-abc123".into())),
+            "must decode the real holderIdentity, not a CRD-shaped 'group' field; got {:?}",
+            val
+        );
+        assert_eq!(val.get("leaseDurationSeconds"), Some(&Value::Number(15.into())));
+        assert_eq!(val.get("leaseTransitions"), Some(&Value::Number(3.into())));
+        // The CRD-fallback bug's telltale signature: these fields must never
+        // appear on a decoded LeaseSpec.
+        assert!(val.get("group").is_none());
+        assert!(val.get("names").is_none());
+        assert!(val.get("versions").is_none());
     }
 
     #[test]

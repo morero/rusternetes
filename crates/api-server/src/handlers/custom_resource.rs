@@ -1223,6 +1223,29 @@ pub async fn patch_custom_resource_status(
         rusternetes_common::Error::InvalidResource(format!("Invalid patch JSON: {}", e))
     })?;
 
+    // Real Kubernetes clients (including `kubectl patch --subresource=status`)
+    // shape a status-subresource merge/strategic-merge patch as the FULL
+    // object structure — `{"status": {...partial status fields...}}` — even
+    // though the subresource URL already scopes the patch target to
+    // `.status`; only fields under that key are meant to apply. `current_status`
+    // below is the *unwrapped* content of `.status` (`{"appliedResources":
+    // [...], "conditions": [...], ...}`), so merging the still-wrapped
+    // `patch_value` against it inserted a spurious nested `status.status` key
+    // instead of merging `appliedResources` directly — a real, confirmed bug
+    // (reproduced live: `PATCH .../releases/platform-db/status` with body
+    // `{"status":{"appliedResources":[]}}` produced
+    // `status: {appliedResources: [...unchanged...], ..., status:
+    // {appliedResources: []}}`). A JSON Patch (RFC 6902) document is an array
+    // of `{op, path, value}` operations with paths already relative to
+    // `.status`, not an object with a `status` key, so this unwrap is only
+    // ever applicable to the object-shaped patch types.
+    let patch_value = match &patch_value {
+        serde_json::Value::Object(obj) if obj.contains_key("status") => {
+            obj.get("status").cloned().unwrap_or(serde_json::Value::Null)
+        }
+        other => other.clone(),
+    };
+
     // Apply the patch to the status field only
     let current_status = current
         .status
