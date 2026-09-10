@@ -1977,13 +1977,27 @@ impl ProtoRegistry {
         }
     }
 
+    /// Field numbers per the real `k8s.io/apimachinery/pkg/apis/meta/v1`
+    /// `OwnerReference` proto (verified against upstream
+    /// `generated.proto`, not assumed): `kind=1`, `name=3`, `uid=4`,
+    /// `apiVersion=5`, `controller=6`, `blockOwnerDeletion=7` — field 2
+    /// does not exist. This schema previously had `apiVersion=1,
+    /// kind=2` (backwards) with no mapping for the real `apiVersion=5`
+    /// at all — silently dropping every real client's `kind` value into
+    /// the `apiVersion` JSON key and losing `apiVersion` and `kind`
+    /// entirely. Since `kind` is a required field on a real
+    /// `OwnerReference`, this broke deserializing *any* protobuf-encoded
+    /// object carrying an `ownerReferences` entry (confirmed live: a
+    /// real operator, CloudNativePG, creating its own webhook-cert
+    /// `Secret` with an owner reference to its `Deployment` — a
+    /// generic bug, not specific to that one object).
     fn owner_reference_schema() -> MessageSchema {
         MessageSchema {
             fields: HashMap::from([
-                (1, ("apiVersion".into(), FieldType::String)),
-                (2, ("kind".into(), FieldType::String)),
+                (1, ("kind".into(), FieldType::String)),
                 (3, ("name".into(), FieldType::String)),
                 (4, ("uid".into(), FieldType::String)),
+                (5, ("apiVersion".into(), FieldType::String)),
                 (6, ("controller".into(), FieldType::Bool)),
                 (7, ("blockOwnerDeletion".into(), FieldType::Bool)),
             ]),
@@ -3250,6 +3264,51 @@ mod tests {
             val.pointer("/matchLabels/app"),
             Some(&Value::String("nginx".into()))
         );
+    }
+
+    #[test]
+    fn test_decode_owner_reference_real_field_numbers() {
+        // Regression test for a real bug (found live-testing a real
+        // operator, CloudNativePG, creating a Secret with an
+        // ownerReference): the schema previously had apiVersion=1,
+        // kind=2, with no mapping for apiVersion's real field (5) —
+        // backwards from upstream `k8s.io/apimachinery`'s actual
+        // OwnerReference proto (verified against generated.proto:
+        // kind=1, name=3, uid=4, apiVersion=5, controller=6,
+        // blockOwnerDeletion=7; field 2 does not exist).
+        let registry = ProtoRegistry::new();
+        let mut owner_ref = Vec::new();
+        // kind (field 1, string) = "Deployment"
+        owner_ref.push(0x0a);
+        owner_ref.push(10);
+        owner_ref.extend_from_slice(b"Deployment");
+        // name (field 3, string) = "my-deploy"
+        owner_ref.push(0x1a);
+        owner_ref.push(9);
+        owner_ref.extend_from_slice(b"my-deploy");
+        // uid (field 4, string) = "abc-123"
+        owner_ref.push(0x22);
+        owner_ref.push(7);
+        owner_ref.extend_from_slice(b"abc-123");
+        // apiVersion (field 5, string) = "apps/v1"
+        owner_ref.push(0x2a);
+        owner_ref.push(7);
+        owner_ref.extend_from_slice(b"apps/v1");
+        // controller (field 6, varint bool) = true
+        owner_ref.push(0x30);
+        owner_ref.push(0x01);
+
+        let result = registry.decode_message("OwnerReference", &owner_ref);
+        assert!(result.is_some());
+        let val = result.unwrap();
+        assert_eq!(val.get("kind"), Some(&Value::String("Deployment".into())));
+        assert_eq!(
+            val.get("apiVersion"),
+            Some(&Value::String("apps/v1".into()))
+        );
+        assert_eq!(val.get("name"), Some(&Value::String("my-deploy".into())));
+        assert_eq!(val.get("uid"), Some(&Value::String("abc-123".into())));
+        assert_eq!(val.get("controller"), Some(&Value::Bool(true)));
     }
 
     #[test]
