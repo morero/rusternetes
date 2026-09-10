@@ -374,8 +374,50 @@ pub async fn list_all_secrets(
     Ok(Json(list).into_response())
 }
 
-// Use the macro to create a PATCH handler
-crate::patch_handler_namespaced!(patch, Secret, "secrets", "");
+// Hand-written, not the generic macro: the generic PATCH handler
+// (generic_patch::patch_namespaced_resource) is fully type-generic over
+// `T` and has no per-resource-type hook, so it never runs the
+// stringData -> base64 `data` normalization that create()/update() above
+// apply via `secret.normalize()`. A Secret patched (not created/PUT) with
+// `stringData` therefore persisted with the new `stringData` but a
+// stale/empty `data` — and a volume mount is built from `.data`, not
+// `.stringData`, so the mounted file stayed empty. Live-confirmed: a
+// Release re-applying a Workflow-rendered Secret via PATCH left its
+// mounted config file empty, crashing the consuming pod even though the
+// stored object's `stringData` field clearly held the real content, and
+// `kubectl get secret -o yaml` clearly showed it. Fixed here by wrapping
+// the generic handler (reusing all of its patch/SSA/conflict-retry/
+// webhook logic unchanged) with one follow-up normalize-and-resave pass,
+// rather than adding a generic hook that every other resource type using
+// this macro would also need to implement.
+pub async fn patch(
+    State(state): State<Arc<ApiServerState>>,
+    auth_ctx: Extension<AuthContext>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<Secret>> {
+    let Json(mut patched) = crate::handlers::generic_patch::patch_namespaced_resource::<Secret>(
+        State(state.clone()),
+        auth_ctx,
+        Path((namespace.clone(), name.clone())),
+        Query(params),
+        headers,
+        body,
+        "secrets",
+        "",
+    )
+    .await?;
+
+    if patched.string_data.is_some() {
+        patched.normalize();
+        let key = build_key("secrets", Some(&namespace), &name);
+        patched = state.storage.update(&key, &patched).await?;
+    }
+
+    Ok(Json(patched))
+}
 
 pub async fn deletecollection_secrets(
     State(state): State<Arc<ApiServerState>>,
