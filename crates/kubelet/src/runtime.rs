@@ -157,6 +157,80 @@ fn needs_shell_quoting(s: &str) -> bool {
     })
 }
 
+/// Docker `--security-opt` entries for a container: `no-new-privileges`
+/// when `allowPrivilegeEscalation` is false, and `seccomp=unconfined`
+/// when `seccompProfile.type` is `Unconfined` — container-level,
+/// falling back to pod-level, matching real Kubernetes field-
+/// inheritance semantics. `RuntimeDefault` needs no entry (Docker's own
+/// default profile already applies); `Localhost` isn't implemented (no
+/// local profile file plumbing exists here) and is treated the same as
+/// absent rather than silently misapplied.
+///
+/// `seccompProfile` was previously an unused type on the wire — parsed
+/// from the pod spec but never read by container creation, so setting
+/// it (e.g. `type: Unconfined`, the real Kubernetes way to let a pod
+/// create nested namespaces — `unshare(CLONE_NEWUSER)` and friends are
+/// blocked by Docker's default seccomp profile — without going all the
+/// way to `privileged: true`) silently did nothing.
+fn security_opts_for(
+    container_sc: Option<&rusternetes_common::resources::SecurityContext>,
+    pod_sc: Option<&rusternetes_common::resources::pod::PodSecurityContext>,
+) -> Option<Vec<String>> {
+    let allow_privilege_escalation = container_sc
+        .and_then(|sc| sc.allow_privilege_escalation)
+        .or_else(|| pod_sc.and_then(|sc| sc.run_as_non_root).map(|_| false));
+    let seccomp_type = container_sc
+        .and_then(|sc| sc.seccomp_profile.as_ref())
+        .or_else(|| pod_sc.and_then(|sc| sc.seccomp_profile.as_ref()))
+        .map(|p| p.r#type.as_str());
+
+    let mut opts = Vec::new();
+    if allow_privilege_escalation == Some(false) {
+        opts.push("no-new-privileges".to_string());
+    }
+    if seccomp_type == Some("Unconfined") {
+        opts.push("seccomp=unconfined".to_string());
+    }
+    (!opts.is_empty()).then_some(opts)
+}
+
+/// The first `nameserver` entry in `resolv_conf` that isn't loopback-
+/// scoped (127.0.0.0/8 or ::1) — a loopback nameserver only ever
+/// resolves for processes in the *host's own* network namespace, so
+/// blindly copying one (e.g. `nameserver 127.0.0.53`, what
+/// systemd-resolved's stub listener leaves in `/etc/resolv.conf` on
+/// many hosts) into a bridge-networked pod's resolv.conf produces a
+/// resolv.conf that can never work.
+fn first_non_loopback_nameserver(resolv_conf: &str) -> Option<String> {
+    resolv_conf
+        .lines()
+        .filter_map(|l| l.strip_prefix("nameserver"))
+        .map(|l| l.trim().to_string())
+        .find(|ns| {
+            ns.parse::<std::net::IpAddr>()
+                .map(|ip| !ip.is_loopback())
+                .unwrap_or(true) // an address we can't even parse isn't recognizably loopback — pass it through rather than silently drop it
+        })
+}
+
+/// A nameserver from the host actually reachable from a pod: the first
+/// non-loopback entry in `/etc/resolv.conf`, falling back to
+/// `/run/systemd/resolve/resolv.conf` (systemd-resolved's own "uplink"
+/// file, listing the real nameservers it forwards to — present
+/// alongside the loopback stub file on any host running it in stub
+/// mode, the default on most systemd-based distros) when the primary
+/// file has nothing usable.
+fn host_nameserver_for_pods() -> Option<String> {
+    std::fs::read_to_string("/etc/resolv.conf")
+        .ok()
+        .and_then(|c| first_non_loopback_nameserver(&c))
+        .or_else(|| {
+            std::fs::read_to_string("/run/systemd/resolve/resolv.conf")
+                .ok()
+                .and_then(|c| first_non_loopback_nameserver(&c))
+        })
+}
+
 /// Set up an EmptyDir volume directory with mode 0o777, matching upstream
 /// Kubernetes (pkg/volume/emptydir/empty_dir.go setupDir).
 ///
@@ -181,7 +255,222 @@ pub(crate) fn setup_emptydir_dir(path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Whether a projected ServiceAccountToken file needs to be re-minted:
+/// missing entirely (`token_age: None`), or old enough that it's spent at
+/// least 80% of its `expiration_seconds` lifetime (mirrors real kubelet's
+/// rotate-at-~80%-of-TTL policy). Pulled out of `refresh_volumes` as a pure
+/// function so the threshold logic is unit-testable without standing up a
+/// full `ContainerRuntime` (which needs a live Docker connection to
+/// construct at all).
+///
+/// `refresh_volumes` calls this every sync pass for every pod's projected
+/// token; without it, `create_volume` mints the token exactly once at pod
+/// start with a fixed `exp`, nothing else ever refreshes it, and once `exp`
+/// passes the api-server rejects every request from the pod — fatal for
+/// anything doing client-go leader election, which exits its whole process
+/// once lease renewal fails.
+pub(crate) fn token_needs_rotation(token_age: Option<Duration>, expiration_seconds: i64) -> bool {
+    let rotate_after = Duration::from_secs((expiration_seconds.max(0) as f64 * 0.8) as u64);
+    match token_age {
+        Some(age) => age >= rotate_after,
+        None => true,
+    }
+}
+
+/// Write `contents` to `path` only if the file doesn't already hold exactly
+/// those bytes — best-effort, errors on either the read or the write are
+/// silently ignored (matching every other volume-refresh write in this
+/// module, which is itself best-effort against a background sync loop).
+///
+/// `refresh_volumes` calls this for every Secret/ConfigMap volume key on
+/// every sync pass, whether or not the underlying object actually changed.
+/// A plain `std::fs::write` truncates the file before writing the new
+/// bytes, so an unconditional call here rewrites (truncate + write) an
+/// *unchanged* file every few seconds. That's a real race for anything
+/// watching the file for changes via inotify and reading it synchronously
+/// on the write event — such as controller-runtime's `CertWatcher`, which
+/// intermittently read a truncated (mid-write) `tls.crt`/`tls.key` and
+/// logged "tls: failed to find any PEM data in certificate/key input",
+/// repeating every few seconds for as long as the pod ran, even though the
+/// file's steady-state content was always valid PEM. The same
+/// skip-if-unchanged guard is already used by (a separate) resync path
+/// for `ConfigMap` volumes elsewhere in this file — this just extends it to
+/// `refresh_volumes`, which didn't have it for either `Secret` or
+/// `ConfigMap`.
+///
+/// Even the skip-if-unchanged fast path above still falls through to a real
+/// write whenever content genuinely differs, and that write was a plain
+/// `std::fs::write` (truncate then write) — not atomic. Hardened to a
+/// same-directory temp file plus `rename` (atomic on POSIX), so a
+/// concurrent reader of a Secret/ConfigMap volume file always sees either
+/// the old complete content or the new complete content, never a partial
+/// write, the same reasoning (and the same real, live-confirmed failure
+/// mode — see `refresh_volumes`'s ServiceAccountToken rotation below,
+/// which had this exact bug on its own separate, non-`write_file_if_changed`
+/// write path) that motivated fixing the token-rotation write site too.
+/// Recursively chown `path` to `fs_group` and mirror each file/directory's
+/// owner permission bits onto its group bits (real Kubernetes fsGroup
+/// behavior: a file with mode 0440 stays 0440, not 0460 the way a blanket
+/// `chmod g+rwX` would leave it), then set the setgid bit on `path` itself
+/// so anything created under it later inherits the group.
+///
+/// Extracted out of `create_pod_volumes`'s one-time-per-volume pass so a
+/// subPath directory created *after* that pass already ran (see the
+/// `subPath target doesn't exist — create as directory` call site below)
+/// can get the exact same treatment applied to it individually. That
+/// ordering gap was a real, live-confirmed bug: `create_pod_volumes` chowns
+/// each volume's root once, before any container mount is set up, but a
+/// `subPath` directory nested under an `emptyDir` (e.g. Bitnami's own
+/// charts commonly mount `subPath: app-conf-dir` under a shared
+/// `empty-dir` volume, precisely because their images run as a non-root
+/// UID against a read-only root filesystem) is only created later, per
+/// container, the first time that particular mount is resolved — so it
+/// never existed yet when the volume-wide chown walked the tree, and was
+/// left owned by whatever UID/GID kubelet's own process runs as (root),
+/// not the pod's `fsGroup`. The container then fails to write into its own
+/// declared writable directory with a plain permission error that gives no
+/// hint the *cause* is a volume-ownership gap rather than the chart's own
+/// configuration.
+/// `chown -R :GID path` shelled out as an external process. A file
+/// capability like `CAP_CHOWN` granted to *this* binary (see
+/// `test-integration.sh`'s `setcap` step) is not inherited by a spawned
+/// child process unless the child binary carries the same file capability
+/// itself, or the parent explicitly raises it into its ambient set before
+/// `exec` — plain `std::process::Command` does neither. Real, live-
+/// confirmed: granting `cap_chown+ep` to the kubelet binary and confirming
+/// it with `getcap` had zero effect on this exact `chown -R` call — the
+/// spawned `/usr/bin/chown` process ran with an empty capability set of
+/// its own and failed exactly like an unprivileged one would, silently
+/// (its own failure is itself swallowed by the `let _ = ...output()`
+/// below). Kept only as a change-nothing-if-it-still-fails fallback for a
+/// path this function can't reach any other way (chowning `path` itself
+/// happens via the raw syscall further down, so this specifically covers
+/// stray files this walk doesn't visit — there shouldn't be any).
+#[cfg(unix)]
+fn chown_group_via_subprocess_fallback(path: &str, fs_group: i64) {
+    let _ = std::process::Command::new("chown")
+        .args(["-R", &format!(":{}", fs_group), path])
+        .output();
+}
+
+/// The actual fix: an in-process `chown(2)` syscall runs under *this*
+/// process's own effective capabilities directly — no exec, no
+/// inheritance gap, so a file-capability grant on the kubelet binary
+/// itself (`CAP_CHOWN`) actually takes effect. `(uid_t)-1` (`u32::MAX`
+/// once cast, matching `chown :GID path`'s "leave owner alone, only
+/// change group" semantics) leaves ownership untouched.
+#[cfg(unix)]
+fn chown_group(path: &std::path::Path, fs_group: i64) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else {
+        return;
+    };
+    // SAFETY: c_path is a valid, NUL-terminated C string for the lifetime
+    // of this call; chown(2) only reads it and returns an int status we
+    // deliberately don't need to check further (matching every other
+    // fsGroup step in this module, which is already best-effort against a
+    // background sync loop — see write_file_if_changed's doc comment).
+    unsafe {
+        libc::chown(c_path.as_ptr(), u32::MAX, fs_group as libc::gid_t);
+    }
+}
+
+#[cfg(unix)]
+fn apply_fsgroup_to_path(path: &str, fs_group: i64) {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Best-effort external fallback first (a no-op in practice — see its
+    // own doc comment — but harmless, and covers an environment where the
+    // in-process syscall below is somehow unavailable), then the actual
+    // in-process chown that works under a granted CAP_CHOWN.
+    chown_group_via_subprocess_fallback(path, fs_group);
+    chown_group(std::path::Path::new(path), fs_group);
+
+    fn apply_fsgroup_permissions(dir: &std::path::Path, fs_group: i64) {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let fpath = entry.path();
+                chown_group(&fpath, fs_group);
+                if let Ok(meta) = std::fs::metadata(&fpath) {
+                    let mode = meta.permissions().mode();
+                    // Copy owner bits (bits 8-6) to group bits (bits 5-3)
+                    let owner_bits = (mode >> 6) & 0o7;
+                    let new_mode = (mode & !0o070) | (owner_bits << 3);
+                    if new_mode != mode {
+                        let _ = std::fs::set_permissions(
+                            &fpath,
+                            std::fs::Permissions::from_mode(new_mode),
+                        );
+                    }
+                    if meta.is_dir() {
+                        apply_fsgroup_permissions(&fpath, fs_group);
+                    }
+                }
+            }
+        }
+    }
+    apply_fsgroup_permissions(std::path::Path::new(path), fs_group);
+
+    // Set setgid bit on the directory itself so new files inherit group
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mode = meta.permissions().mode();
+        let owner_bits = (mode >> 6) & 0o7;
+        let new_mode = (mode & !0o070) | (owner_bits << 3) | 0o2000;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(new_mode));
+    }
+}
+
+fn write_file_if_changed(path: &str, contents: &[u8]) {
+    if let Ok(existing) = std::fs::read(path) {
+        if existing == contents {
+            return;
+        }
+    }
+    let tmp_path = format!("{path}.tmp-{}", std::process::id());
+    if std::fs::write(&tmp_path, contents).is_ok() {
+        let _ = std::fs::rename(&tmp_path, path);
+    }
+}
+
+/// Docker label carrying this kubelet's cluster identity. Set on every
+/// container this runtime creates (workload and pause containers) so
+/// reconciliation/GC can scope to containers it owns instead of parsing
+/// container names — see the `container-ownership-labels` capability in
+/// `openspec/changes/rinr-nested-cluster`. Reuses `--network` as the
+/// cluster identity: it's already required to be distinct per rusternetes
+/// instance sharing a Docker daemon (Docker rejects two networks with the
+/// same name), so no new configuration surface is needed.
+const CLUSTER_LABEL: &str = "rusternetes.io/cluster";
+/// Docker label carrying the owning pod's name, set alongside
+/// [`CLUSTER_LABEL`]. Kept separate from the cluster label so ownership
+/// checks can match on cluster identity alone without also parsing the pod
+/// name back out of a combined value.
+const POD_LABEL: &str = "rusternetes.io/pod";
+
 impl ContainerRuntime {
+    /// Labels to attach to every container this runtime creates, so it can
+    /// later recognize (and only ever act on) its own containers rather
+    /// than anything else present on the Docker daemon.
+    fn ownership_labels(&self, pod_name: &str) -> HashMap<String, String> {
+        let mut labels = HashMap::new();
+        labels.insert(CLUSTER_LABEL.to_string(), self.network.clone());
+        labels.insert(POD_LABEL.to_string(), pod_name.to_string());
+        labels
+    }
+
+    /// Whether a container's labels mark it as owned by this runtime's
+    /// cluster (matched on [`CLUSTER_LABEL`] only — the specific pod name
+    /// is read separately from [`POD_LABEL`] where needed).
+    fn is_owned_by_this_cluster(&self, labels: &Option<HashMap<String, String>>) -> bool {
+        labels
+            .as_ref()
+            .and_then(|l| l.get(CLUSTER_LABEL))
+            .is_some_and(|v| v == &self.network)
+    }
+
     pub async fn new(
         volumes_base_path: String,
         cluster_dns: String,
@@ -269,10 +558,27 @@ impl ContainerRuntime {
         let version = match docker.version().await {
             Ok(version) => version,
             Err(e) => {
-                // The daemon is unreachable; nothing else will work either.
-                // Don't change pod-creation behaviour off a failed probe.
-                warn!("Could not probe container runtime version: {}", e);
-                return true;
+                // Default to false (Docker-style, "not supported") on a
+                // failed probe, not true. Observed live: right after a
+                // socket *file* appears (e.g. this runtime's own
+                // wait-for-socket loop against a nested dind sidecar), the
+                // daemon behind it isn't always ready to accept connections
+                // yet, and this version() call can fail on that race —
+                // one-shot, cached for the kubelet's whole lifetime via
+                // `supports_uts_container_mode`. Defaulting to `true`
+                // there meant every pod on that kubelet failed container
+                // creation outright with Docker's `400 invalid UTS mode`
+                // (uts_mode=container:X is Podman-only); defaulting to
+                // `false` instead degrades gracefully — pod hostname still
+                // gets set via the shared network namespace either way, so
+                // "assume unsupported" costs nothing on a daemon that
+                // actually does support it, while "assume supported" broke
+                // pod creation entirely on one that doesn't.
+                warn!(
+                    "Could not probe container runtime version: {} — assuming uts_mode=container: is not supported",
+                    e
+                );
+                return false;
             }
         };
 
@@ -659,7 +965,25 @@ impl ContainerRuntime {
         // Ensure the pod has a kube-api-access volume for SA tokens.
         // Controllers that create pods directly in etcd bypass the API server's
         // admission controller, so the SA token volume may not be injected.
+        //
+        // Real, live-confirmed bug this used to have: the synthesized volume
+        // below was only ever applied to `pod_with_sa`, a local clone used
+        // for this function's own volume-creation/container-setup calls —
+        // it was never written back to storage. `refresh_volumes`'s
+        // periodic rotation check (see its own doc comment) re-fetches the
+        // pod from storage on every sync pass, so for any pod relying on
+        // this auto-injection (i.e. nearly every real pod — explicitly
+        // declaring a projected ServiceAccountToken volume is the
+        // exception, not the rule), that re-fetched pod had no
+        // ServiceAccountToken volume to find at all, and rotation silently
+        // never fired for the pod's entire lifetime. Confirmed live: a
+        // pod's token, still holding its original `iat` from pod creation,
+        // found dead — a properly-signed, structurally valid JWT simply
+        // expired over 8 hours past its 1-hour TTL, still being presented
+        // on every request. Fixed by persisting the synthesized volume back
+        // to storage once, immediately below, so later re-fetches see it.
         let mut pod_with_sa = pod.clone();
+        let mut injected_sa_volume = false;
         if let Some(ref mut spec) = pod_with_sa.spec {
             let has_sa_volume = spec
                 .volumes
@@ -667,6 +991,7 @@ impl ContainerRuntime {
                 .map(|vols| vols.iter().any(|v| v.name.contains("kube-api-access")))
                 .unwrap_or(false);
             if !has_sa_volume {
+                injected_sa_volume = true;
                 // Add projected SA token volume
                 let sa_vol = rusternetes_common::resources::Volume {
                     name: "kube-api-access".to_string(),
@@ -675,19 +1000,80 @@ impl ContainerRuntime {
                     config_map: None,
                     secret: None,
                     projected: Some(rusternetes_common::resources::ProjectedVolumeSource {
-                        sources: Some(vec![rusternetes_common::resources::VolumeProjection {
-                            service_account_token: Some(
-                                rusternetes_common::resources::ServiceAccountTokenProjection {
-                                    path: "token".to_string(),
-                                    expiration_seconds: Some(3600),
-                                    audience: None,
-                                },
-                            ),
-                            config_map: None,
-                            secret: None,
-                            downward_api: None,
-                            cluster_trust_bundle: None,
-                        }]),
+                        sources: Some(vec![
+                            rusternetes_common::resources::VolumeProjection {
+                                service_account_token: Some(
+                                    rusternetes_common::resources::ServiceAccountTokenProjection {
+                                        path: "token".to_string(),
+                                        expiration_seconds: Some(3600),
+                                        audience: None,
+                                    },
+                                ),
+                                config_map: None,
+                                secret: None,
+                                downward_api: None,
+                                cluster_trust_bundle: None,
+                            },
+                            // Real Kubernetes always projects `namespace`
+                            // alongside the token. Without it, any client
+                            // using standard in-cluster config detection
+                            // (e.g. kube-rs' `Client::try_default()`) fails
+                            // outright, since that inference unconditionally
+                            // reads this file.
+                            rusternetes_common::resources::VolumeProjection {
+                                service_account_token: None,
+                                config_map: None,
+                                secret: None,
+                                downward_api: Some(
+                                    rusternetes_common::resources::DownwardAPIProjection {
+                                        items: Some(vec![
+                                            rusternetes_common::resources::DownwardAPIVolumeFile {
+                                                path: "namespace".to_string(),
+                                                field_ref: Some(
+                                                    rusternetes_common::resources::ObjectFieldSelector {
+                                                        field_path: "metadata.namespace".to_string(),
+                                                        api_version: None,
+                                                    },
+                                                ),
+                                                resource_field_ref: None,
+                                                mode: None,
+                                            },
+                                        ]),
+                                    },
+                                ),
+                                cluster_trust_bundle: None,
+                            },
+                            // Real Kubernetes also projects `ca.crt` from a
+                            // `kube-root-ca.crt` ConfigMap a controller
+                            // auto-creates in every namespace — needed for
+                            // any client using standard in-cluster TLS
+                            // verification. This cluster has no such
+                            // controller; a namespace only gets one if
+                            // something else (a deploy script, a cluster
+                            // operator) creates it — this is `optional`, so
+                            // a namespace without one just gets no `ca.crt`
+                            // file, exactly like today, rather than a failed
+                            // mount.
+                            rusternetes_common::resources::VolumeProjection {
+                                service_account_token: None,
+                                config_map: Some(
+                                    rusternetes_common::resources::ConfigMapProjection {
+                                        name: Some("kube-root-ca.crt".to_string()),
+                                        items: Some(vec![
+                                            rusternetes_common::resources::KeyToPath {
+                                                key: "ca.crt".to_string(),
+                                                path: "ca.crt".to_string(),
+                                                mode: None,
+                                            },
+                                        ]),
+                                        optional: Some(true),
+                                    },
+                                ),
+                                secret: None,
+                                downward_api: None,
+                                cluster_trust_bundle: None,
+                            },
+                        ]),
                         default_mode: Some(0o644),
                     }),
                     persistent_volume_claim: None,
@@ -716,6 +1102,43 @@ impl ContainerRuntime {
                 }
             }
         }
+
+        if injected_sa_volume {
+            if let Some(ref storage) = self.storage {
+                use rusternetes_storage::Storage;
+                let pod_key = rusternetes_storage::build_key("pods", Some(namespace), pod_name);
+                match storage.get::<Pod>(&pod_key).await {
+                    Ok(mut stored_pod) => {
+                        if let (Some(ref mut stored_spec), Some(ref synthesized_spec)) =
+                            (&mut stored_pod.spec, &pod_with_sa.spec)
+                        {
+                            let already_present = stored_spec
+                                .volumes
+                                .as_ref()
+                                .map(|vols| vols.iter().any(|v| v.name.contains("kube-api-access")))
+                                .unwrap_or(false);
+                            if !already_present {
+                                stored_spec.volumes = synthesized_spec.volumes.clone();
+                                stored_spec.containers = synthesized_spec.containers.clone();
+                                if let Err(e) = storage.update(&pod_key, &stored_pod).await {
+                                    warn!(
+                                        "Failed to persist synthesized kube-api-access volume for pod {}/{}: {}",
+                                        namespace, pod_name, e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to re-fetch pod {}/{} to persist synthesized kube-api-access volume: {}",
+                            namespace, pod_name, e
+                        );
+                    }
+                }
+            }
+        }
+
         let pod = &pod_with_sa;
 
         // Create volumes first (includes service account token volumes)
@@ -1427,6 +1850,7 @@ impl ContainerRuntime {
 
         let config = Config {
             image: Some("busybox:latest".to_string()),
+            labels: Some(self.ownership_labels(pod_name)),
             cmd: Some(vec!["sleep".to_string(), "infinity".to_string()]),
             hostname: Some(pause_hostname),
             exposed_ports: if exposed_ports.is_empty() {
@@ -1481,6 +1905,16 @@ impl ContainerRuntime {
                         "Pause container {} already exists, removing and retrying",
                         pause_name
                     );
+                    // Never remove a container this cluster didn't create — see
+                    // the matching check in create_container's 409 handling.
+                    if let Ok(existing) = self.docker.inspect_container(&pause_name, None).await {
+                        if !self.is_owned_by_this_cluster(&existing.config.and_then(|c| c.labels)) {
+                            return Err(anyhow::anyhow!(
+                                "Pause container name {} is already in use by a container this cluster did not create; refusing to remove it",
+                                pause_name
+                            ));
+                        }
+                    }
                     // Remove dependent containers first (required for Podman which
                     // refuses to remove a container that has dependents).
                     if let Ok(containers) = self
@@ -1753,49 +2187,8 @@ impl ContainerRuntime {
             .and_then(|s| s.security_context.as_ref())
             .and_then(|sc| sc.fs_group)
         {
-            use std::os::unix::fs::PermissionsExt;
             for path in volume_paths.values() {
-                // Recursively chown to fsGroup
-                let _ = std::process::Command::new("chown")
-                    .args(["-R", &format!(":{}", fs_group), path])
-                    .output();
-
-                // Set group bits to mirror owner bits on each file/directory.
-                // This matches real K8s behavior: if owner=r--, group becomes r--
-                // (not r+w which chmod g+rwX would do).
-                fn apply_fsgroup_permissions(dir: &std::path::Path) {
-                    use std::os::unix::fs::PermissionsExt;
-                    if let Ok(entries) = std::fs::read_dir(dir) {
-                        for entry in entries.flatten() {
-                            let fpath = entry.path();
-                            if let Ok(meta) = std::fs::metadata(&fpath) {
-                                let mode = meta.permissions().mode();
-                                // Copy owner bits (bits 8-6) to group bits (bits 5-3)
-                                let owner_bits = (mode >> 6) & 0o7;
-                                let new_mode = (mode & !0o070) | (owner_bits << 3);
-                                if new_mode != mode {
-                                    let _ = std::fs::set_permissions(
-                                        &fpath,
-                                        std::fs::Permissions::from_mode(new_mode),
-                                    );
-                                }
-                                if meta.is_dir() {
-                                    apply_fsgroup_permissions(&fpath);
-                                }
-                            }
-                        }
-                    }
-                }
-                apply_fsgroup_permissions(std::path::Path::new(path));
-
-                // Set setgid bit on the directory itself so new files inherit group
-                if let Ok(meta) = std::fs::metadata(path) {
-                    let mode = meta.permissions().mode();
-                    let owner_bits = (mode >> 6) & 0o7;
-                    let new_mode = (mode & !0o070) | (owner_bits << 3) | 0o2000;
-                    let _ =
-                        std::fs::set_permissions(path, std::fs::Permissions::from_mode(new_mode));
-                }
+                apply_fsgroup_to_path(path, fs_group);
             }
             info!(
                 "Applied fsGroup {} to {} volumes",
@@ -2714,6 +3107,27 @@ impl ContainerRuntime {
                 "Using PersistentVolumeClaim volume {} backed by PV {} at {}",
                 volume.name, pv_name, path
             );
+            // Real, live-confirmed bug this fixes: unlike every other
+            // branch in this function (DownwardAPI right below, Secret,
+            // ConfigMap, emptyDir), this one never ensured the resolved
+            // path actually exists — it just handed the raw string off
+            // to whatever sets up the container's bind mount. Docker
+            // auto-creates a missing bind-mount source directory itself
+            // when that happens, but the Docker *daemon* runs as root,
+            // so the directory ends up owned by root:root regardless of
+            // which user invoked `docker run` — outside the reach of
+            // this process's own CAP_CHOWN (granted to *this* process,
+            // not to dockerd) and outside the fsGroup pass that runs
+            // right after `create_volume` returns (which can only chown
+            // what already exists by the time it walks this path).
+            // Found live: a dynamically-provisioned PV's hostPath came
+            // back `root:root`, and Valkey (running as a non-root
+            // fsGroup-owned UID) failed with "Can't open or create
+            // append-only dir appendonlydir: Permission denied" — a
+            // symptom that gave no hint the real cause was this
+            // directory never having been created by kubelet itself.
+            std::fs::create_dir_all(&path)
+                .context("Failed to create PersistentVolumeClaim host path directory")?;
             return Ok(path);
         }
 
@@ -3101,85 +3515,9 @@ impl ContainerRuntime {
                         if let Some(parent) = std::path::Path::new(&token_path).parent() {
                             std::fs::create_dir_all(parent)?;
                         }
-                        // Generate a real JWT token bound to this pod
-                        let sa_name = pod
-                            .spec
-                            .as_ref()
-                            .and_then(|s| s.service_account_name.as_deref())
-                            .unwrap_or("default");
-                        let sa_uid = if let Some(storage) = storage {
-                            let sa_key = build_key("serviceaccounts", Some(namespace), sa_name);
-                            match storage
-                                .get::<rusternetes_common::resources::ServiceAccount>(&sa_key)
-                                .await
-                            {
-                                Ok(sa) => sa.metadata.uid.clone(),
-                                Err(_) => String::new(),
-                            }
-                        } else {
-                            String::new()
-                        };
-                        let expiration_seconds = sa_token.expiration_seconds.unwrap_or(3600);
-                        let now = chrono::Utc::now();
-                        let exp = now.timestamp() + expiration_seconds;
-                        let mut audiences = vec!["rusternetes".to_string()];
-                        if let Some(ref aud) = sa_token.audience {
-                            audiences = vec![aud.clone()];
-                        }
-                        let node_name = pod.spec.as_ref().and_then(|s| s.node_name.clone());
-                        let node_uid = if let (Some(ref nn), Some(st)) = (&node_name, storage) {
-                            let node_key = build_key("nodes", None::<&str>, nn);
-                            st.get::<serde_json::Value>(&node_key)
-                                .await
-                                .ok()
-                                .and_then(|v| {
-                                    v.pointer("/metadata/uid")
-                                        .and_then(|u| u.as_str())
-                                        .map(|s| s.to_string())
-                                })
-                        } else {
-                            None
-                        };
-                        let claims = rusternetes_common::auth::ServiceAccountClaims {
-                            sub: format!("system:serviceaccount:{}:{}", namespace, sa_name),
-                            namespace: namespace.to_string(),
-                            uid: sa_uid.clone(),
-                            iat: now.timestamp(),
-                            exp,
-                            iss: "https://kubernetes.default.svc.cluster.local".to_string(),
-                            aud: audiences,
-                            kubernetes: Some(rusternetes_common::auth::KubernetesClaims {
-                                namespace: namespace.to_string(),
-                                svcacct: rusternetes_common::auth::KubeRef {
-                                    name: sa_name.to_string(),
-                                    uid: sa_uid,
-                                },
-                                pod: Some(rusternetes_common::auth::KubeRef {
-                                    name: pod_name.clone(),
-                                    uid: pod.metadata.uid.clone(),
-                                }),
-                                node: node_name.as_ref().map(|nn| {
-                                    rusternetes_common::auth::KubeRef {
-                                        name: nn.clone(),
-                                        uid: node_uid.clone().unwrap_or_default(),
-                                    }
-                                }),
-                            }),
-                            pod_name: Some(pod_name.clone()),
-                            pod_uid: Some(pod.metadata.uid.clone()),
-                            node_name,
-                            node_uid,
-                        };
-                        let token = match self.token_manager.generate_token(claims) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                warn!(
-                                    "Failed to generate SA token for pod {}: {}, using placeholder",
-                                    pod_name, e
-                                );
-                                "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.placeholder".to_string()
-                            }
-                        };
+                        let token = self
+                            .mint_serviceaccount_token(pod, namespace, storage, sa_token)
+                            .await;
                         std::fs::write(&token_path, &token)?;
                         #[cfg(unix)]
                         {
@@ -3228,6 +3566,98 @@ impl ContainerRuntime {
         std::fs::create_dir_all(&volume_dir)
             .context("Failed to create fallback volume directory")?;
         Ok(volume_dir)
+    }
+
+    /// Mint a fresh JWT for a pod's projected ServiceAccountToken volume
+    /// source. Shared by the initial mount in `create_volume` and the
+    /// periodic rotation in `refresh_volumes` — see the doc comment there
+    /// for why rotation exists at all.
+    async fn mint_serviceaccount_token(
+        &self,
+        pod: &Pod,
+        namespace: &str,
+        storage: Option<&std::sync::Arc<rusternetes_storage::StorageBackend>>,
+        sa_token: &rusternetes_common::resources::pod::ServiceAccountTokenProjection,
+    ) -> String {
+        let pod_name = &pod.metadata.name;
+        let sa_name = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.service_account_name.as_deref())
+            .unwrap_or("default");
+        let sa_uid = if let Some(storage) = storage {
+            let sa_key = build_key("serviceaccounts", Some(namespace), sa_name);
+            match storage
+                .get::<rusternetes_common::resources::ServiceAccount>(&sa_key)
+                .await
+            {
+                Ok(sa) => sa.metadata.uid.clone(),
+                Err(_) => String::new(),
+            }
+        } else {
+            String::new()
+        };
+        let expiration_seconds = sa_token.expiration_seconds.unwrap_or(3600);
+        let now = chrono::Utc::now();
+        let exp = now.timestamp() + expiration_seconds;
+        let mut audiences = vec!["rusternetes".to_string()];
+        if let Some(ref aud) = sa_token.audience {
+            audiences = vec![aud.clone()];
+        }
+        let node_name = pod.spec.as_ref().and_then(|s| s.node_name.clone());
+        let node_uid = if let (Some(ref nn), Some(st)) = (&node_name, storage) {
+            let node_key = build_key("nodes", None::<&str>, nn);
+            st.get::<serde_json::Value>(&node_key)
+                .await
+                .ok()
+                .and_then(|v| {
+                    v.pointer("/metadata/uid")
+                        .and_then(|u| u.as_str())
+                        .map(|s| s.to_string())
+                })
+        } else {
+            None
+        };
+        let claims = rusternetes_common::auth::ServiceAccountClaims {
+            sub: format!("system:serviceaccount:{}:{}", namespace, sa_name),
+            namespace: namespace.to_string(),
+            uid: sa_uid.clone(),
+            iat: now.timestamp(),
+            exp,
+            iss: "https://kubernetes.default.svc.cluster.local".to_string(),
+            aud: audiences,
+            kubernetes: Some(rusternetes_common::auth::KubernetesClaims {
+                namespace: namespace.to_string(),
+                svcacct: rusternetes_common::auth::KubeRef {
+                    name: sa_name.to_string(),
+                    uid: sa_uid,
+                },
+                pod: Some(rusternetes_common::auth::KubeRef {
+                    name: pod_name.clone(),
+                    uid: pod.metadata.uid.clone(),
+                }),
+                node: node_name
+                    .as_ref()
+                    .map(|nn| rusternetes_common::auth::KubeRef {
+                        name: nn.clone(),
+                        uid: node_uid.clone().unwrap_or_default(),
+                    }),
+            }),
+            pod_name: Some(pod_name.clone()),
+            pod_uid: Some(pod.metadata.uid.clone()),
+            node_name,
+            node_uid,
+        };
+        match self.token_manager.generate_token(claims) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(
+                    "Failed to generate SA token for pod {}: {}, using placeholder",
+                    pod_name, e
+                );
+                "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.placeholder".to_string()
+            }
+        }
     }
 
     /// Create ServiceAccount token volume for in-cluster authentication
@@ -3483,12 +3913,15 @@ impl ContainerRuntime {
 
         // Inject Kubernetes service environment variables for in-cluster access.
         // When using direct API server IP (KUBERNETES_SERVICE_HOST_OVERRIDE),
-        // use port 6443 (the actual API server port). When using ClusterIP,
-        // use port 443 (the service port that DNAT maps to 6443).
+        // use the API server's real port — KUBERNETES_SERVICE_PORT_OVERRIDE if
+        // set (the api-server doesn't have to be on the conventional 6443;
+        // e.g. this project's own integration harness uses 18443), else 6443.
+        // When using ClusterIP, use port 443 (the service port that DNAT maps
+        // to the api-server's real port).
         let k8s_port = if std::env::var("KUBERNETES_SERVICE_HOST_OVERRIDE").is_ok() {
-            "6443"
+            std::env::var("KUBERNETES_SERVICE_PORT_OVERRIDE").unwrap_or_else(|_| "6443".to_string())
         } else {
-            "443"
+            "443".to_string()
         };
         env_list.push(format!(
             "KUBERNETES_SERVICE_HOST={}",
@@ -3977,6 +4410,23 @@ impl ContainerRuntime {
                                     // subPath target doesn't exist — create as directory
                                     if let Err(e) = std::fs::create_dir_all(&full) {
                                         warn!("Failed to create subPath dir {}: {}", full, e);
+                                    } else {
+                                        // This directory is created here, per-container,
+                                        // *after* create_pod_volumes' one-time fsGroup
+                                        // pass over each volume's root already ran — so
+                                        // it never inherited the pod's fsGroup ownership
+                                        // and needs the same treatment applied to it
+                                        // individually. See apply_fsgroup_to_path's doc
+                                        // comment for the real failure this fixes.
+                                        #[cfg(unix)]
+                                        if let Some(fs_group) = pod
+                                            .spec
+                                            .as_ref()
+                                            .and_then(|s| s.security_context.as_ref())
+                                            .and_then(|sc| sc.fs_group)
+                                        {
+                                            apply_fsgroup_to_path(&full, fs_group);
+                                        }
                                     }
                                 }
                             }
@@ -4099,14 +4549,30 @@ impl ContainerRuntime {
                         // Container DNS first so container hostnames (api-server) resolve.
                         // Cluster DNS second for K8s service names.
                         // K8s ref: pkg/kubelet/network/dns/dns.go — getClusterDNS()
-                        let host_dns =
-                            std::fs::read_to_string("/etc/resolv.conf")
-                                .ok()
-                                .and_then(|c| {
-                                    c.lines().find(|l| l.starts_with("nameserver")).map(|l| {
-                                        l.trim_start_matches("nameserver").trim().to_string()
-                                    })
-                                });
+                        //
+                        // The host's own nameserver is skipped when it's
+                        // loopback-scoped (127.0.0.0/8 or ::1) — very
+                        // common on hosts running systemd-resolved's stub
+                        // listener (`/etc/resolv.conf` then reads just
+                        // `nameserver 127.0.0.53`), and *always* wrong to
+                        // copy here: a loopback address in the host's own
+                        // network namespace is never reachable from a pod
+                        // in a different one (unlike the "Default"/
+                        // host-network branches above, which intentionally
+                        // inherit the host's resolv.conf verbatim — this
+                        // branch only ever meant to add the host's
+                        // nameserver as a convenience alongside cluster
+                        // DNS, never to blindly copy an address that can
+                        // only ever work for the host itself). When that
+                        // leaves nothing, fall back to
+                        // /run/systemd/resolve/resolv.conf — the real
+                        // "uplink" nameservers systemd-resolved itself
+                        // talks to, which it maintains as a matter of
+                        // course alongside the stub file on any host
+                        // running it in (the default) stub mode. Real,
+                        // documented systemd-resolved behavior (see
+                        // resolved.conf(5)), not specific to this host.
+                        let host_dns = host_nameserver_for_pods();
                         let nameservers = match host_dns {
                             Some(dns) => {
                                 format!("nameserver {}\nnameserver {}", dns, self.cluster_dns)
@@ -4402,6 +4868,7 @@ impl ContainerRuntime {
 
         let mut config = Config {
             image: Some(container.image.clone()),
+            labels: Some(self.ownership_labels(pod_name)),
             env,
             working_dir: container.working_dir.clone(),
             user: run_as_user,
@@ -4495,25 +4962,19 @@ impl ContainerRuntime {
                     .security_context
                     .as_ref()
                     .and_then(|sc| sc.read_only_root_filesystem),
-                // Security options: no-new-privileges when allowPrivilegeEscalation is false
-                security_opt: {
-                    let ape = container
-                        .security_context
-                        .as_ref()
-                        .and_then(|sc| sc.allow_privilege_escalation)
-                        .or_else(|| {
-                            pod.spec
-                                .as_ref()
-                                .and_then(|s| s.security_context.as_ref())
-                                .and_then(|sc| sc.run_as_non_root)
-                                .map(|_| false)
-                        });
-                    if ape == Some(false) {
-                        Some(vec!["no-new-privileges".to_string()])
-                    } else {
-                        None
-                    }
-                },
+                // Security options: no-new-privileges when allowPrivilegeEscalation
+                // is false, and seccompProfile.type (container-level, falling back
+                // to pod-level — real Kubernetes field-inheritance semantics).
+                // `seccompProfile` was previously an unused type: parsed from the
+                // pod spec but never read by container creation, so setting it
+                // (e.g. `type: Unconfined`, the real Kubernetes way to let a pod
+                // create nested namespaces — `unshare(CLONE_NEWUSER)` and friends
+                // are blocked by Docker's default seccomp profile — without going
+                // all the way to `privileged: true`) silently did nothing.
+                security_opt: security_opts_for(
+                    container.security_context.as_ref(),
+                    pod.spec.as_ref().and_then(|s| s.security_context.as_ref()),
+                ),
                 // Capabilities
                 cap_add: container
                     .security_context
@@ -4877,6 +5338,19 @@ impl ContainerRuntime {
 
                 // Remove by ID if available, otherwise by name
                 let remove_target = conflicting_id.as_deref().unwrap_or(&container_name);
+                // Never remove a container this cluster didn't create — on a
+                // Docker daemon shared with another cluster instance, a name
+                // collision is possible (same pod name, different cluster),
+                // and blindly force-removing here would delete someone
+                // else's container. Surface a clear error instead.
+                if let Ok(existing) = self.docker.inspect_container(remove_target, None).await {
+                    if !self.is_owned_by_this_cluster(&existing.config.and_then(|c| c.labels)) {
+                        return Err(anyhow::anyhow!(
+                            "Container name {} is already in use by a container this cluster did not create; refusing to remove it",
+                            container_name
+                        ));
+                    }
+                }
                 let _ = self
                     .docker
                     .remove_container(
@@ -7373,14 +7847,14 @@ impl ContainerRuntime {
                                 for item in items {
                                     if let Some(value) = data.get(&item.key) {
                                         let file_path = format!("{}/{}", volume_dir, item.path);
-                                        let _ = std::fs::write(&file_path, value);
+                                        write_file_if_changed(&file_path, value);
                                     }
                                 }
                             } else {
                                 // Write all current keys
                                 for (key, value) in data {
                                     let file_path = format!("{}/{}", volume_dir, key);
-                                    let _ = std::fs::write(&file_path, value);
+                                    write_file_if_changed(&file_path, value);
                                 }
                                 // Delete files for keys that no longer exist
                                 if let Ok(entries) = std::fs::read_dir(&volume_dir) {
@@ -7431,13 +7905,13 @@ impl ContainerRuntime {
                                 for item in items {
                                     if let Some(value) = data.get(&item.key) {
                                         let file_path = format!("{}/{}", volume_dir, item.path);
-                                        let _ = std::fs::write(&file_path, value);
+                                        write_file_if_changed(&file_path, value.as_bytes());
                                     }
                                 }
                             } else {
                                 for (key, value) in data {
                                     let file_path = format!("{}/{}", volume_dir, key);
-                                    let _ = std::fs::write(&file_path, value);
+                                    write_file_if_changed(&file_path, value.as_bytes());
                                 }
                                 // Delete files for keys removed from ConfigMap
                                 if let Ok(entries) = std::fs::read_dir(&volume_dir) {
@@ -7459,6 +7933,86 @@ impl ContainerRuntime {
                             if let Ok(entries) = std::fs::read_dir(&volume_dir) {
                                 for entry in entries.flatten() {
                                     let _ = std::fs::remove_file(entry.path());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Rotate projected ServiceAccountToken volumes before they expire.
+            // `create_volume` mints this token exactly once, at pod start,
+            // with a fixed `exp = now + expiration_seconds` (default 3600s)
+            // — nothing else used to refresh it. Once `exp` passed, the
+            // api-server's JWT validation (`jsonwebtoken::Validation`'s
+            // default `validate_exp: true`, `crates/common/src/auth.rs`)
+            // started rejecting every request from the pod, which is fatal
+            // for anything doing client-go leader election: it gives up and
+            // exits the whole process once lease renewal fails. That's what
+            // was causing CNPG's operator pod to crash-loop roughly once an
+            // hour — kubelet would only notice and restart it *after* the
+            // token had already been dead for a while. Real kubelet rotates
+            // at ~80% of the token's TTL; mirror that here using the token
+            // file's mtime as a proxy for when it was last minted, so a
+            // fresh token is in place well before the old one expires.
+            if let Some(projected) = &volume.projected {
+                if let Some(sources) = &projected.sources {
+                    for source in sources {
+                        if let Some(sa_token) = &source.service_account_token {
+                            let token_path = format!("{}/{}", volume_dir, sa_token.path);
+                            let expiration_seconds = sa_token.expiration_seconds.unwrap_or(3600);
+                            let token_age = std::fs::metadata(&token_path)
+                                .and_then(|m| m.modified())
+                                .ok()
+                                .and_then(|modified| modified.elapsed().ok());
+                            let needs_rotation =
+                                token_needs_rotation(token_age, expiration_seconds);
+                            if needs_rotation {
+                                if let Some(parent) = std::path::Path::new(&token_path).parent() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                                let token = self
+                                    .mint_serviceaccount_token(
+                                        pod,
+                                        namespace,
+                                        Some(storage),
+                                        sa_token,
+                                    )
+                                    .await;
+                                // Not a plain `std::fs::write`: that truncates the
+                                // file before writing the new token, and a rotated
+                                // token's bytes always differ from the old ones (a
+                                // fresh `iat`/`exp` every time), so this call site
+                                // can never take a "content unchanged" fast path the
+                                // way Secret/ConfigMap volume refreshes can. A
+                                // concurrent reader — `kube`-rs's in-cluster client
+                                // reloads the token file from disk on its own timer,
+                                // independent of this rotation — can land mid-write
+                                // and read a truncated/torn JWT, which the
+                                // api-server then correctly rejects. Surfaced live
+                                // as an intermittent, otherwise-inexplicable
+                                // "Invalid token" 401 with no relation to actual
+                                // expiry (confirmed by pulling the exact rejected
+                                // token out of a running container and re-verifying
+                                // its signature/claims by hand: well-formed,
+                                // correctly signed, not expired). `rename` is
+                                // atomic on POSIX, so writing to a same-directory
+                                // temp file first means a concurrent reader always
+                                // sees either the complete old file or the complete
+                                // new one, never a partial write.
+                                let tmp_path = format!("{token_path}.tmp-{}", std::process::id());
+                                let rotated = std::fs::write(&tmp_path, &token)
+                                    .and_then(|()| std::fs::rename(&tmp_path, &token_path));
+                                if rotated.is_ok() {
+                                    debug!(
+                                        "Rotated ServiceAccountToken for pod {}/{} before expiry",
+                                        namespace, pod_name
+                                    );
+                                } else {
+                                    warn!(
+                                        "Failed to write rotated ServiceAccountToken for pod {}/{}",
+                                        namespace, pod_name
+                                    );
                                 }
                             }
                         }
@@ -8026,17 +8580,19 @@ impl ContainerRuntime {
 
         let containers = self.docker.list_containers(Some(options)).await?;
 
+        // Scoped to containers labeled as belonging to this cluster (see
+        // `ownership_labels`), not by parsing container names — on a Docker
+        // daemon shared with anything else (another rusternetes instance, or
+        // unrelated containers entirely), name-based matching had no way to
+        // tell "not mine" from "mine, just don't recognize the format", and
+        // treated the former as stale on every startup/periodic cleanup.
         let mut pod_names = std::collections::HashSet::new();
         for container in containers {
-            if let Some(names) = container.names {
-                for name in names {
-                    let name = name.trim_start_matches('/');
-                    if let Some(pod_name) = name.split('_').next() {
-                        if !pod_name.starts_with("rusternetes-") {
-                            pod_names.insert(pod_name.to_string());
-                        }
-                    }
-                }
+            if !self.is_owned_by_this_cluster(&container.labels) {
+                continue;
+            }
+            if let Some(pod_name) = container.labels.as_ref().and_then(|l| l.get(POD_LABEL)) {
+                pod_names.insert(pod_name.clone());
             }
         }
 
@@ -8216,9 +8772,287 @@ pub fn parse_cpu_quantity(s: &str) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::ContainerRuntime;
-    use rusternetes_common::resources::{Container, ContainerState, ContainerStatus, Pod, PodSpec};
+    use super::{
+        apply_fsgroup_to_path, security_opts_for, token_needs_rotation, write_file_if_changed,
+        ContainerRuntime,
+    };
+    use rusternetes_common::resources::pod::PodSecurityContext as PodLevelSecurityContext;
+    use rusternetes_common::resources::{
+        Capabilities, Container, ContainerState, ContainerStatus, Pod, PodSpec, SeccompProfile,
+        SecurityContext,
+    };
     use rusternetes_common::types::{ObjectMeta, TypeMeta};
+    use std::time::Duration;
+
+    #[test]
+    fn security_opts_none_when_nothing_set() {
+        assert_eq!(security_opts_for(None, None), None);
+    }
+
+    #[test]
+    fn token_needs_rotation_when_file_missing() {
+        // No token file yet (first mount, or it was deleted out from under
+        // us) — always rotate rather than risk leaving the pod with no
+        // token at all.
+        assert!(token_needs_rotation(None, 3600));
+    }
+
+    #[test]
+    fn token_needs_rotation_false_for_a_fresh_token() {
+        assert!(!token_needs_rotation(Some(Duration::from_secs(0)), 3600));
+        assert!(!token_needs_rotation(Some(Duration::from_secs(60)), 3600));
+    }
+
+    #[test]
+    fn token_needs_rotation_false_just_under_80_percent_of_ttl() {
+        // 3600 * 0.8 = 2880s — one second under that must not rotate yet.
+        assert!(!token_needs_rotation(Some(Duration::from_secs(2879)), 3600));
+    }
+
+    #[test]
+    fn token_needs_rotation_true_at_and_past_80_percent_of_ttl() {
+        // This is the exact bug this fixes: a token minted once at pod
+        // start with the default 3600s TTL and never refreshed silently
+        // expires ~an hour in, breaking every authenticated request the
+        // pod makes (fatal for client-go leader election, which exits the
+        // whole process on renewal failure — this crash-looped CNPG's
+        // operator roughly once an hour before this fix).
+        assert!(token_needs_rotation(Some(Duration::from_secs(2880)), 3600));
+        assert!(token_needs_rotation(Some(Duration::from_secs(3600)), 3600));
+        assert!(token_needs_rotation(Some(Duration::from_secs(9999)), 3600));
+    }
+
+    #[test]
+    fn token_needs_rotation_respects_a_custom_expiration_seconds() {
+        // A pod requesting a shorter-lived token (e.g. `expirationSeconds:
+        // 600`) must rotate on its own schedule, not the 3600s default.
+        assert!(!token_needs_rotation(Some(Duration::from_secs(479)), 600));
+        assert!(token_needs_rotation(Some(Duration::from_secs(480)), 600));
+    }
+
+    #[test]
+    fn write_file_if_changed_creates_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tls.crt");
+        write_file_if_changed(path.to_str().unwrap(), b"cert-bytes");
+        assert_eq!(std::fs::read(&path).unwrap(), b"cert-bytes");
+    }
+
+    #[test]
+    fn write_file_if_changed_leaves_an_identical_file_untouched() {
+        // This is the actual bug: refresh_volumes used to call plain
+        // std::fs::write unconditionally on every sync pass, truncating and
+        // rewriting even a byte-for-byte identical file. That's a real race
+        // for anything watching the file via inotify and reading it
+        // synchronously on the write event (controller-runtime's
+        // CertWatcher intermittently caught tls.crt/tls.key mid-truncation
+        // and logged "failed to find any PEM data"). Detect the regression
+        // by checking mtime doesn't advance when content hasn't changed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tls.crt");
+        std::fs::write(&path, b"cert-bytes").unwrap();
+        let mtime_before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_file_if_changed(path.to_str().unwrap(), b"cert-bytes");
+
+        let mtime_after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(mtime_before, mtime_after);
+        assert_eq!(std::fs::read(&path).unwrap(), b"cert-bytes");
+    }
+
+    #[test]
+    fn write_file_if_changed_overwrites_when_content_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tls.crt");
+        std::fs::write(&path, b"old-bytes").unwrap();
+
+        write_file_if_changed(path.to_str().unwrap(), b"new-bytes");
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"new-bytes");
+    }
+
+    /// The real bug this write-path is hardened against (see this
+    /// function's doc comment, and the ServiceAccountToken rotation site in
+    /// `refresh_volumes`): a plain `std::fs::write` truncates before
+    /// writing, so a reader polling the file mid-write can observe a
+    /// zero-length or partial file. Can't deterministically reproduce a
+    /// concurrent-read race in a unit test, but can assert the mechanism
+    /// this fix relies on: content lands via a same-directory temp file
+    /// plus `rename` (atomic on POSIX), and no leftover temp file remains
+    /// after a successful write — proving the rename actually happened
+    /// rather than a fallback direct write.
+    #[test]
+    fn write_file_if_changed_leaves_no_temp_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+
+        write_file_if_changed(path.to_str().unwrap(), b"jwt-bytes");
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"jwt-bytes");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "expected no .tmp- sibling files, found {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn security_opts_no_new_privileges_from_container_allow_privilege_escalation() {
+        let sc = SecurityContext {
+            allow_privilege_escalation: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            security_opts_for(Some(&sc), None),
+            Some(vec!["no-new-privileges".to_string()])
+        );
+    }
+
+    #[test]
+    fn security_opts_seccomp_unconfined_from_container() {
+        let sc = SecurityContext {
+            seccomp_profile: Some(SeccompProfile {
+                r#type: "Unconfined".to_string(),
+                localhost_profile: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            security_opts_for(Some(&sc), None),
+            Some(vec!["seccomp=unconfined".to_string()])
+        );
+    }
+
+    #[test]
+    fn security_opts_seccomp_falls_back_to_pod_level() {
+        let pod_sc = PodLevelSecurityContext {
+            seccomp_profile: Some(SeccompProfile {
+                r#type: "Unconfined".to_string(),
+                localhost_profile: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            security_opts_for(None, Some(&pod_sc)),
+            Some(vec!["seccomp=unconfined".to_string()])
+        );
+    }
+
+    #[test]
+    fn security_opts_container_seccomp_overrides_pod_level() {
+        let pod_sc = PodLevelSecurityContext {
+            seccomp_profile: Some(SeccompProfile {
+                r#type: "Unconfined".to_string(),
+                localhost_profile: None,
+            }),
+            ..Default::default()
+        };
+        let container_sc = SecurityContext {
+            seccomp_profile: Some(SeccompProfile {
+                r#type: "RuntimeDefault".to_string(),
+                localhost_profile: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(security_opts_for(Some(&container_sc), Some(&pod_sc)), None);
+    }
+
+    #[test]
+    fn security_opts_runtime_default_and_localhost_add_no_entry() {
+        for profile_type in ["RuntimeDefault", "Localhost"] {
+            let sc = SecurityContext {
+                seccomp_profile: Some(SeccompProfile {
+                    r#type: profile_type.to_string(),
+                    localhost_profile: None,
+                }),
+                ..Default::default()
+            };
+            assert_eq!(security_opts_for(Some(&sc), None), None);
+        }
+    }
+
+    #[test]
+    fn security_opts_combines_both_entries() {
+        let sc = SecurityContext {
+            allow_privilege_escalation: Some(false),
+            seccomp_profile: Some(SeccompProfile {
+                r#type: "Unconfined".to_string(),
+                localhost_profile: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            security_opts_for(Some(&sc), None),
+            Some(vec![
+                "no-new-privileges".to_string(),
+                "seccomp=unconfined".to_string()
+            ])
+        );
+    }
+
+    // `roci`'s own nested-namespace use case (design.md's Risks note on
+    // scoping the runner ServiceAccount tightly, not on how a pod
+    // requests the kernel permission it needs): SYS_ADMIN + seccomp
+    // Unconfined, deliberately never `privileged: true`.
+    #[test]
+    fn security_opts_supports_the_nested_namespace_grant_without_privileged() {
+        let sc = SecurityContext {
+            capabilities: Some(Capabilities {
+                add: Some(vec!["SYS_ADMIN".to_string()]),
+                drop: None,
+            }),
+            seccomp_profile: Some(SeccompProfile {
+                r#type: "Unconfined".to_string(),
+                localhost_profile: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(sc.privileged, None);
+        assert_eq!(
+            security_opts_for(Some(&sc), None),
+            Some(vec!["seccomp=unconfined".to_string()])
+        );
+    }
+
+    #[test]
+    fn first_non_loopback_nameserver_skips_the_systemd_resolved_stub() {
+        // What /etc/resolv.conf looks like on a host running
+        // systemd-resolved's stub listener — the common case that broke
+        // pod DNS resolution before this fix.
+        let resolv = "nameserver 127.0.0.53\noptions edns0 trust-ad\nsearch .\n";
+        assert_eq!(super::first_non_loopback_nameserver(resolv), None);
+    }
+
+    #[test]
+    fn first_non_loopback_nameserver_skips_ipv6_loopback_too() {
+        let resolv = "nameserver ::1\nnameserver 8.8.8.8\n";
+        assert_eq!(
+            super::first_non_loopback_nameserver(resolv),
+            Some("8.8.8.8".to_string())
+        );
+    }
+
+    #[test]
+    fn first_non_loopback_nameserver_passes_through_a_real_upstream() {
+        let resolv = "nameserver 192.168.1.1\nnameserver 127.0.0.53\n";
+        assert_eq!(
+            super::first_non_loopback_nameserver(resolv),
+            Some("192.168.1.1".to_string())
+        );
+    }
+
+    #[test]
+    fn first_non_loopback_nameserver_none_when_no_nameserver_line() {
+        assert_eq!(
+            super::first_non_loopback_nameserver("search example.com\n"),
+            None
+        );
+    }
 
     /// Docker rejects `UtsMode: "container:<id>"` with `400 invalid UTS mode`,
     /// so it must be classified as unsupported; Podman accepts it.
@@ -10475,6 +11309,41 @@ mod tests {
             final_mode, 0o664,
             "fsGroup should copy owner rw bits to group, got {:04o}",
             final_mode
+        );
+    }
+
+    /// Real bug this covers: a `subPath` directory (e.g. Bitnami charts'
+    /// `subPath: app-conf-dir` under a shared `empty-dir` volume, needed
+    /// because their images run as a non-root UID against a read-only root
+    /// filesystem) is created per-container, after `create_pod_volumes`'
+    /// one-time fsGroup pass over each volume's root already ran — so
+    /// without applying fsGroup to it individually (this function, called
+    /// from the subPath-creation call site), it stays owned by whatever
+    /// UID/GID kubelet itself runs as, and the container fails to write
+    /// into its own declared writable directory. `chown` itself needs root
+    /// to actually change the group (silently a no-op under a non-root
+    /// test runner, same as every other test here that can't assume root),
+    /// so this asserts the part that doesn't: the setgid bit this function
+    /// sets on the directory itself, so files created under it later would
+    /// inherit the (correctly-chowned, in a real root kubelet process)
+    /// group instead of the creating process's primary group.
+    #[test]
+    fn apply_fsgroup_to_path_sets_setgid_on_a_freshly_created_subpath_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sub_path_dir = dir.path().join("app-conf-dir");
+        std::fs::create_dir_all(&sub_path_dir).unwrap();
+        std::fs::set_permissions(&sub_path_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        apply_fsgroup_to_path(sub_path_dir.to_str().unwrap(), 1001);
+
+        let mode = std::fs::metadata(&sub_path_dir).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o2000,
+            0o2000,
+            "expected setgid bit set on the subPath dir, got mode {:04o}",
+            mode & 0o7777
         );
     }
 

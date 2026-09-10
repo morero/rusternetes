@@ -78,6 +78,74 @@ pub fn pod_status_equal(a: &Pod, b: &Pod) -> bool {
     serde_json::to_value(&a.status).ok() == serde_json::to_value(&b.status).ok()
 }
 
+/// Whether `existing`'s entry for `new_cs`'s container name already reflects
+/// this exact termination — same container ID, already marked not-ready.
+///
+/// The same watch-triggered-reentry pattern `pod_status_equal` guards
+/// against for terminal pods also applies to the restartPolicy=Always
+/// CrashLoopBackOff path: incrementing `restart_count` and writing status
+/// is itself a write the pod's own watch fires on, and without this check
+/// every re-entry against the *same* still-terminated container (before
+/// `start_pod` is actually called, gated separately by backoff) bumped the
+/// count and wrote again — producing hundreds of recorded "restarts" for
+/// one real container termination, all within the time one backoff window
+/// is supposed to take.
+fn container_termination_already_recorded(
+    existing: Option<&[ContainerStatus]>,
+    new_cs: &ContainerStatus,
+) -> bool {
+    existing
+        .and_then(|statuses| statuses.iter().find(|c| c.name == new_cs.name))
+        .map(|existing| {
+            !existing.ready
+                && existing.container_id == new_cs.container_id
+                && new_cs.container_id.is_some()
+        })
+        .unwrap_or(false)
+}
+
+/// Whether every container in `observed` (the runtime's current view) has
+/// already been recorded as terminated in `existing` (this pod's stored
+/// status) — see [`container_termination_already_recorded`]. Empty/missing
+/// `observed` is never "already recorded" (nothing to skip re-processing).
+fn all_terminations_already_recorded(
+    existing: Option<&Vec<ContainerStatus>>,
+    observed: Option<&[ContainerStatus]>,
+) -> bool {
+    match observed {
+        Some(cs) if !cs.is_empty() => cs
+            .iter()
+            .all(|c| container_termination_already_recorded(existing.map(|v| v.as_slice()), c)),
+        _ => false,
+    }
+}
+
+/// Whether `sync_pod`'s `TerminatedPod` handler should forget this pod's
+/// worker state entirely (`true`), vs. keep recording it as
+/// `PodWorkerState::TerminatedPod` so future sync ticks recognize it's
+/// already fully handled (`false`).
+///
+/// Only `true` when the pod object itself was also just removed from
+/// storage (`deletionTimestamp` set — the caller deletes it from storage
+/// in that same branch). Get this backwards — forget unconditionally,
+/// which is what the code did before this fix — and it's a real, confirmed
+/// infinite loop: a naturally-terminal pod that's never explicitly deleted
+/// (every workflow-runner Job pod — Jobs don't delete their own completed
+/// pods) stays visible in storage forever. Forgetting its pod_states entry
+/// means the very next sync tick finds none, defaults back to `SyncPod`,
+/// re-derives `needs_terminating = true` from the still-terminal phase,
+/// and re-enters `TerminatingPod` — repeating stop/cleanup forever, every
+/// sync tick. Confirmed live: every workflow-runner Job pod ever created
+/// in this environment did exactly this, and the repeated
+/// stop_pod_for/cleanup_pod_volumes cycle raced something that leaves the
+/// pod's volume directory root-owned partway through, so
+/// `cleanup_pod_volumes`'s own `remove_dir_all` then fails with
+/// "Permission denied" forever too — a downstream symptom of this same
+/// loop, not a separate bug.
+fn should_forget_pod_worker(pod_has_deletion_timestamp: bool) -> bool {
+    pod_has_deletion_timestamp
+}
+
 impl Kubelet {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
@@ -1462,8 +1530,18 @@ impl Kubelet {
                 }
             }
             // Volumes are cleaned by stop_pod_for during TerminatingPod.
-            // Remove pod worker state — K8s HandlePodCleanups removes finished workers
-            self.pod_states.lock().unwrap().remove(pod_uid);
+            // See should_forget_pod_worker's doc comment for why this must
+            // NOT unconditionally forget the worker state — doing so was a
+            // real, confirmed infinite loop for every naturally-terminal,
+            // never-explicitly-deleted pod (every workflow-runner Job pod).
+            if should_forget_pod_worker(pod.metadata.deletion_timestamp.is_some()) {
+                self.pod_states.lock().unwrap().remove(pod_uid);
+            } else {
+                self.pod_states
+                    .lock()
+                    .unwrap()
+                    .insert(pod_uid.clone(), PodWorkerState::TerminatedPod);
+            }
             return Ok(());
         }
 
@@ -1857,9 +1935,23 @@ impl Kubelet {
                     debug!("Pod {}/{} already has CreateContainer(Config)Error, retrying without status reset", namespace, pod_name);
                 }
 
-                // Start the pod with timeout
+                // Start the pod with timeout. `start_pod` includes image
+                // pulls, and `tokio::time::timeout` *cancels* (drops) the
+                // wrapped future on expiry — for an in-flight bollard image
+                // pull, that drops the underlying request, not just this
+                // wait. A large, cold-cache image (e.g. `docker:dind`) under
+                // real disk I/O pressure can legitimately take longer than
+                // 30s to pull; with the old 30s bound, each retry restarted
+                // that same pull from scratch rather than letting one
+                // attempt actually finish, observed live to loop for
+                // several minutes before finally landing inside one 30s
+                // window by chance. 180s gives a slow pull room to
+                // complete once instead of being serially aborted — see
+                // ISSUES.md #13 (rinr repo) for the live repro. Real
+                // Kubernetes has no flat cap on this combined step either
+                // (separate, much more generous image-pull timeouts).
                 match tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
+                    std::time::Duration::from_secs(180),
                     self.runtime.start_pod(pod),
                 )
                 .await
@@ -3437,31 +3529,53 @@ impl Kubelet {
                             .and_then(|cs| cs.iter().map(|c| c.restart_count).max())
                             .unwrap_or(0);
 
-                        if let Some(ref mut status) = fresh_pod.status {
-                            if let Some(ref cs) = container_statuses {
-                                let updated_statuses: Vec<ContainerStatus> = cs
-                                    .iter()
-                                    .map(|c| {
-                                        let mut new_cs = c.clone();
-                                        // Preserve the Terminated state (with reason) from
-                                        // get_container_statuses. Increment restart count.
-                                        new_cs.restart_count = prev_restart + 1;
-                                        new_cs.ready = false;
-                                        new_cs.started = Some(false);
-                                        // Keep state as Terminated — tests need to observe it.
-                                        // On the NEXT sync cycle, after backoff, we'll set
-                                        // Waiting/CrashLoopBackOff and restart.
-                                        new_cs
-                                    })
-                                    .collect();
-                                status.container_statuses = Some(updated_statuses);
+                        // This handler re-enters on every watch-triggered reconcile for
+                        // this pod, not just once per real container termination — and
+                        // our own status writes below are themselves a write the watch
+                        // fires on. Without this check, every re-entry against the SAME
+                        // still-terminated container (start_pod is only called once
+                        // `should_restart` passes, below) bumped restart_count and wrote
+                        // status again, producing hundreds of "restarts" — and phase
+                        // updates elsewhere keying off restart_count churn — in the time
+                        // it takes one real backoff window to elapse. See
+                        // `all_terminations_already_recorded` for the check itself.
+                        let all_already_recorded = all_terminations_already_recorded(
+                            fresh_pod
+                                .status
+                                .as_ref()
+                                .and_then(|s| s.container_statuses.as_ref()),
+                            container_statuses.as_deref(),
+                        );
+
+                        let current_restart = if all_already_recorded {
+                            prev_restart
+                        } else {
+                            if let Some(ref mut status) = fresh_pod.status {
+                                if let Some(ref cs) = container_statuses {
+                                    let updated_statuses: Vec<ContainerStatus> = cs
+                                        .iter()
+                                        .map(|c| {
+                                            let mut new_cs = c.clone();
+                                            // Preserve the Terminated state (with reason) from
+                                            // get_container_statuses. Increment restart count.
+                                            new_cs.restart_count = prev_restart + 1;
+                                            new_cs.ready = false;
+                                            new_cs.started = Some(false);
+                                            // Keep state as Terminated — tests need to observe it.
+                                            // On the NEXT sync cycle, after backoff, we'll set
+                                            // Waiting/CrashLoopBackOff and restart.
+                                            new_cs
+                                        })
+                                        .collect();
+                                    status.container_statuses = Some(updated_statuses);
+                                }
                             }
-                        }
-                        let _ = self.storage.update(&key, &fresh_pod).await;
+                            let _ = self.storage.update(&key, &fresh_pod).await;
+                            prev_restart + 1
+                        };
 
                         // CrashLoopBackOff: compute backoff delay based on restart count
                         // K8s uses: 10s, 20s, 40s, 80s, 160s, 300s (capped at 5m)
-                        let current_restart = prev_restart + 1;
                         let backoff_secs: i64 =
                             std::cmp::min(10 * (1_i64 << (current_restart as i64 - 1).min(5)), 300);
                         // Check if enough time has passed since the container finished
@@ -4065,6 +4179,10 @@ impl Kubelet {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        all_terminations_already_recorded, container_termination_already_recorded,
+        should_forget_pod_worker,
+    };
     use rusternetes_common::resources::pod::PodSpec;
     use rusternetes_common::resources::{
         Container, ContainerState, ContainerStatus, Pod, PodStatus,
@@ -4177,6 +4295,131 @@ mod tests {
             volume_mounts: None,
             stop_signal: None,
         }
+    }
+
+    fn make_terminated_container_status(
+        name: &str,
+        container_id: &str,
+        restart_count: u32,
+        ready: bool,
+    ) -> ContainerStatus {
+        ContainerStatus {
+            name: name.to_string(),
+            ready,
+            restart_count,
+            last_state: None,
+            image: Some("nginx:latest".to_string()),
+            image_id: None,
+            container_id: Some(format!("docker://{}", container_id)),
+            state: Some(ContainerState::Terminated {
+                exit_code: 137,
+                signal: None,
+                reason: Some("OOMKilled".to_string()),
+                message: None,
+                started_at: Some("2024-01-01T00:00:00Z".parse().unwrap()),
+                finished_at: Some("2024-01-01T00:00:01Z".parse().unwrap()),
+                container_id: Some(format!("docker://{}", container_id)),
+            }),
+            started: Some(false),
+            allocated_resources: None,
+            allocated_resources_status: None,
+            resources: None,
+            user: None,
+            volume_mounts: None,
+            stop_signal: None,
+        }
+    }
+
+    // Regression test for the CrashLoopBackOff re-entrancy bug: a watch-
+    // triggered reconcile against the *same* still-terminated container
+    // (container_id unchanged, already marked not-ready from a prior
+    // entry) must be recognized as already recorded, not counted as a new
+    // termination — this is what stopped restart_count from climbing into
+    // the hundreds within one backoff window. See
+    // `container_termination_already_recorded`.
+    #[test]
+    fn test_termination_already_recorded_when_container_id_and_ready_match() {
+        let existing = vec![make_terminated_container_status("app", "abc123", 3, false)];
+        let observed = make_terminated_container_status("app", "abc123", 0, true);
+        assert!(container_termination_already_recorded(
+            Some(&existing),
+            &observed
+        ));
+    }
+
+    #[test]
+    fn test_termination_not_already_recorded_on_first_observation() {
+        // Existing entry is still `ready: true` (Running) — this is the
+        // first time we're observing the termination, not a re-entry.
+        let existing = vec![make_running_container_status("app")];
+        let observed = make_terminated_container_status("app", "abc123", 0, true);
+        assert!(!container_termination_already_recorded(
+            Some(&existing),
+            &observed
+        ));
+    }
+
+    #[test]
+    fn test_termination_not_already_recorded_after_real_restart() {
+        // A real restart replaced the container (new container_id) —
+        // this is a genuinely new termination, must be recorded.
+        let existing = vec![make_terminated_container_status("app", "abc123", 3, false)];
+        let observed = make_terminated_container_status("app", "def456", 0, true);
+        assert!(!container_termination_already_recorded(
+            Some(&existing),
+            &observed
+        ));
+    }
+
+    #[test]
+    fn test_termination_not_already_recorded_with_no_existing_status() {
+        let observed = make_terminated_container_status("app", "abc123", 0, true);
+        assert!(!container_termination_already_recorded(None, &observed));
+    }
+
+    #[test]
+    fn test_all_terminations_already_recorded_requires_every_container() {
+        let existing = vec![
+            make_terminated_container_status("app", "abc123", 3, false),
+            // "sidecar" still shows ready — its termination hasn't been
+            // recorded yet, so the pod-level check must not skip it.
+            make_running_container_status("sidecar"),
+        ];
+        let observed = vec![
+            make_terminated_container_status("app", "abc123", 0, true),
+            make_terminated_container_status("sidecar", "xyz789", 0, true),
+        ];
+        assert!(!all_terminations_already_recorded(
+            Some(&existing),
+            Some(&observed)
+        ));
+    }
+
+    #[test]
+    fn test_all_terminations_already_recorded_empty_observed_is_false() {
+        // Nothing observed means nothing to skip re-processing — nothing
+        // should ever be reported "already recorded" for an empty list.
+        assert!(!all_terminations_already_recorded(None, Some(&[])));
+        assert!(!all_terminations_already_recorded(None, None));
+    }
+
+    #[test]
+    fn should_forget_pod_worker_when_deletion_timestamp_is_set() {
+        // The pod object was also removed from storage in this same
+        // branch — safe (and necessary) to drop its worker state too.
+        assert!(should_forget_pod_worker(true));
+    }
+
+    #[test]
+    fn should_forget_pod_worker_false_when_no_deletion_timestamp() {
+        // This is the actual bug this fixes: a naturally-terminal pod
+        // that's never explicitly deleted (every workflow-runner Job pod)
+        // stays visible in storage forever. Forgetting its worker state
+        // here means the next sync tick defaults back to SyncPod,
+        // re-derives needs_terminating=true from the still-terminal
+        // phase, and re-enters TerminatingPod — an infinite loop that
+        // also corrupts the pod's volume directory (ISSUES.md #22).
+        assert!(!should_forget_pod_worker(false));
     }
 
     // A Running pod must have containerStatuses so consumers of the pod status
