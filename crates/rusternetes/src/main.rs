@@ -99,6 +99,13 @@ struct Args {
     #[arg(long)]
     disable_proxy: bool,
 
+    /// Prefix for this instance's kube-proxy iptables chain names (default:
+    /// "RUSTERNETES"). Set to a distinct value per instance when multiple
+    /// rusternetes instances' kube-proxies share a network namespace, so
+    /// their chain reset/populate cycles don't affect each other.
+    #[arg(long)]
+    kube_proxy_chain_prefix: Option<String>,
+
     /// Path to the console SPA build directory (enables web console at /console/)
     #[arg(long)]
     console_dir: Option<String>,
@@ -249,6 +256,7 @@ async fn run() -> Result<()> {
         let proxy_config = rusternetes_kube_proxy::KubeProxyConfig {
             node_name: args.node_name,
             sync_interval: args.proxy_sync_interval,
+            chain_prefix: args.kube_proxy_chain_prefix,
         };
         tokio::spawn(async move {
             if let Err(e) = rusternetes_kube_proxy::run(proxy_storage, proxy_config).await {

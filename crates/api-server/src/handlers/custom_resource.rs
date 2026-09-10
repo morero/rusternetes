@@ -193,6 +193,7 @@ pub async fn create_custom_resource(
     // Ensure metadata fields
     cr.metadata.ensure_uid();
     cr.metadata.ensure_creation_timestamp();
+    crate::handlers::lifecycle::set_initial_generation(&mut cr.metadata);
 
     // Set API version and kind
     let kind = crd.spec.names.kind.clone();
@@ -491,6 +492,34 @@ pub async fn update_custom_resource(
     cr.api_version = format!("{}/{}", group, version);
     cr.kind = crd.spec.names.kind.clone();
 
+    // Increment metadata.generation only when spec changes — same fix as
+    // generic_patch.rs's typed-resource PUT/PATCH handlers already have;
+    // this custom-resource (CRD instance) path never got it, silently
+    // breaking every operator's `generation != observedGeneration`
+    // resync-detection (e.g. workflow-operator design.md W3) for any CRD
+    // instance replaced via PUT — found live re-testing
+    // `platform-db-real-cluster`'s render Workflow, whose edited spec
+    // never re-triggered a render because generation never moved.
+    {
+        let resource_type_for_gen = format!("{}_{}", group.replace('.', "_"), plural);
+        let key_for_gen = if let Some(ref ns) = namespace {
+            build_key(&resource_type_for_gen, Some(ns), &name)
+        } else {
+            build_key(&resource_type_for_gen, None, &name)
+        };
+        if let Ok(current) = state.storage.get::<CustomResource>(&key_for_gen).await {
+            if let (Ok(old_json), Ok(new_json)) =
+                (serde_json::to_value(&current), serde_json::to_value(&cr))
+            {
+                crate::handlers::lifecycle::maybe_increment_generation(
+                    &old_json,
+                    &new_json,
+                    &mut cr.metadata,
+                );
+            }
+        }
+    }
+
     let cr_is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
 
     // Run validating webhooks for UPDATE operations.
@@ -603,6 +632,144 @@ pub async fn patch_custom_resource(
     } else {
         build_key(&resource_type, None, &name)
     };
+    // Server-side apply (Content-Type: application/apply-patch+yaml) —
+    // same real, field-manager-aware implementation generic_patch.rs's
+    // typed-resource handlers already use
+    // (rusternetes_common::server_side_apply), just never wired up here.
+    // Without this, any client using kube-rs's standard `Api::patch` with
+    // `PatchParams::apply(...)` against an *existing* custom resource
+    // (any platform.ertia.io CRD instance, or any third-party CRD like
+    // CNPG's `Cluster`) hit "Unsupported content type" on every apply
+    // after the first — found live: release-operator applies a rendered
+    // chart's resources with server-side apply, and a chart that renders
+    // more than one object (a ConfigMap alongside the Cluster CNPG's
+    // "cluster" chart does) hit this on the ConfigMap's second-and-later
+    // reconcile, well before ever reaching the Cluster object itself.
+    {
+        use axum::body::to_bytes;
+        let headers = req.headers();
+        let content_type = headers
+            .get("x-original-content-type")
+            .or_else(|| headers.get(axum::http::header::CONTENT_TYPE))
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let is_apply = content_type.contains("apply-patch");
+        let query: HashMap<String, String> = req
+            .uri()
+            .query()
+            .map(|q| {
+                url::form_urlencoded::parse(q.as_bytes())
+                    .into_owned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        // SSA is only taken when `fieldManager` is present — same
+        // requirement as generic_patch.rs's typed-resource handlers
+        // (`if let Some(field_manager) = params.get("fieldManager")`).
+        // Without it, apply-patch+yaml falls through to the regular patch
+        // dispatcher below, which correctly 4xxs since it isn't a
+        // recognized `PatchType`.
+        if let (true, Some(field_manager)) = (is_apply, query.get("fieldManager").cloned()) {
+            let force = query
+                .get("force")
+                .and_then(|v| v.parse::<bool>().ok())
+                .unwrap_or(false);
+
+            let current_json = match state.storage.get::<CustomResource>(&key).await {
+                Ok(current) => Some(
+                    serde_json::to_value(&current)
+                        .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?,
+                ),
+                Err(rusternetes_common::Error::NotFound(_)) => None,
+                Err(e) => return Err(e),
+            };
+
+            let body_bytes = to_bytes(req.into_body(), usize::MAX).await.map_err(|e| {
+                rusternetes_common::Error::InvalidResource(format!(
+                    "Failed to read patch body: {}",
+                    e
+                ))
+            })?;
+            let desired_json: serde_json::Value = if content_type.contains("yaml") {
+                serde_yaml::from_slice(&body_bytes).map_err(|e| {
+                    rusternetes_common::Error::InvalidResource(format!(
+                        "Invalid patch YAML: {}",
+                        e
+                    ))
+                })?
+            } else {
+                serde_json::from_slice(&body_bytes).map_err(|e| {
+                    rusternetes_common::Error::InvalidResource(format!(
+                        "Invalid patch JSON: {}",
+                        e
+                    ))
+                })?
+            };
+
+            let apply_params = if force {
+                rusternetes_common::server_side_apply::ApplyParams::new(field_manager)
+                    .with_force()
+            } else {
+                rusternetes_common::server_side_apply::ApplyParams::new(field_manager)
+            };
+
+            let result = rusternetes_common::server_side_apply::server_side_apply(
+                current_json.as_ref(),
+                &desired_json,
+                &apply_params,
+            )
+            .map_err(|e| rusternetes_common::Error::InvalidResource(e.to_string()))?;
+
+            return match result {
+                rusternetes_common::server_side_apply::ApplyResult::Success(mut applied_json) => {
+                    let is_create = current_json.is_none();
+                    if let Some(obj) = applied_json.as_object_mut() {
+                        obj.insert(
+                            "apiVersion".to_string(),
+                            serde_json::json!(format!("{}/{}", group, version)),
+                        );
+                        obj.insert(
+                            "kind".to_string(),
+                            serde_json::json!(crd.spec.names.kind.clone()),
+                        );
+                    }
+                    let mut applied: CustomResource = serde_json::from_value(applied_json)
+                        .map_err(|e| {
+                            rusternetes_common::Error::InvalidResource(format!(
+                                "Invalid result: {}",
+                                e
+                            ))
+                        })?;
+                    validate_custom_resource(&crd, &version, &applied)?;
+                    let saved = if is_create {
+                        applied.metadata.ensure_uid();
+                        applied.metadata.ensure_creation_timestamp();
+                        crate::handlers::lifecycle::set_initial_generation(&mut applied.metadata);
+                        state.storage.create(&key, &applied).await?
+                    } else {
+                        state.storage.update(&key, &applied).await?
+                    };
+                    Ok(Json(saved))
+                }
+                rusternetes_common::server_side_apply::ApplyResult::Conflicts(conflicts) => {
+                    let conflict_details: Vec<String> = conflicts
+                        .iter()
+                        .map(|c| {
+                            format!(
+                                "Field '{}' is owned by '{}' (applying as '{}')",
+                                c.field, c.current_manager, c.applying_manager
+                            )
+                        })
+                        .collect();
+                    Err(rusternetes_common::Error::Conflict(format!(
+                        "Apply conflict: {}. Use force=true to override.",
+                        conflict_details.join("; ")
+                    )))
+                }
+            };
+        }
+    }
 
     // Get current resource (may not exist for server-side apply)
     let current_result: rusternetes_common::Result<CustomResource> = state.storage.get(&key).await;
@@ -682,7 +849,7 @@ pub async fn patch_custom_resource(
     // For server-side apply (application/apply-patch+yaml), create if not found
     let is_apply = content_type.contains("apply-patch");
 
-    let patched_json = if let Ok(current) = &current_result {
+    let mut patched_json = if let Ok(current) = &current_result {
         // Resource exists — apply patch
         let current_json = serde_json::to_value(current).map_err(|e| {
             rusternetes_common::Error::Internal(format!(
@@ -706,6 +873,37 @@ pub async fn patch_custom_resource(
         // Resource doesn't exist + regular patch = error
         return Err(current_result.unwrap_err());
     };
+
+    // Increment metadata.generation only when spec changes — same logic
+    // as generic_patch.rs's typed-resource PATCH handlers already apply;
+    // this custom-resource (CRD instance) path never had it, so `kubectl
+    // apply` on any platform.ertia.io CRD instance (Workflow, Release,
+    // Bundle, ...) never bumped generation, silently breaking every
+    // operator's `generation != observedGeneration` resync-detection.
+    // Found live re-testing `platform-db-real-cluster`'s render Workflow:
+    // an edited spec applied via `kubectl apply` never re-triggered a
+    // render, because workflow-operator never saw generation move.
+    if let Ok(current) = &current_result {
+        let old_json = serde_json::to_value(current).ok();
+        let new_spec = patched_json.get("spec").cloned();
+        let old_spec = old_json.as_ref().and_then(|v| v.get("spec")).cloned();
+        let spec_changed = match (&old_spec, &new_spec) {
+            (Some(old), Some(new)) => old != new,
+            (None, Some(_)) | (Some(_), None) => true,
+            (None, None) => false,
+        };
+        if spec_changed {
+            if let Some(metadata) = patched_json.get_mut("metadata") {
+                if let Some(meta_obj) = metadata.as_object_mut() {
+                    let current_gen = meta_obj
+                        .get("generation")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    meta_obj.insert("generation".to_string(), serde_json::json!(current_gen + 1));
+                }
+            }
+        }
+    }
 
     // Deserialize the patched JSON back to CustomResource
     let mut patched: CustomResource = serde_json::from_value(patched_json).map_err(|e| {
@@ -845,6 +1043,7 @@ pub async fn patch_custom_resource(
         // Server-side apply creates new resource
         patched.metadata.ensure_uid();
         patched.metadata.ensure_creation_timestamp();
+        crate::handlers::lifecycle::set_initial_generation(&mut patched.metadata);
         state.storage.create(&key, &patched).await?
     };
 
@@ -1097,7 +1296,7 @@ pub async fn delete_custom_resource(
 }
 
 /// Helper to get CRD from storage
-async fn get_crd_for_resource(
+pub(crate) async fn get_crd_for_resource(
     state: &ApiServerState,
     crd_name: &str,
 ) -> Result<CustomResourceDefinition> {

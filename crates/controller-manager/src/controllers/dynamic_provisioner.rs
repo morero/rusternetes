@@ -96,8 +96,17 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
                 .await
             {
                 Ok(pvc) => {
-                    // Only process unbound PVCs with a storage class
-                    if pvc.spec.volume_name.is_none() && pvc.spec.storage_class_name.is_some() {
+                    // Only process unbound PVCs — `provision_volume`
+                    // resolves which StorageClass to use, explicit or the
+                    // cluster's default. This is the actual, live
+                    // reconcile path (unlike `reconcile_all` below, which
+                    // is `#[allow(dead_code)]` — genuinely unused, not a
+                    // reference implementation): the same
+                    // `storage_class_name.is_some()` bug this fixes was
+                    // live here too, and fixing only the dead-code copy
+                    // first (an easy mistake to make — they read
+                    // identically) would have changed nothing real.
+                    if pvc.spec.volume_name.is_none() {
                         match self.provision_volume(&pvc).await {
                             Ok(()) => queue.forget(&key).await,
                             Err(e) => {
@@ -145,8 +154,15 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
             .await?;
 
         for pvc in pvcs {
-            // Only process unbound PVCs with a storage class
-            if pvc.spec.volume_name.is_none() && pvc.spec.storage_class_name.is_some() {
+            // Only process unbound PVCs — `provision_volume` itself
+            // resolves which StorageClass to use, explicit or the
+            // cluster's default (see its own doc comment for the real
+            // bug this used to be: a PVC that omits `storageClassName`
+            // entirely, real, standard Kubernetes behavior for "use
+            // whatever the cluster's default StorageClass is", used to
+            // be silently skipped right here, before ever reaching that
+            // resolution logic).
+            if pvc.spec.volume_name.is_none() {
                 if let Err(e) = self.provision_volume(&pvc).await {
                     error!(
                         "Failed to provision volume for PVC {}/{}: {}",
@@ -161,15 +177,37 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
         Ok(())
     }
 
+    /// Real, live-confirmed bug this fixes: a `PersistentVolumeClaim` that
+    /// omits `storageClassName` entirely — standard, common Kubernetes
+    /// usage, meaning "use the cluster's default `StorageClass`" (the one
+    /// annotated `storageclass.kubernetes.io/is-default-class: "true"`) —
+    /// used to be silently skipped by the caller (`reconcile_all` required
+    /// `storage_class_name.is_some()` before even calling this function),
+    /// with no log line and no error anywhere. A real chart (Bitnami's
+    /// Valkey) hit this exactly: its `volumeClaimTemplate` doesn't set an
+    /// explicit `storageClassName`, so no `PersistentVolume` was ever
+    /// provisioned, and the pod failed at startup with `dir /data: No
+    /// such file or directory` — a symptom that gave no hint the real
+    /// cause was upstream in provisioning, not the pod's own config.
     async fn provision_volume(&self, pvc: &PersistentVolumeClaim) -> Result<()> {
         let pvc_name = &pvc.metadata.name;
         let namespace = pvc.metadata.namespace.as_deref().unwrap_or("default");
 
-        let storage_class_name = pvc
-            .spec
-            .storage_class_name
-            .as_ref()
-            .context("PVC has no storage class name")?;
+        let storage_class_name = match &pvc.spec.storage_class_name {
+            Some(name) => name.clone(),
+            None => match self.default_storage_class_name().await? {
+                Some(name) => name,
+                None => {
+                    debug!(
+                        "PVC {}/{} has no storageClassName and no default StorageClass exists — \
+                         cannot dynamically provision",
+                        namespace, pvc_name
+                    );
+                    return Ok(());
+                }
+            },
+        };
+        let storage_class_name = &storage_class_name;
 
         debug!(
             "Attempting to dynamically provision volume for PVC {}/{} using StorageClass {}",
@@ -227,6 +265,30 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
         );
 
         Ok(())
+    }
+
+    /// The name of the `StorageClass` annotated
+    /// `storageclass.kubernetes.io/is-default-class: "true"`, if any —
+    /// matches real Kubernetes' own convention for what "no
+    /// storageClassName on the PVC" resolves to. If more than one
+    /// `StorageClass` carries the annotation (a cluster misconfiguration
+    /// in real Kubernetes too — admission control there rejects a second
+    /// `true` value, which this reimplementation doesn't enforce), the
+    /// first one found wins; deterministic-enough for this to still be
+    /// useful, not a silent correctness trap for the common case.
+    async fn default_storage_class_name(&self) -> Result<Option<String>> {
+        let classes: Vec<StorageClass> = self.storage.list("/registry/storageclasses/").await?;
+        Ok(classes
+            .into_iter()
+            .find(|sc| {
+                sc.metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.get("storageclass.kubernetes.io/is-default-class"))
+                    .map(|v| v == "true")
+                    .unwrap_or(false)
+            })
+            .map(|sc| sc.metadata.name))
     }
 
     fn is_provisioner_supported(&self, provisioner: &str) -> bool {
@@ -474,6 +536,116 @@ mod tests {
         assert!(controller.is_provisioner_supported("kubernetes.io/hostpath"));
         assert!(controller.is_provisioner_supported("hostpath"));
         assert!(!controller.is_provisioner_supported("kubernetes.io/aws-ebs"));
+    }
+
+    fn storage_class(name: &str, is_default: bool) -> StorageClass {
+        let mut metadata = ObjectMeta::new(name);
+        if is_default {
+            let mut annotations = HashMap::new();
+            annotations.insert(
+                "storageclass.kubernetes.io/is-default-class".to_string(),
+                "true".to_string(),
+            );
+            metadata.annotations = Some(annotations);
+        }
+        StorageClass {
+            type_meta: TypeMeta {
+                kind: "StorageClass".to_string(),
+                api_version: "storage.k8s.io/v1".to_string(),
+            },
+            metadata,
+            provisioner: "rusternetes.io/hostpath".to_string(),
+            parameters: None,
+            reclaim_policy: Some(PersistentVolumeReclaimPolicy::Delete),
+            volume_binding_mode: None,
+            allowed_topologies: None,
+            allow_volume_expansion: None,
+            mount_options: None,
+        }
+    }
+
+    fn pvc_without_storage_class(name: &str) -> PersistentVolumeClaim {
+        let mut requests = HashMap::new();
+        requests.insert("storage".to_string(), "5Gi".to_string());
+        PersistentVolumeClaim {
+            type_meta: TypeMeta {
+                kind: "PersistentVolumeClaim".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: {
+                let mut meta = ObjectMeta::new(name);
+                meta.namespace = Some("default".to_string());
+                meta
+            },
+            spec: rusternetes_common::resources::PersistentVolumeClaimSpec {
+                access_modes: vec![PersistentVolumeAccessMode::ReadWriteOnce],
+                resources: ResourceRequirements {
+                    limits: None,
+                    requests: Some(requests),
+                },
+                volume_name: None,
+                storage_class_name: None,
+                volume_mode: Some(PersistentVolumeMode::Filesystem),
+                selector: None,
+                data_source: None,
+                data_source_ref: None,
+                volume_attributes_class_name: None,
+            },
+            status: Some(PersistentVolumeClaimStatus {
+                phase: PersistentVolumeClaimPhase::Pending,
+                access_modes: None,
+                capacity: None,
+                conditions: None,
+                allocated_resources: None,
+                allocated_resource_statuses: None,
+                resize_status: None,
+                current_volume_attributes_class_name: None,
+                modify_volume_status: None,
+            }),
+        }
+    }
+
+    /// Real, live-confirmed bug: a PVC with no `storageClassName` (common,
+    /// standard Kubernetes usage — meaning "use the cluster's default
+    /// StorageClass") used to be silently skipped by `reconcile_all`
+    /// before this fix, provisioning nothing, no error, no log — found
+    /// live when Bitnami's real Valkey chart (whose `volumeClaimTemplate`
+    /// doesn't set an explicit class) hit exactly this, and its pod
+    /// failed with a confusing, unrelated-looking `dir /data: No such
+    /// file or directory`.
+    #[tokio::test]
+    async fn provision_volume_falls_back_to_the_default_storage_class() {
+        let storage = Arc::new(MemoryStorage::new());
+        let sc_key = build_key("storageclasses", None, "standard");
+        storage
+            .create(&sc_key, &storage_class("standard", true))
+            .await
+            .unwrap();
+
+        let controller = DynamicProvisionerController::new(storage.clone());
+        let pvc = pvc_without_storage_class("no-class-pvc");
+
+        controller.provision_volume(&pvc).await.unwrap();
+
+        let pv_key = build_key("persistentvolumes", None, "pvc-default-no-class-pvc");
+        let pv: PersistentVolume = storage.get(&pv_key).await.expect("PV should be provisioned");
+        assert_eq!(pv.spec.storage_class_name, Some("standard".to_string()));
+    }
+
+    /// The other half of the same fix: when no `StorageClass` is marked
+    /// default at all, a PVC with no `storageClassName` genuinely can't
+    /// be provisioned — that's a real "nothing to do here" case, not an
+    /// error, and shouldn't panic or fail loudly.
+    #[tokio::test]
+    async fn provision_volume_is_a_no_op_when_no_default_storage_class_exists() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = DynamicProvisionerController::new(storage.clone());
+        let pvc = pvc_without_storage_class("no-class-pvc-2");
+
+        controller.provision_volume(&pvc).await.unwrap();
+
+        let pv_key = build_key("persistentvolumes", None, "pvc-default-no-class-pvc-2");
+        assert!(storage.get::<PersistentVolume>(&pv_key).await.is_err());
     }
 
     #[tokio::test]

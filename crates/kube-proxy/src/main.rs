@@ -32,6 +32,12 @@ struct Args {
     /// Sync interval in seconds
     #[arg(long, default_value = "1")]
     sync_interval: u64,
+
+    /// Prefix for this instance's iptables chain names (default:
+    /// "RUSTERNETES"). Set to a distinct value per instance when multiple
+    /// kube-proxy instances share a network namespace.
+    #[arg(long)]
+    chain_prefix: Option<String>,
 }
 
 #[tokio::main]
@@ -72,6 +78,7 @@ async fn main() -> Result<()> {
     let config = KubeProxyConfig {
         node_name: args.node_name,
         sync_interval: args.sync_interval,
+        chain_prefix: args.chain_prefix,
     };
 
     rusternetes_kube_proxy::run(storage, config).await

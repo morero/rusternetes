@@ -11,6 +11,15 @@ use tracing::{info, warn};
 pub struct KubeProxyConfig {
     pub node_name: String,
     pub sync_interval: u64,
+    /// Prefix for this instance's iptables chain names (services, nodeports,
+    /// per-endpoint SEP chains) — e.g. "CLUSTER-A" produces
+    /// "CLUSTER-A-SERVICES", "CLUSTER-A-SEP-*", etc. Defaults to
+    /// "RUSTERNETES" when `None`, matching pre-existing behavior. Set this
+    /// to a distinct value per instance when multiple rusternetes
+    /// kube-proxy instances share a network namespace, so their chain
+    /// reset/populate cycles don't affect each other — see
+    /// `IptablesManager::new_with_prefix`.
+    pub chain_prefix: Option<String>,
 }
 
 /// Run the kube-proxy component.
@@ -40,9 +49,10 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeProxyConfig) -> anyho
         }
     }
 
-    let kube_proxy = Arc::new(tokio::sync::Mutex::new(KubeProxy::new(Arc::clone(
-        &storage,
-    ))?));
+    let kube_proxy = Arc::new(tokio::sync::Mutex::new(KubeProxy::new(
+        Arc::clone(&storage),
+        config.chain_prefix.as_deref(),
+    )?));
 
     info!("Kube-proxy initialized successfully");
     info!("Syncing services every {} seconds", config.sync_interval);

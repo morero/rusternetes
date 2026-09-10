@@ -21,6 +21,58 @@ use serde::{de::DeserializeOwned, Serialize};
 use std::sync::Arc;
 use tracing::info;
 
+/// Server-side apply's create path deserializes the applied JSON straight
+/// into the caller's generic `T` and saves it — unlike every dedicated
+/// typed create handler (e.g. `service_account::create_service_account`),
+/// which explicitly calls `ObjectMeta::ensure_uid()`/
+/// `ensure_creation_timestamp()` before saving. A client never sets these
+/// itself, so on first creation via apply they were silently left empty:
+/// confirmed live (a `ServiceAccount` created this way had `metadata.uid:
+/// ""`), and consequential beyond just an odd status field — the
+/// kubelet-minted service-account token for a pod using that
+/// `ServiceAccount` embeds its UID, and the api-server's own token
+/// verification rejects a token whose embedded UID doesn't match a real,
+/// non-empty `ServiceAccount` UID ("Invalid token", indistinguishable
+/// from a genuinely bad token). Fixed by enriching the same way the typed
+/// handlers do, applied directly to the JSON value (this function is
+/// generic over `T`, so it can't call `ObjectMeta` methods without a
+/// trait bound every call site would need) — only on the create path;
+/// update-path objects already have real values from their first create.
+///
+/// Shared with `handlers::generic_patch`'s `patch_namespaced_resource`/
+/// `patch_cluster_resource` — this module's own `apply_namespaced_resource`/
+/// `apply_cluster_resource` turned out to be *dead code*: real built-in
+/// resource types (confirmed for `ServiceAccount`) route their SSA-typed
+/// `PATCH` requests to `generic_patch`'s content-type-dispatching
+/// handlers instead (see `router.rs` — `.patch(handlers::service_account::patch)`,
+/// not anything in this file), which independently reimplement the exact
+/// same create-vs-update logic and had the exact same gap. Fixing only
+/// this file's copy was verified live to do nothing at all.
+pub(crate) fn ensure_metadata_defaults_on_create(applied_json: &mut serde_json::Value) {
+    let Some(metadata) = applied_json.get_mut("metadata") else {
+        return;
+    };
+    let Some(metadata) = metadata.as_object_mut() else {
+        return;
+    };
+    let uid_is_empty = metadata
+        .get("uid")
+        .and_then(|v| v.as_str())
+        .is_none_or(str::is_empty);
+    if uid_is_empty {
+        metadata.insert(
+            "uid".to_string(),
+            serde_json::Value::String(uuid::Uuid::new_v4().to_string()),
+        );
+    }
+    if !metadata.contains_key("creationTimestamp") || metadata["creationTimestamp"].is_null() {
+        metadata.insert(
+            "creationTimestamp".to_string(),
+            serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+        );
+    }
+}
+
 /// Query parameters for server-side apply
 #[derive(Debug, serde::Deserialize)]
 pub struct ApplyQueryParams {
@@ -107,17 +159,21 @@ where
         .map_err(|e| rusternetes_common::Error::InvalidResource(e.to_string()))?;
 
     match result {
-        ApplyResult::Success(applied_json) => {
+        ApplyResult::Success(mut applied_json) => {
+            let is_create = current_json.is_none();
+            if is_create {
+                ensure_metadata_defaults_on_create(&mut applied_json);
+            }
             // Convert to resource type
             let applied_resource: T = serde_json::from_value(applied_json).map_err(|e| {
                 rusternetes_common::Error::InvalidResource(format!("Invalid result: {}", e))
             })?;
 
             // Save to storage (create or update)
-            let saved = if current_json.is_some() {
-                state.storage.update(&key, &applied_resource).await?
-            } else {
+            let saved = if is_create {
                 state.storage.create(&key, &applied_resource).await?
+            } else {
+                state.storage.update(&key, &applied_resource).await?
             };
 
             Ok(Json(saved))
@@ -214,17 +270,21 @@ where
         .map_err(|e| rusternetes_common::Error::InvalidResource(e.to_string()))?;
 
     match result {
-        ApplyResult::Success(applied_json) => {
+        ApplyResult::Success(mut applied_json) => {
+            let is_create = current_json.is_none();
+            if is_create {
+                ensure_metadata_defaults_on_create(&mut applied_json);
+            }
             // Convert to resource type
             let applied_resource: T = serde_json::from_value(applied_json).map_err(|e| {
                 rusternetes_common::Error::InvalidResource(format!("Invalid result: {}", e))
             })?;
 
             // Save to storage (create or update)
-            let saved = if current_json.is_some() {
-                state.storage.update(&key, &applied_resource).await?
-            } else {
+            let saved = if is_create {
                 state.storage.create(&key, &applied_resource).await?
+            } else {
+                state.storage.update(&key, &applied_resource).await?
             };
 
             Ok(Json(saved))
@@ -313,4 +373,44 @@ macro_rules! apply_handler_cluster {
             .await
         }
     };
+}
+
+#[cfg(test)]
+mod ensure_metadata_defaults_tests {
+    use super::ensure_metadata_defaults_on_create;
+    use serde_json::json;
+
+    #[test]
+    fn fills_in_empty_uid_and_missing_creation_timestamp() {
+        let mut applied = json!({
+            "apiVersion": "v1",
+            "kind": "ServiceAccount",
+            "metadata": {"name": "cnpg-operator", "namespace": "default", "uid": ""}
+        });
+        ensure_metadata_defaults_on_create(&mut applied);
+        let uid = applied["metadata"]["uid"].as_str().unwrap();
+        assert!(!uid.is_empty());
+        assert!(uuid::Uuid::parse_str(uid).is_ok());
+        assert!(applied["metadata"]["creationTimestamp"].is_string());
+    }
+
+    #[test]
+    fn leaves_an_already_set_uid_untouched() {
+        let mut applied = json!({
+            "metadata": {"name": "x", "uid": "existing-uid", "creationTimestamp": "2026-01-01T00:00:00Z"}
+        });
+        ensure_metadata_defaults_on_create(&mut applied);
+        assert_eq!(applied["metadata"]["uid"], "existing-uid");
+        assert_eq!(
+            applied["metadata"]["creationTimestamp"],
+            "2026-01-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn missing_metadata_object_does_not_panic() {
+        let mut applied = json!({"apiVersion": "v1", "kind": "ServiceAccount"});
+        ensure_metadata_defaults_on_create(&mut applied);
+        assert!(applied.get("metadata").is_none());
+    }
 }

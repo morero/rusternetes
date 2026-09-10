@@ -3,6 +3,7 @@
 /// This module provides a generic implementation of PATCH operations
 /// that can be used across all Kubernetes resource types.
 use crate::{
+    handlers::apply::ensure_metadata_defaults_on_create,
     middleware::AuthContext,
     patch::{apply_patch, PatchType},
     state::ApiServerState,
@@ -123,6 +124,10 @@ where
 
             match result {
                 ApplyResult::Success(mut applied_json) => {
+                    let is_create = current_json.is_none();
+                    if is_create {
+                        ensure_metadata_defaults_on_create(&mut applied_json);
+                    }
                     // Set the last-applied-configuration annotation
                     if let Some(metadata) = applied_json.get_mut("metadata") {
                         if let Some(obj) = metadata.as_object_mut() {
@@ -150,10 +155,10 @@ where
                         })?;
 
                     // Save to storage (create or update)
-                    let saved = if current_json.is_some() {
-                        state.storage.update(&key, &applied_resource).await?
-                    } else {
+                    let saved = if is_create {
                         state.storage.create(&key, &applied_resource).await?
+                    } else {
+                        state.storage.update(&key, &applied_resource).await?
                     };
 
                     return Ok(Json(saved));
@@ -442,6 +447,10 @@ where
 
             match result {
                 ApplyResult::Success(mut applied_json) => {
+                    let is_create = current_json.is_none();
+                    if is_create {
+                        ensure_metadata_defaults_on_create(&mut applied_json);
+                    }
                     // Set the last-applied-configuration annotation
                     if let Some(metadata) = applied_json.get_mut("metadata") {
                         if let Some(obj) = metadata.as_object_mut() {
@@ -469,10 +478,10 @@ where
                         })?;
 
                     // Save to storage (create or update)
-                    let saved = if current_json.is_some() {
-                        state.storage.update(&key, &applied_resource).await?
-                    } else {
+                    let saved = if is_create {
                         state.storage.create(&key, &applied_resource).await?
+                    } else {
+                        state.storage.update(&key, &applied_resource).await?
                     };
 
                     return Ok(Json(saved));
