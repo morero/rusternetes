@@ -94,6 +94,35 @@ pub fn normalize_resource_version(rv: Option<String>) -> Option<String> {
     rv.filter(|s| !s.is_empty())
 }
 
+/// The RBAC-facing resource name for a watch request — e.g. `bundles`,
+/// never the group-prefixed storage key (`platform_ertia_io_bundles`)
+/// dynamic CRD routes pass as `resource_type` for collision-safe storage
+/// prefixing (router.rs: `format!("{}_{}", group.replace('.', "_"),
+/// plural)`).
+///
+/// `RequestAttributes::new(user, "watch", resource_type)` was previously
+/// built directly from that storage-prefixed string, so a `ClusterRole`
+/// rule naming the real plural (`resources: ["bundles"]`, exactly what
+/// every RBAC manifest in this project — and any real Kubernetes
+/// manifest — writes) could never match: `rule_allows`'s resource check
+/// compared it against `"platform_ertia_io_bundles"` and always failed,
+/// so every CRD's `watch` was silently `Forbidden` regardless of RBAC,
+/// while `list` (whose handler always used the plain plural for its own
+/// `RequestAttributes`) worked fine — the two verbs disagreeing on
+/// identical rules was the tell.
+///
+/// Built-in resources are unaffected: their own handlers always pass
+/// the same plain name for both storage and RBAC (e.g. `"pods"`), which
+/// never happens to start with `"<their api_group>_"`, so this strips
+/// nothing for them.
+fn rbac_resource_name<'a>(resource_type: &'a str, api_group: &str) -> &'a str {
+    let group_prefix = format!("{}_", api_group.replace('.', "_"));
+    resource_type
+        .strip_prefix(group_prefix.as_str())
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(resource_type)
+}
+
 /// Check if a query param map indicates a watch request
 pub fn is_watch_request(params: &std::collections::HashMap<String, String>) -> bool {
     params
@@ -133,6 +162,46 @@ pub async fn watch_namespaced<T>(
 where
     T: Serialize + DeserializeOwned + Send + Sync + 'static + Clone + HasMetadata,
 {
+    watch_namespaced_with_kind_override::<T>(
+        state,
+        auth_ctx,
+        namespace,
+        resource_type,
+        api_group,
+        params,
+        None,
+    )
+    .await
+}
+
+/// Same as [`watch_namespaced`], but lets the caller stamp an explicit
+/// (Kind, apiVersion) on BOOKMARK events instead of deriving them from
+/// `resource_type` via `resource_type_to_kind_and_version`'s plural-to-Kind
+/// heuristic.
+///
+/// The ~45 built-in `watch_*` wrappers all go through the plain
+/// `watch_namespaced` above (override `None`, heuristic unchanged). Only the
+/// CRD dynamic-route dispatcher in router.rs calls this directly, passing
+/// the CRD's own `spec.names.kind` + `{group}/{version}`: for CRDs,
+/// `resource_type` is the storage-prefix key
+/// (`{group_with_underscores}_{plural}`, e.g. `postgresql_cnpg_io_clusters`),
+/// not the plural alone, so the heuristic can't recover a real Kind from it
+/// — it produced the literal string `"Postgresql_cnpg_io_cluster"` for
+/// CNPG's `Cluster` CRD, which client-go then rejected with "no kind ...
+/// registered in scheme" (bookmarks are still fully type-decoded by
+/// client-go even though they carry no meaningful body).
+pub async fn watch_namespaced_with_kind_override<T>(
+    state: Arc<ApiServerState>,
+    auth_ctx: AuthContext,
+    namespace: String,
+    resource_type: &str,
+    api_group: &str,
+    params: WatchParams,
+    bookmark_kind_override: Option<(String, String)>,
+) -> Result<Response>
+where
+    T: Serialize + DeserializeOwned + Send + Sync + 'static + Clone + HasMetadata,
+{
     info!(
         "Starting watch for {} in namespace {} (timeout: {:?}s, bookmarks: {})",
         resource_type,
@@ -142,9 +211,13 @@ where
     );
 
     // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user.clone(), "watch", resource_type)
-        .with_namespace(&namespace)
-        .with_api_group(api_group);
+    let attrs = RequestAttributes::new(
+        auth_ctx.user.clone(),
+        "watch",
+        rbac_resource_name(resource_type, api_group),
+    )
+    .with_namespace(&namespace)
+    .with_api_group(api_group);
 
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
@@ -171,7 +244,7 @@ where
     let field_selector = params.field_selector.clone();
     let requested_rv = params.resource_version.clone();
     let (bookmark_kind, bookmark_api_version) =
-        resource_type_to_kind_and_version(resource_type, api_group);
+        resolve_bookmark_kind(resource_type, api_group, bookmark_kind_override.clone());
 
     // Determine if we have a specific non-zero resourceVersion to replay from.
     // rv=0 and rv=1 are treated as "list current state" — don't replay from etcd
@@ -619,6 +692,31 @@ pub async fn watch_cluster_scoped<T>(
 where
     T: Serialize + DeserializeOwned + Send + Sync + 'static + Clone + HasMetadata,
 {
+    watch_cluster_scoped_with_kind_override::<T>(
+        state,
+        auth_ctx,
+        resource_type,
+        api_group,
+        params,
+        None,
+    )
+    .await
+}
+
+/// Same as [`watch_cluster_scoped`], but lets the caller stamp an explicit
+/// (Kind, apiVersion) on BOOKMARK events — see
+/// [`watch_namespaced_with_kind_override`] for why this exists.
+pub async fn watch_cluster_scoped_with_kind_override<T>(
+    state: Arc<ApiServerState>,
+    auth_ctx: AuthContext,
+    resource_type: &str,
+    api_group: &str,
+    params: WatchParams,
+    bookmark_kind_override: Option<(String, String)>,
+) -> Result<Response>
+where
+    T: Serialize + DeserializeOwned + Send + Sync + 'static + Clone + HasMetadata,
+{
     info!(
         "Starting watch for cluster-scoped {} (timeout: {:?}s, bookmarks: {})",
         resource_type,
@@ -631,8 +729,12 @@ where
     );
 
     // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user.clone(), "watch", resource_type)
-        .with_api_group(api_group);
+    let attrs = RequestAttributes::new(
+        auth_ctx.user.clone(),
+        "watch",
+        rbac_resource_name(resource_type, api_group),
+    )
+    .with_api_group(api_group);
 
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
@@ -659,7 +761,7 @@ where
     let field_selector = params.field_selector.clone();
     let requested_rv = params.resource_version.clone();
     let (bookmark_kind, bookmark_api_version) =
-        resource_type_to_kind_and_version(resource_type, api_group);
+        resolve_bookmark_kind(resource_type, api_group, bookmark_kind_override.clone());
 
     // Determine if we have a specific non-zero resourceVersion to replay from.
     // rv=0 and rv=1 are treated as "list current state" — don't replay from etcd
@@ -1340,6 +1442,16 @@ fn resource_type_to_kind_and_version(resource_type: &str, api_group: &str) -> (S
         "controllerrevisions" => "ControllerRevision",
         "csistoragecapacities" => "CSIStorageCapacity",
         "csidrivers" => "CSIDriver",
+        // VolumeSnapshot's a native (non-CRD) multi-word-Kind resource —
+        // the `other` fallback below can't recover "VolumeSnapshot" from
+        // "volumesnapshots" (it produced the literal "Volumesnapshot",
+        // live-reproduced via curl against `?watch=true&allowWatchBookmarks=true`
+        // on the all-namespaces route once that route's own missing-`watch=true`
+        // bug — see `list_or_watch_all_volumesnapshots` — was fixed enough to
+        // even reach this function).
+        "volumesnapshots" => "VolumeSnapshot",
+        "volumesnapshotclasses" => "VolumeSnapshotClass",
+        "volumesnapshotcontents" => "VolumeSnapshotContent",
         "csinodes" => "CSINode",
         other => {
             // CamelCase heuristic: capitalize first letter, remove trailing 's'
@@ -1360,6 +1472,20 @@ fn resource_type_to_kind_and_version(resource_type: &str, api_group: &str) -> (S
         format!("{}/v1", api_group)
     };
     (kind.to_string(), api_version)
+}
+
+/// Resolve the (Kind, apiVersion) to stamp on BOOKMARK events: an explicit
+/// override always wins over `resource_type_to_kind_and_version`'s
+/// plural-to-Kind heuristic. Split out from `watch_namespaced_with_kind_override`
+/// / `watch_cluster_scoped_with_kind_override` so it's unit-testable without
+/// standing up `ApiServerState`/`AuthContext`.
+fn resolve_bookmark_kind(
+    resource_type: &str,
+    api_group: &str,
+    bookmark_kind_override: Option<(String, String)>,
+) -> (String, String) {
+    bookmark_kind_override
+        .unwrap_or_else(|| resource_type_to_kind_and_version(resource_type, api_group))
 }
 
 /// Trait for types that have metadata (all Kubernetes resources)
@@ -1446,7 +1572,8 @@ impl_has_metadata!(
     rusternetes_common::resources::PriorityLevelConfiguration,
     rusternetes_common::resources::IngressClass,
     rusternetes_common::resources::CSIStorageCapacity,
-    rusternetes_common::resources::CustomResource
+    rusternetes_common::resources::CustomResource,
+    rusternetes_common::resources::VolumeSnapshot
 );
 
 // Concrete handler functions for specific resources
@@ -2241,8 +2368,12 @@ pub async fn watch_cluster_scoped_json(
 ) -> Result<Response> {
     info!("Starting JSON watch for cluster-scoped {}", resource_type);
 
-    let attrs = RequestAttributes::new(auth_ctx.user.clone(), "watch", resource_type)
-        .with_api_group(api_group);
+    let attrs = RequestAttributes::new(
+        auth_ctx.user.clone(),
+        "watch",
+        rbac_resource_name(resource_type, api_group),
+    )
+    .with_api_group(api_group);
 
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
@@ -2453,9 +2584,13 @@ pub async fn watch_namespaced_json(
         namespace, resource_type
     );
 
-    let attrs = RequestAttributes::new(auth_ctx.user.clone(), "watch", resource_type)
-        .with_api_group(api_group)
-        .with_namespace(&namespace);
+    let attrs = RequestAttributes::new(
+        auth_ctx.user.clone(),
+        "watch",
+        rbac_resource_name(resource_type, api_group),
+    )
+    .with_api_group(api_group)
+    .with_namespace(&namespace);
 
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
@@ -2630,6 +2765,98 @@ pub async fn watch_namespaced_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rbac_resource_name_strips_the_crd_storage_prefix() {
+        // Dynamic CRD routes pre-concatenate group+plural for a
+        // collision-safe storage key (router.rs); RBAC rules are always
+        // written against the plain plural (e.g. `resources: ["bundles"]`,
+        // matching real Kubernetes manifests) and must see that, not the
+        // storage key.
+        assert_eq!(
+            rbac_resource_name("platform_ertia_io_bundles", "platform.ertia.io"),
+            "bundles"
+        );
+    }
+
+    #[test]
+    fn rbac_resource_name_leaves_builtin_resources_untouched() {
+        // Built-in resource handlers pass the same plain name for both
+        // storage and RBAC — it never happens to start with their own
+        // "<api_group>_" prefix, so nothing should be stripped.
+        assert_eq!(rbac_resource_name("pods", ""), "pods");
+        assert_eq!(
+            rbac_resource_name("networkpolicies", "networking.k8s.io"),
+            "networkpolicies"
+        );
+        assert_eq!(rbac_resource_name("jobs", "batch"), "jobs");
+    }
+
+    #[test]
+    fn resolve_bookmark_kind_prefers_explicit_override_over_heuristic() {
+        // CNPG's `Cluster` CRD: resource_type is the group-prefixed storage
+        // key (`postgresql_cnpg_io_clusters`), which the plural-to-Kind
+        // heuristic mangles into "Postgresql_cnpg_io_cluster" — client-go
+        // then rejects the bookmark with "no kind ... registered in scheme".
+        // An explicit override (as router.rs supplies from the CRD's own
+        // `spec.names.kind`) must win regardless of what the heuristic would
+        // have produced.
+        assert_eq!(
+            resolve_bookmark_kind(
+                "postgresql_cnpg_io_clusters",
+                "postgresql.cnpg.io",
+                Some(("Cluster".to_string(), "postgresql.cnpg.io/v1".to_string())),
+            ),
+            ("Cluster".to_string(), "postgresql.cnpg.io/v1".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_bookmark_kind_falls_back_to_heuristic_when_no_override() {
+        // The ~45 built-in watch_* wrappers never pass an override — must
+        // keep behaving exactly as before.
+        assert_eq!(
+            resolve_bookmark_kind("pods", "", None),
+            ("Pod".to_string(), "v1".to_string())
+        );
+        assert_eq!(
+            resolve_bookmark_kind("deployments", "apps", None),
+            ("Deployment".to_string(), "apps/v1".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_bookmark_kind_gets_volumesnapshot_casing_right() {
+        // Live-reproduced bug: the generic plural-to-Kind heuristic
+        // (capitalize first letter, strip trailing 's') can't recover a
+        // multi-word Kind from an all-lowercase plural — it turned
+        // "volumesnapshots" into "Volumesnapshot" (missing the capital S),
+        // which is exactly the kind of mismatch client-go's watch decoder
+        // rejects. VolumeSnapshot is a native (non-CRD) type, so unlike
+        // CNPG's own CRDs (#18) there's no CRD to look the real Kind up
+        // from — it has to be a real match arm.
+        assert_eq!(
+            resolve_bookmark_kind("volumesnapshots", "snapshot.storage.k8s.io", None),
+            (
+                "VolumeSnapshot".to_string(),
+                "snapshot.storage.k8s.io/v1".to_string()
+            )
+        );
+        assert_eq!(
+            resolve_bookmark_kind("volumesnapshotclasses", "snapshot.storage.k8s.io", None),
+            (
+                "VolumeSnapshotClass".to_string(),
+                "snapshot.storage.k8s.io/v1".to_string()
+            )
+        );
+        assert_eq!(
+            resolve_bookmark_kind("volumesnapshotcontents", "snapshot.storage.k8s.io", None),
+            (
+                "VolumeSnapshotContent".to_string(),
+                "snapshot.storage.k8s.io/v1".to_string()
+            )
+        );
+    }
 
     fn meta(name: &str, namespace: Option<&str>) -> ObjectMeta {
         let meta = ObjectMeta::new(name);

@@ -15,6 +15,85 @@ use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, info, warn};
 
+/// Dispatch GET on the all-namespaces RoleBindings collection.
+///
+/// `RoleBinding` is namespaced, but its storage key is
+/// `/registry/rolebindings/{namespace}/{name}` — a prefix watch on
+/// `/registry/rolebindings` (no namespace segment) already spans every
+/// namespace, which is exactly what `watch_cluster_scoped` gives, despite
+/// the name (the same trick `watch_resourcequotas_all`/
+/// `watch_poddisruptionbudgets_all` already use for their own namespaced
+/// types). Without this dispatch, the route below mapped `GET` straight to
+/// `list_all_rolebindings`, which ignores `?watch=true` entirely and always
+/// returns a plain `RoleBindingList` — client-go's watch decoder can't
+/// parse a list body as a stream of `WatchEvent`s and fails with "unable to
+/// decode to metav1.WatchEvent", breaking any operator (e.g. CNPG) that
+/// watches RoleBindings cluster-wide.
+async fn list_or_watch_all_rolebindings(
+    state: State<Arc<ApiServerState>>,
+    auth_ctx: Extension<crate::middleware::AuthContext>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if handlers::watch::is_watch_request(&params) {
+        let watch_params = handlers::watch::watch_params_from_query(&params);
+        match handlers::watch::watch_cluster_scoped::<rusternetes_common::resources::RoleBinding>(
+            state.0,
+            auth_ctx.0,
+            "rolebindings",
+            "rbac.authorization.k8s.io",
+            watch_params,
+        )
+        .await
+        {
+            Ok(resp) => resp,
+            Err(e) => e.into_response(),
+        }
+    } else {
+        match handlers::rbac::list_all_rolebindings(state, auth_ctx, axum::extract::Query(params))
+            .await
+        {
+            Ok(json) => json.into_response(),
+            Err(e) => e.into_response(),
+        }
+    }
+}
+
+/// Dispatch GET on the all-namespaces VolumeSnapshots collection — same
+/// `?watch=true` gap and fix as [`list_or_watch_all_rolebindings`], for
+/// `list_all_volumesnapshots` instead.
+async fn list_or_watch_all_volumesnapshots(
+    state: State<Arc<ApiServerState>>,
+    auth_ctx: Extension<crate::middleware::AuthContext>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if handlers::watch::is_watch_request(&params) {
+        let watch_params = handlers::watch::watch_params_from_query(&params);
+        match handlers::watch::watch_cluster_scoped::<rusternetes_common::resources::VolumeSnapshot>(
+            state.0,
+            auth_ctx.0,
+            "volumesnapshots",
+            "snapshot.storage.k8s.io",
+            watch_params,
+        )
+        .await
+        {
+            Ok(resp) => resp,
+            Err(e) => e.into_response(),
+        }
+    } else {
+        match handlers::volumesnapshot::list_all_volumesnapshots(
+            state,
+            auth_ctx,
+            axum::extract::Query(params),
+        )
+        .await
+        {
+            Ok(json) => json.into_response(),
+            Err(e) => e.into_response(),
+        }
+    }
+}
+
 /// Fallback handler for custom resources defined by CRDs
 /// This handler is called for any route not matched by the static routes
 /// It checks if the request matches a CRD and routes to the appropriate handler
@@ -267,7 +346,7 @@ async fn custom_resource_fallback(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let _crd = crd.unwrap();
+    let crd = crd.unwrap();
     debug!("Found CRD {} for request", crd_name);
 
     // Route to the appropriate custom resource handler based on method and path
@@ -328,6 +407,15 @@ async fn custom_resource_fallback(
             if is_watch {
                 // Watch custom resources using the JSON watch handler
                 let resource_type = format!("{}_{}", group.replace('.', "_"), plural);
+                // `resource_type` above is the storage-prefix key, not a real
+                // Kind — bookmark events need the CRD's actual declared Kind
+                // (already loaded as `crd` above) or client-go rejects them
+                // with "no kind ... registered in scheme" (see
+                // watch_namespaced_with_kind_override's doc comment).
+                let bookmark_kind_override = Some((
+                    crd.spec.names.kind.clone(),
+                    format!("{}/{}", group, version),
+                ));
                 let watch_params = crate::handlers::watch::WatchParams {
                     resource_version: crate::handlers::watch::normalize_resource_version(
                         query_params.get("resourceVersion").cloned(),
@@ -346,7 +434,7 @@ async fn custom_resource_fallback(
                         .and_then(|v| v.parse::<bool>().ok()),
                 };
                 if let Some(ns) = namespace {
-                    match crate::handlers::watch::watch_namespaced::<
+                    match crate::handlers::watch::watch_namespaced_with_kind_override::<
                         rusternetes_common::resources::CustomResource,
                     >(
                         state.clone(),
@@ -355,6 +443,7 @@ async fn custom_resource_fallback(
                         &resource_type,
                         group,
                         watch_params,
+                        bookmark_kind_override,
                     )
                     .await
                     {
@@ -365,7 +454,7 @@ async fn custom_resource_fallback(
                         }
                     }
                 } else {
-                    match crate::handlers::watch::watch_cluster_scoped::<
+                    match crate::handlers::watch::watch_cluster_scoped_with_kind_override::<
                         rusternetes_common::resources::CustomResource,
                     >(
                         state.clone(),
@@ -373,6 +462,7 @@ async fn custom_resource_fallback(
                         &resource_type,
                         group,
                         watch_params,
+                        bookmark_kind_override,
                     )
                     .await
                     {
@@ -1338,10 +1428,12 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
                 .patch(handlers::rbac::patch_rolebinding)
                 .delete(handlers::rbac::delete_rolebinding),
         )
-        // RoleBindings (all namespaces)
+        // RoleBindings (all namespaces) — dispatches to a real watch stream
+        // on `?watch=true` instead of always returning a plain list; see
+        // `list_or_watch_all_rolebindings`'s doc comment.
         .route(
             "/apis/rbac.authorization.k8s.io/v1/rolebindings",
-            get(handlers::rbac::list_all_rolebindings),
+            get(list_or_watch_all_rolebindings),
         )
         // RBAC - ClusterRoles
         .route(
@@ -1504,10 +1596,12 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
                 .patch(handlers::volumesnapshot::patch_volumesnapshot)
                 .delete(handlers::volumesnapshot::delete_volumesnapshot),
         )
-        // VolumeSnapshots (all namespaces)
+        // VolumeSnapshots (all namespaces) — dispatches to a real watch
+        // stream on `?watch=true`; see `list_or_watch_all_volumesnapshots`'s
+        // doc comment.
         .route(
             "/apis/snapshot.storage.k8s.io/v1/volumesnapshots",
-            get(handlers::volumesnapshot::list_all_volumesnapshots)
+            get(list_or_watch_all_volumesnapshots)
             .delete(handlers::volumesnapshot::deletecollection_volumesnapshots),
         )
         // VolumeSnapshotContents (cluster-scoped)
