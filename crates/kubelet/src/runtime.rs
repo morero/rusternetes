@@ -491,6 +491,16 @@ const CLUSTER_LABEL: &str = "rusternetes.io/cluster";
 /// name back out of a combined value.
 const POD_LABEL: &str = "rusternetes.io/pod";
 
+/// Whether `garbage_collect_containers` should fully clean up a pod's dead
+/// containers (all of them, plus the pause container and volumes) instead of
+/// keeping its 1 dead container for log access. Only true once the pod is
+/// both out of running containers AND actually gone from storage — a pod
+/// that's merely between containers (e.g. a completed/failed Job pod) but
+/// still present in storage keeps its one dead container regardless.
+fn should_fully_cleanup_pod(pod_has_running_container: bool, pod_still_exists: bool) -> bool {
+    !pod_has_running_container && !pod_still_exists
+}
+
 impl ContainerRuntime {
     /// Labels to attach to every container this runtime creates, so it can
     /// later recognize (and only ever act on) its own containers rather
@@ -8554,9 +8564,17 @@ impl ContainerRuntime {
                 }
             }
 
-            // If the pod has no running containers, remove the last dead one too
-            // and clean up the pause container (orphaned sandbox)
-            if !pods_with_running.contains(&pod_name) {
+            // If the pod has no running containers AND is actually gone from
+            // storage, remove the last dead one too and clean up the pause
+            // container (orphaned sandbox). A pod that's merely between
+            // containers (e.g. a completed/failed Job pod, or a container
+            // mid-restart) but still present in storage must keep its one
+            // dead container for log access — that's the whole point of the
+            // `keep_count` decision above; without the `existing_pods` check
+            // here, this block undid it unconditionally, so a failed pod's
+            // logs became unavailable within the same GC pass they were
+            // supposed to survive (see ISSUES.md).
+            if should_fully_cleanup_pod(pods_with_running.contains(&pod_name), existing_pods.contains(&pod_name)) {
                 for (container_id, _) in exited.iter().take(1) {
                     let opts = RemoveContainerOptions {
                         force: true,
@@ -8818,8 +8836,8 @@ pub fn parse_cpu_quantity(s: &str) -> i64 {
 mod tests {
     use super::{
         apply_fsgroup_to_path, bound_pv_name, effective_sub_path_expr,
-        effective_termination_message_path, security_opts_for, token_needs_rotation,
-        write_file_if_changed, ContainerRuntime,
+        effective_termination_message_path, security_opts_for, should_fully_cleanup_pod,
+        token_needs_rotation, write_file_if_changed, ContainerRuntime,
     };
     use rusternetes_common::resources::pod::PodSecurityContext as PodLevelSecurityContext;
     use rusternetes_common::resources::{
@@ -8832,6 +8850,25 @@ mod tests {
     #[test]
     fn security_opts_none_when_nothing_set() {
         assert_eq!(security_opts_for(None, None), None);
+    }
+
+    /// Regression: a completed/failed pod (no running containers) still in
+    /// storage must keep its 1 dead container for log access, not have it
+    /// swept in the same GC pass that was supposed to preserve it.
+    #[test]
+    fn should_not_fully_cleanup_pod_with_no_running_container_but_still_in_storage() {
+        assert!(!should_fully_cleanup_pod(false, true));
+    }
+
+    #[test]
+    fn should_fully_cleanup_pod_with_no_running_container_and_gone_from_storage() {
+        assert!(should_fully_cleanup_pod(false, false));
+    }
+
+    #[test]
+    fn should_not_fully_cleanup_pod_with_a_running_container() {
+        assert!(!should_fully_cleanup_pod(true, true));
+        assert!(!should_fully_cleanup_pod(true, false));
     }
 
     #[test]

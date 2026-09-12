@@ -16,6 +16,7 @@ use axum::{
 };
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
+    resources::pod::ContainerState,
     Error, Result,
 };
 use rusternetes_storage::Storage;
@@ -193,11 +194,7 @@ pub async fn get_logs(
     // Get logs from the container runtime
     let logs = match get_container_logs(&pod, &container_name, &query).await {
         Ok(logs) => logs,
-        Err(e) => {
-            info!("Failed to get real container logs, using fallback: {}", e);
-            // Fallback to synthetic logs if container runtime is not available
-            generate_pod_logs(&pod, &container_name, &query)
-        }
+        Err(e) => return Err(logs_unavailable_error(&pod, &container_name, &e)),
     };
 
     // If WebSocket upgrade requested, send logs over WebSocket
@@ -333,75 +330,59 @@ async fn get_container_logs(
     Ok(log_output)
 }
 
-/// Generate synthetic logs for a pod container
-fn generate_pod_logs(
+/// Finds the given container's own `ContainerStatus` among a pod's regular,
+/// init, and ephemeral container statuses.
+fn find_container_status<'a>(
+    pod: &'a rusternetes_common::resources::Pod,
+    container_name: &str,
+) -> Option<&'a rusternetes_common::resources::pod::ContainerStatus> {
+    let status = pod.status.as_ref()?;
+    status
+        .container_statuses
+        .iter()
+        .flatten()
+        .chain(status.init_container_statuses.iter().flatten())
+        .chain(status.ephemeral_container_statuses.iter().flatten())
+        .find(|cs| cs.name == container_name)
+}
+
+/// Builds an honest error for when real container logs can't be retrieved
+/// (Docker daemon unreachable, the container's already been garbage
+/// collected, a stream read failed partway through) — surfacing whatever
+/// real terminated/waiting-state diagnostics are already sitting in the
+/// pod's own stored status, rather than fabricating a "container ran fine"
+/// log stream (see ISSUES.md: that fabrication previously masked every real
+/// failure reason for fast-failing pods, e.g. CNPG initdb Jobs).
+fn logs_unavailable_error(
     pod: &rusternetes_common::resources::Pod,
     container_name: &str,
-    query: &LogsQuery,
-) -> String {
-    use chrono::Utc;
-
-    let mut lines = vec![];
-
-    // Get pod status phase
-    let phase = pod
-        .status
-        .as_ref()
-        .map(|s| format!("{:?}", s.phase))
-        .unwrap_or_else(|| "Unknown".to_string());
-
-    // Generate log entries
-    let base_time = pod.metadata.creation_timestamp.unwrap_or_else(Utc::now);
-
-    let mut log_lines = vec![
-        format!(
-            "Container {} starting in pod {}",
-            container_name, pod.metadata.name
+    underlying: &anyhow::Error,
+) -> Error {
+    let diagnostics = match find_container_status(pod, container_name).and_then(|cs| cs.state.as_ref()) {
+        Some(ContainerState::Terminated {
+            exit_code,
+            reason,
+            message,
+            ..
+        }) => format!(
+            "; container terminated: exitCode={}{}{}",
+            exit_code,
+            reason.as_deref().map(|r| format!(", reason={r}")).unwrap_or_default(),
+            message.as_deref().map(|m| format!(", message={m}")).unwrap_or_default(),
         ),
-        format!("Pod phase: {}", phase),
-        format!("Environment initialized"),
-        format!("Starting application process"),
-        format!("Application ready to serve traffic"),
-        format!("Health check passed"),
-        format!("Serving requests"),
-    ];
-
-    // Apply tail_lines if specified
-    if let Some(tail) = query.tail_lines {
-        let tail = tail as usize;
-        if tail < log_lines.len() {
-            log_lines = log_lines.drain(log_lines.len() - tail..).collect();
-        }
-    }
-
-    // Format log lines with timestamps if requested
-    for (i, line) in log_lines.iter().enumerate() {
-        let log_time = base_time + chrono::Duration::seconds(i as i64 * 5);
-
-        let formatted_line = if query.timestamps {
-            format!("{} {}", log_time.to_rfc3339(), line)
-        } else {
-            line.clone()
-        };
-
-        lines.push(formatted_line);
-    }
-
-    let result = if lines.is_empty() {
-        String::new()
-    } else {
-        lines.join("\n")
+        Some(ContainerState::Waiting { reason, message }) => format!(
+            "; container waiting{}{}",
+            reason.as_deref().map(|r| format!(": reason={r}")).unwrap_or_default(),
+            message.as_deref().map(|m| format!(", message={m}")).unwrap_or_default(),
+        ),
+        Some(ContainerState::Running { .. }) | None => String::new(),
     };
 
-    // Apply limit_bytes if specified
-    if let Some(limit) = query.limit_bytes {
-        let limit = limit as usize;
-        if result.len() > limit {
-            return result[..limit].to_string();
-        }
-    }
-
-    result
+    Error::BadRequest(format!(
+        "unable to retrieve logs for container {container_name} in pod {}/{}: {underlying}{diagnostics}",
+        pod.metadata.namespace.as_deref().unwrap_or("default"),
+        pod.metadata.name,
+    ))
 }
 
 /// GET/POST /api/v1/namespaces/{namespace}/pods/{name}/exec
@@ -1568,5 +1549,62 @@ mod tests {
         };
         // 50% of 10 = 5
         assert_eq!(compute_pdb_desired_healthy(&pdb, 10), 5);
+    }
+
+    fn make_pod_with_container_state(name: &str, namespace: &str, state_json: serde_json::Value) -> Pod {
+        let json = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": name, "namespace": namespace},
+            "spec": {"containers": [{"name": "test", "image": "nginx"}]},
+            "status": {
+                "phase": "Failed",
+                "containerStatuses": [{
+                    "name": "test",
+                    "ready": false,
+                    "restartCount": 0,
+                    "state": state_json,
+                }]
+            }
+        });
+        serde_json::from_value(json).unwrap()
+    }
+
+    /// Regression: real errors used to be silently swallowed into a fake
+    /// "everything is fine" log stream. Confirm the honest replacement
+    /// surfaces the pod's own real terminated-state diagnostics instead.
+    #[test]
+    fn logs_unavailable_error_surfaces_terminated_diagnostics() {
+        let pod = make_pod_with_container_state(
+            "initdb-job",
+            "default",
+            serde_json::json!({"terminated": {
+                "exitCode": 1,
+                "reason": "Error",
+                "message": "initdb failed",
+            }}),
+        );
+        let underlying = anyhow::anyhow!("No such container: initdb-job_test");
+        let err = logs_unavailable_error(&pod, "test", &underlying);
+        let msg = err.to_string();
+        assert!(msg.contains("exitCode=1"), "{msg}");
+        assert!(msg.contains("reason=Error"), "{msg}");
+        assert!(msg.contains("message=initdb failed"), "{msg}");
+        assert!(msg.contains("No such container"), "{msg}");
+        assert!(
+            !msg.contains("Application ready to serve traffic"),
+            "must not contain fabricated success text: {msg}"
+        );
+    }
+
+    #[test]
+    fn logs_unavailable_error_has_no_diagnostics_suffix_when_status_unknown() {
+        let pod = make_pod("no-status", "default", HashMap::new(), false);
+        let underlying = anyhow::anyhow!("connection refused");
+        let err = logs_unavailable_error(&pod, "test", &underlying);
+        let msg = err.to_string();
+        assert!(msg.contains("connection refused"), "{msg}");
+        assert!(!msg.contains("terminated"), "{msg}");
+        assert!(!msg.contains("waiting"), "{msg}");
     }
 }
