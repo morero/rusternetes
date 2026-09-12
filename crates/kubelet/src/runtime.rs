@@ -149,6 +149,19 @@ fn effective_termination_message_path(termination_message_path: &Option<String>)
         .unwrap_or("/dev/termination-log")
 }
 
+/// An HTTP probe's explicit `host` override, treating an explicit empty
+/// string the same as unset (`None`) — real clients (CNPG's own generated
+/// Pod spec, confirmed live) send `host: ""` for "not set", the API's own
+/// documented default, not a missing field. Using `Some("")` as-is built a
+/// `https://:<port>/...` URL that reqwest rejects outright as invalid
+/// ("builder error"), permanently failing the probe — for a `startupProbe`
+/// specifically, this means the pod can never pass its startup gate and
+/// `Ready` never flips `True`, no matter how healthy the container
+/// actually is (see ISSUES.md).
+fn effective_probe_host(host: &Option<String>) -> Option<&str> {
+    host.as_deref().filter(|s| !s.is_empty())
+}
+
 fn shell_join(args: &[String]) -> String {
     args.iter()
         .map(|a| {
@@ -7062,11 +7075,10 @@ impl ContainerRuntime {
         http_get: &HTTPGetAction,
         timeout: Duration,
     ) -> Result<bool> {
-        // Use host field if specified, otherwise resolve container IP
-        let ip = if let Some(ref host) = http_get.host {
-            host.clone()
-        } else {
-            self.get_effective_container_ip(container_name).await
+        // Use host field if specified, otherwise resolve container IP.
+        let ip = match effective_probe_host(&http_get.host) {
+            Some(host) => host.to_string(),
+            None => self.get_effective_container_ip(container_name).await,
         };
 
         // Resolve named port via container.ports[].name lookup (K8s IntOrString).
@@ -8479,8 +8491,17 @@ impl ContainerRuntime {
 
         let containers = self.docker.list_containers(Some(options)).await?;
 
-        // Group exited containers by pod name, track which pods have running containers
-        let mut exited_by_pod: HashMap<String, Vec<(String, i64)>> = HashMap::new();
+        // Group exited containers by (pod name, container name) — real
+        // kubelet's MaxPerPodContainerCount keeps N dead containers *per
+        // container name*, not N total per pod. Grouping by pod name alone
+        // meant a multi-container pod (e.g. an init container plus its main
+        // container, both exited) only ever kept the single most-recently-
+        // created one, immediately removing every other container's own
+        // exit — losing log access to it in the very same GC pass a
+        // still-running pod's failure diagnostics were supposed to survive
+        // in (see ISSUES.md).
+        let mut exited_by_pod: HashMap<String, HashMap<String, Vec<(String, i64)>>> =
+            HashMap::new();
         let mut pods_with_running: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         let mut stale_created: Vec<String> = Vec::new();
@@ -8500,10 +8521,12 @@ impl ContainerRuntime {
                 continue;
             }
 
-            let pod_name = match name.split('_').next() {
+            let mut name_parts = name.splitn(2, '_');
+            let pod_name = match name_parts.next() {
                 Some(p) => p.to_string(),
                 None => continue,
             };
+            let container_name = name_parts.next().unwrap_or("").to_string();
 
             let state = container.state.as_deref().unwrap_or("");
             let container_id = match &container.id {
@@ -8519,6 +8542,8 @@ impl ContainerRuntime {
                 "exited" | "dead" | "stopped" => {
                     exited_by_pod
                         .entry(pod_name)
+                        .or_default()
+                        .entry(container_name)
                         .or_default()
                         .push((container_id, created));
                 }
@@ -8537,45 +8562,18 @@ impl ContainerRuntime {
 
         // 1. Remove exited containers.
         // K8s ref: evictContainers — for deleted pods (allSourcesReady), remove ALL.
-        // For existing pods, keep at most MaxPerPodContainerCount (default 1).
-        for (pod_name, mut exited) in exited_by_pod {
-            // Sort by created time descending — keep the newest
-            exited.sort_by(|a, b| b.1.cmp(&a.1));
-
+        // For existing pods, keep at most MaxPerPodContainerCount (default 1)
+        // *per container name* (a pod's init container and main container
+        // each keep their own newest exited copy, independently).
+        for (pod_name, containers_by_name) in &exited_by_pod {
             // For pods still in etcd, keep 1 dead container for log access.
             // For deleted pods, remove ALL dead containers.
-            let keep_count = if existing_pods.contains(&pod_name) {
-                1
-            } else {
-                0
-            };
-            for (container_id, _) in exited.iter().skip(keep_count) {
-                let opts = RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                };
-                if self
-                    .docker
-                    .remove_container(container_id, Some(opts))
-                    .await
-                    .is_ok()
-                {
-                    removed += 1;
-                }
-            }
-
-            // If the pod has no running containers AND is actually gone from
-            // storage, remove the last dead one too and clean up the pause
-            // container (orphaned sandbox). A pod that's merely between
-            // containers (e.g. a completed/failed Job pod, or a container
-            // mid-restart) but still present in storage must keep its one
-            // dead container for log access — that's the whole point of the
-            // `keep_count` decision above; without the `existing_pods` check
-            // here, this block undid it unconditionally, so a failed pod's
-            // logs became unavailable within the same GC pass they were
-            // supposed to survive (see ISSUES.md).
-            if should_fully_cleanup_pod(pods_with_running.contains(&pod_name), existing_pods.contains(&pod_name)) {
-                for (container_id, _) in exited.iter().take(1) {
+            let keep_count = if existing_pods.contains(pod_name) { 1 } else { 0 };
+            for exited in containers_by_name.values() {
+                let mut exited = exited.clone();
+                // Sort by created time descending — keep the newest
+                exited.sort_by(|a, b| b.1.cmp(&a.1));
+                for (container_id, _) in exited.iter().skip(keep_count) {
                     let opts = RemoveContainerOptions {
                         force: true,
                         ..Default::default()
@@ -8587,6 +8585,38 @@ impl ContainerRuntime {
                         .is_ok()
                     {
                         removed += 1;
+                    }
+                }
+            }
+
+            // If the pod has no running containers AND is actually gone from
+            // storage, remove the last dead one (per container name) too and
+            // clean up the pause container (orphaned sandbox). A pod that's
+            // merely between containers (e.g. a completed/failed Job pod, or
+            // a container mid-restart) but still present in storage must
+            // keep its one dead container for log access — that's the whole
+            // point of the `keep_count` decision above; without the
+            // `existing_pods` check here, this block undid it
+            // unconditionally, so a failed pod's logs became unavailable
+            // within the same GC pass they were supposed to survive (see
+            // ISSUES.md).
+            if should_fully_cleanup_pod(pods_with_running.contains(pod_name), existing_pods.contains(pod_name)) {
+                for exited in containers_by_name.values() {
+                    let mut exited = exited.clone();
+                    exited.sort_by(|a, b| b.1.cmp(&a.1));
+                    for (container_id, _) in exited.iter().take(1) {
+                        let opts = RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        };
+                        if self
+                            .docker
+                            .remove_container(container_id, Some(opts))
+                            .await
+                            .is_ok()
+                        {
+                            removed += 1;
+                        }
                     }
                 }
                 // Remove orphaned pause container
@@ -8608,7 +8638,7 @@ impl ContainerRuntime {
                     removed += 1;
                 }
                 // Clean up volumes
-                let _ = self.cleanup_pod_volumes(&pod_name).await;
+                let _ = self.cleanup_pod_volumes(pod_name).await;
             }
         }
 
@@ -8835,7 +8865,7 @@ pub fn parse_cpu_quantity(s: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_fsgroup_to_path, bound_pv_name, effective_sub_path_expr,
+        apply_fsgroup_to_path, bound_pv_name, effective_probe_host, effective_sub_path_expr,
         effective_termination_message_path, security_opts_for, should_fully_cleanup_pod,
         token_needs_rotation, write_file_if_changed, ContainerRuntime,
     };
@@ -9755,6 +9785,24 @@ mod tests {
         assert_eq!(
             effective_termination_message_path(&Some("/custom/path".to_string())),
             "/custom/path"
+        );
+    }
+
+    /// Same bug class a third time: CNPG's own generated Pod spec sends
+    /// `httpGet.host: ""` explicitly for an unset probe host override
+    /// rather than omitting the field. Using `Some("")` as-is built a
+    /// `https://:<port>/...` URL that reqwest rejects outright as invalid
+    /// ("builder error"), permanently failing the probe — for a
+    /// `startupProbe` specifically, meaning the pod's `Ready` condition
+    /// could never flip `True` no matter how healthy the container
+    /// actually was, live-hit against platform-db-cluster's main instance.
+    #[test]
+    fn test_effective_probe_host_treats_explicit_empty_string_as_unset() {
+        assert_eq!(effective_probe_host(&None), None);
+        assert_eq!(effective_probe_host(&Some(String::new())), None);
+        assert_eq!(
+            effective_probe_host(&Some("10.0.0.5".to_string())),
+            Some("10.0.0.5")
         );
     }
 
