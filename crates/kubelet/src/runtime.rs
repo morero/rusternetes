@@ -108,6 +108,47 @@ pub struct ContainerRuntime {
 
 /// Join a list of strings into a shell-safe command string.
 /// Wraps arguments containing spaces or special characters in single quotes.
+/// A PVC's `spec.volumeName` naming the PV it's bound to, treating an
+/// explicit empty string the same as genuinely unset. Real client-created
+/// PVCs (confirmed live: CloudNativePG's own PVC, before this repo's
+/// `dynamic_provisioner`/`pv_binder` controllers finish binding it) can carry
+/// `volumeName: Some("")` rather than omitting the field while unbound — a
+/// bare `.as_ref()` check treated that as "has a volume", producing a
+/// confusing "PersistentVolume  not found" (empty name interpolated) instead
+/// of correctly waiting for a real binding.
+fn bound_pv_name(volume_name: &Option<String>) -> Option<&str> {
+    volume_name.as_deref().filter(|s| !s.is_empty())
+}
+
+/// A VolumeMount's `subPathExpr`, treating an explicit empty string the same
+/// as genuinely unset. A real client can send `subPathExpr: ""` explicitly
+/// rather than omitting the field — live-hit via CNPG's own
+/// bootstrap-controller container — and real Kubernetes treats that the same
+/// as "no subPathExpr", falling through to the plain `subPath` field
+/// instead. A bare `.as_ref()` check matched `Some("")` too, treating it as
+/// "yes, expand this" — expanding an empty expression trivially yields ""
+/// again, which then hard-failed the container as
+/// `CreateContainerConfigError: subPathExpr '' expanded to empty string`.
+fn effective_sub_path_expr(sub_path_expr: &Option<String>) -> Option<&str> {
+    sub_path_expr.as_deref().filter(|s| !s.is_empty())
+}
+
+/// A Container's `terminationMessagePath`, defaulting to `/dev/termination-log`
+/// (Kubernetes' own default) for both a genuinely unset field AND an
+/// explicit empty string. A real client can send
+/// `terminationMessagePath: ""` explicitly rather than omitting the field —
+/// live-hit via CNPG's own bootstrap-controller container — and a bare
+/// `.as_deref().unwrap_or(...)` only substitutes the default on `None`, not
+/// on `Some("")`, leaving the container-side half of the bind-mount spec
+/// empty. Docker rejects `<host_path>:` outright with "invalid volume
+/// specification", hard-failing the container on every single attempt.
+fn effective_termination_message_path(termination_message_path: &Option<String>) -> &str {
+    termination_message_path
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("/dev/termination-log")
+}
+
 fn shell_join(args: &[String]) -> String {
     args.iter()
         .map(|a| {
@@ -3081,11 +3122,16 @@ impl ContainerRuntime {
                 )
             })?;
 
-            // Get the bound PV name
-            let pv_name = pvc
-                .spec
-                .volume_name
-                .as_ref()
+            // Get the bound PV name. A real client-created PVC can carry
+            // `volumeName` as an explicit empty string rather than omitting
+            // the field while genuinely unbound (confirmed live: CloudNativePG's
+            // own PVC, before `dynamic_provisioner`/`pv_binder` finish binding
+            // it) — the same wire-level convention already fixed in both of
+            // those controllers. `.as_ref()` alone treated `Some("")` as "has
+            // a volume", producing the confusing "PersistentVolume  not
+            // found" (empty name interpolated) instead of a clear "not bound"
+            // error.
+            let pv_name = bound_pv_name(&pvc.spec.volume_name)
                 .context("PersistentVolumeClaim is not bound to a volume")?;
 
             // Get the PV
@@ -3278,7 +3324,7 @@ impl ContainerRuntime {
                     .await
                     .with_context(|| format!("Ephemeral PVC {} not found", pvc_name))?;
 
-                if let Some(pv_name) = &pvc.spec.volume_name {
+                if let Some(pv_name) = bound_pv_name(&pvc.spec.volume_name) {
                     let pv_key = build_key("persistentvolumes", None, pv_name);
                     let pv: PersistentVolume = storage.get(&pv_key).await.with_context(|| {
                         format!(
@@ -4340,7 +4386,10 @@ impl ContainerRuntime {
                 // Validate subPathExpr / subPath BEFORE looking up the volume.
                 // Kubernetes rejects containers whose expanded subpath contains
                 // ".." or is absolute, regardless of whether the volume exists.
-                let expanded_sub_path: Option<String> = if let Some(ref expr) = mount.sub_path_expr
+                // See effective_sub_path_expr's doc comment for why `Some("")`
+                // must fall through to the plain `sub_path` check below.
+                let expanded_sub_path: Option<String> = if let Some(expr) =
+                    effective_sub_path_expr(&mount.sub_path_expr)
                 {
                     debug!(
                         "subPathExpr='{}' for container {} mount {}, env_pairs={:?}",
@@ -4714,10 +4763,8 @@ impl ContainerRuntime {
         // Docker's /dev is a tmpfs that becomes inaccessible after the container stops,
         // so we create a host-side file and bind-mount it into the container.
         {
-            let term_msg_path = container
-                .termination_message_path
-                .as_deref()
-                .unwrap_or("/dev/termination-log");
+            let term_msg_path =
+                effective_termination_message_path(&container.termination_message_path);
             let term_host_dir = format!("{}/{}/termination", self.volumes_base_path, pod_name);
             std::fs::create_dir_all(&term_host_dir).ok();
             let term_host_file = format!("{}/{}", term_host_dir, container.name);
@@ -6779,10 +6826,7 @@ impl ContainerRuntime {
         container: &Container,
         exit_code: i64,
     ) -> Option<String> {
-        let msg_path = container
-            .termination_message_path
-            .as_deref()
-            .unwrap_or("/dev/termination-log");
+        let msg_path = effective_termination_message_path(&container.termination_message_path);
 
         debug!(
             "Reading termination message from {} in container {}",
@@ -8773,8 +8817,9 @@ pub fn parse_cpu_quantity(s: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_fsgroup_to_path, security_opts_for, token_needs_rotation, write_file_if_changed,
-        ContainerRuntime,
+        apply_fsgroup_to_path, bound_pv_name, effective_sub_path_expr,
+        effective_termination_message_path, security_opts_for, token_needs_rotation,
+        write_file_if_changed, ContainerRuntime,
     };
     use rusternetes_common::resources::pod::PodSecurityContext as PodLevelSecurityContext;
     use rusternetes_common::resources::{
@@ -9615,6 +9660,65 @@ mod tests {
         // Extract key
         let key = &field_path[22..field_path.len() - 2];
         assert_eq!(key, "description");
+    }
+
+    /// Regression test for a real bug found live: a real client-created PVC
+    /// (confirmed: CloudNativePG's own PVC, before this repo's
+    /// `dynamic_provisioner`/`pv_binder` controllers finish binding it) can
+    /// carry `volumeName` as an explicit empty string rather than omitting
+    /// the field while genuinely unbound. Treating that as "has a volume"
+    /// (a bare `.as_ref()`/`if let Some(..)`) produced a confusing
+    /// "PersistentVolume  not found" (empty name interpolated) instead of a
+    /// clear "not bound" error — and, worse, burned through a Job's pod-retry
+    /// budget racing against the binder rather than waiting for it.
+    #[test]
+    fn test_bound_pv_name_treats_explicit_empty_string_as_unbound() {
+        assert_eq!(bound_pv_name(&None), None);
+        assert_eq!(bound_pv_name(&Some(String::new())), None);
+        assert_eq!(
+            bound_pv_name(&Some("pvc-default-my-pvc".to_string())),
+            Some("pvc-default-my-pvc")
+        );
+    }
+
+    /// Same bug class, different field: CNPG's own bootstrap-controller
+    /// container sends `subPathExpr: ""` explicitly rather than omitting the
+    /// field. A bare `.as_ref()` treated that as "yes, expand this", which
+    /// trivially expands an empty expression to "" again and then hard-fails
+    /// the container with `CreateContainerConfigError: subPathExpr ''
+    /// expanded to empty string` — live-hit against platform-db-cluster's
+    /// initdb Job.
+    #[test]
+    fn test_effective_sub_path_expr_treats_explicit_empty_string_as_unset() {
+        assert_eq!(effective_sub_path_expr(&None), None);
+        assert_eq!(effective_sub_path_expr(&Some(String::new())), None);
+        assert_eq!(
+            effective_sub_path_expr(&Some("$(POD_NAME)".to_string())),
+            Some("$(POD_NAME)")
+        );
+    }
+
+    /// Same bug class again: CNPG's own bootstrap-controller container sends
+    /// `terminationMessagePath: ""` explicitly rather than omitting the
+    /// field. A bare `.as_deref().unwrap_or(...)` only substitutes the
+    /// Kubernetes default on `None`, not `Some("")`, leaving the
+    /// container-side half of the bind-mount spec empty — Docker rejected
+    /// `<host_path>:` outright with "invalid volume specification",
+    /// hard-failing the container on every attempt.
+    #[test]
+    fn test_effective_termination_message_path_treats_explicit_empty_string_as_unset() {
+        assert_eq!(
+            effective_termination_message_path(&None),
+            "/dev/termination-log"
+        );
+        assert_eq!(
+            effective_termination_message_path(&Some(String::new())),
+            "/dev/termination-log"
+        );
+        assert_eq!(
+            effective_termination_message_path(&Some("/custom/path".to_string())),
+            "/custom/path"
+        );
     }
 
     #[test]
@@ -11338,7 +11442,10 @@ mod tests {
 
         apply_fsgroup_to_path(sub_path_dir.to_str().unwrap(), 1001);
 
-        let mode = std::fs::metadata(&sub_path_dir).unwrap().permissions().mode();
+        let mode = std::fs::metadata(&sub_path_dir)
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(
             mode & 0o2000,
             0o2000,
