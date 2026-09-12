@@ -45,6 +45,34 @@ pub enum FieldType {
     MessageMap(String),
     /// K8s JSON type — a message with a single `raw` bytes field containing JSON
     JsonRaw,
+    /// map<string, resource.Quantity> (e.g. ResourceRequirements limits/requests,
+    /// PodSpec.overhead). Each map entry's value is itself a `resource.Quantity`
+    /// message (`{ optional string string = 1; }`), which must be unwrapped to
+    /// its plain string form ("8Gi", "500m") — matching how real k8s marshals
+    /// Quantity to JSON. Not just a `StringMap`: treating the value's raw
+    /// message bytes as a plain UTF-8 string (the pre-fix behavior) leaks the
+    /// wrapping message's own tag/length bytes into the string, e.g. a PVC's
+    /// `storage: 8Gi` request decoding as `"\n\x038Gi"`.
+    QuantityMap,
+    /// A single `resource.Quantity` field (e.g. `EmptyDirVolumeSource.sizeLimit`),
+    /// unwrapped to its plain string form rather than decoded as a generic
+    /// nested message (which would produce `{"string":"1Gi"}` instead of the
+    /// real k8s JSON shape, a bare `"1Gi"`).
+    Quantity,
+    /// A nested message whose fields should be merged directly into the
+    /// *parent* JSON object, rather than nested under this field's own key —
+    /// matching a real k8s Go struct embedded with `json:",inline"`. Real
+    /// k8s's `Volume` message, for instance, wraps all its source-type
+    /// variants (hostPath, emptyDir, secret, ...) in a nested `VolumeSource`
+    /// sub-message at field 2, but the JSON representation flattens those
+    /// keys directly onto the `Volume` object (`{"name":"x","emptyDir":{}}`,
+    /// never `{"name":"x","volumeSource":{"emptyDir":{}}}`). Before this
+    /// variant existed, `Volume`'s schema wrongly treated its OWN field
+    /// numbers as if they directly were the source-type fields, which
+    /// decoded a real emptyDir volume as a broken, empty `hostPath` object
+    /// (missing its required `path`) — found live via a real CNPG-created
+    /// Job whose pod template's first volume tripped this exact bug.
+    FlattenedMessage(String),
 }
 
 /// Schema for a single protobuf message type
@@ -618,6 +646,54 @@ impl ProtoRegistry {
             Self::resource_requirements_schema(),
         );
         schemas.insert("Volume".into(), Self::volume_schema());
+        schemas.insert("VolumeSource".into(), Self::volume_source_schema());
+        schemas.insert(
+            "HostPathVolumeSource".into(),
+            Self::host_path_volume_source_schema(),
+        );
+        schemas.insert(
+            "EmptyDirVolumeSource".into(),
+            Self::empty_dir_volume_source_schema(),
+        );
+        schemas.insert(
+            "SecretVolumeSource".into(),
+            Self::secret_volume_source_schema(),
+        );
+        schemas.insert(
+            "PersistentVolumeClaimVolumeSource".into(),
+            Self::persistent_volume_claim_volume_source_schema(),
+        );
+        schemas.insert(
+            "ConfigMapVolumeSource".into(),
+            Self::config_map_volume_source_schema(),
+        );
+        schemas.insert("KeyToPath".into(), Self::key_to_path_schema());
+        schemas.insert(
+            "DownwardAPIVolumeSource".into(),
+            Self::downward_api_volume_source_schema(),
+        );
+        schemas.insert(
+            "DownwardAPIVolumeFile".into(),
+            Self::downward_api_volume_file_schema(),
+        );
+        schemas.insert(
+            "ProjectedVolumeSource".into(),
+            Self::projected_volume_source_schema(),
+        );
+        schemas.insert("VolumeProjection".into(), Self::volume_projection_schema());
+        schemas.insert("SecretProjection".into(), Self::secret_projection_schema());
+        schemas.insert(
+            "ConfigMapProjection".into(),
+            Self::config_map_projection_schema(),
+        );
+        schemas.insert(
+            "DownwardAPIProjection".into(),
+            Self::downward_api_projection_schema(),
+        );
+        schemas.insert(
+            "ServiceAccountTokenProjection".into(),
+            Self::service_account_token_projection_schema(),
+        );
         schemas.insert("VolumeMount".into(), Self::volume_mount_schema());
         schemas.insert("EnvVar".into(), Self::env_var_schema());
         schemas.insert("EnvVarSource".into(), Self::env_var_source_schema());
@@ -640,11 +716,29 @@ impl ProtoRegistry {
                 ]),
             },
         );
+        // ConfigMapKeySelector/SecretKeySelector/*EnvSource all embed
+        // `LocalObjectReference` FLATTENED at field 1 (real k8s Go struct:
+        // `LocalObjectReference \`json:",inline\``, so the JSON representation
+        // is a bare `{"name":"x","key":"y"}`, never a nested `localObjectReference`
+        // key). Field 1 was wrongly declared as a plain string here, which
+        // decoded the wrapping message's own tag+length bytes straight into
+        // the name — found live via a real CNPG-created Job whose container's
+        // `env[].valueFrom.secretKeyRef.name` came back as
+        // `"\n\x17platform-db-cluster-app"` instead of
+        // `"platform-db-cluster-app"` — same bug class as the Quantity and
+        // Volume/VolumeSource fixes above, just recurring in a different
+        // family of embedded types.
         schemas.insert(
             "ConfigMapKeySelector".into(),
             MessageSchema {
                 fields: HashMap::from([
-                    (1, ("name".into(), FieldType::String)),
+                    (
+                        1,
+                        (
+                            "__localObjectReference".into(),
+                            FieldType::FlattenedMessage("LocalObjectReference".into()),
+                        ),
+                    ),
                     (2, ("key".into(), FieldType::String)),
                     (3, ("optional".into(), FieldType::Bool)),
                 ]),
@@ -654,9 +748,64 @@ impl ProtoRegistry {
             "SecretKeySelector".into(),
             MessageSchema {
                 fields: HashMap::from([
-                    (1, ("name".into(), FieldType::String)),
+                    (
+                        1,
+                        (
+                            "__localObjectReference".into(),
+                            FieldType::FlattenedMessage("LocalObjectReference".into()),
+                        ),
+                    ),
                     (2, ("key".into(), FieldType::String)),
                     (3, ("optional".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "SecretEnvSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "__localObjectReference".into(),
+                            FieldType::FlattenedMessage("LocalObjectReference".into()),
+                        ),
+                    ),
+                    (2, ("optional".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ConfigMapEnvSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "__localObjectReference".into(),
+                            FieldType::FlattenedMessage("LocalObjectReference".into()),
+                        ),
+                    ),
+                    (2, ("optional".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "EnvFromSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("prefix".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "configMapRef".into(),
+                            FieldType::Message("ConfigMapEnvSource".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        ("secretRef".into(), FieldType::Message("SecretEnvSource".into())),
+                    ),
                 ]),
             },
         );
@@ -1062,6 +1211,220 @@ impl ProtoRegistry {
             },
         );
 
+        // PodDisruptionBudget (policy/v1) — found live via CNPG's Cluster
+        // reconcile: no schema was registered for this kind at all, so
+        // decode_k8s_resource() returned None for every protobuf-encoded
+        // PodDisruptionBudget write, falling through to the generic CRD
+        // fallback decoder (which blindly applies CustomResourceDefinitionSpec's
+        // own field layout to any unregistered kind), producing garbage that
+        // then failed strict deserialization — same bug class as the earlier
+        // missing "Lease" schema.
+        schemas.insert(
+            "PodDisruptionBudget".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "spec".into(),
+                            FieldType::Message("PodDisruptionBudgetSpec".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "status".into(),
+                            FieldType::Message("PodDisruptionBudgetStatus".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "PodDisruptionBudgetSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("minAvailable".into(), FieldType::IntOrString)),
+                    (2, ("selector".into(), FieldType::Message("LabelSelector".into()))),
+                    (3, ("maxUnavailable".into(), FieldType::IntOrString)),
+                    (4, ("unhealthyPodEvictionPolicy".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "PodDisruptionBudgetStatus".into(),
+            MessageSchema {
+                fields: HashMap::new(),
+            },
+        );
+
+        // RBAC types (rbac.authorization.k8s.io/v1) — found live in the same
+        // investigation as PodDisruptionBudget above: CNPG's Cluster reconcile
+        // creates a Role/RoleBinding per cluster and hit the identical
+        // no-schema-registered symptom immediately after PDB was fixed. Field
+        // numbers verified against the real upstream k8s.io/api/rbac/v1
+        // generated.proto.
+        schemas.insert(
+            "PolicyRule".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "verbs".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "apiGroups".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "resources".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        4,
+                        (
+                            "resourceNames".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        5,
+                        (
+                            "nonResourceURLs".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "Role".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "rules".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("PolicyRule".into()))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "AggregationRule".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "clusterRoleSelectors".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message("LabelSelector".into()))),
+                    ),
+                )]),
+            },
+        );
+        schemas.insert(
+            "ClusterRole".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "rules".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("PolicyRule".into()))),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "aggregationRule".into(),
+                            FieldType::Message("AggregationRule".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "Subject".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("kind".into(), FieldType::String)),
+                    (2, ("apiGroup".into(), FieldType::String)),
+                    (3, ("name".into(), FieldType::String)),
+                    (4, ("namespace".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "RoleRef".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("apiGroup".into(), FieldType::String)),
+                    (2, ("kind".into(), FieldType::String)),
+                    (3, ("name".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "RoleBinding".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "subjects".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("Subject".into()))),
+                        ),
+                    ),
+                    (3, ("roleRef".into(), FieldType::Message("RoleRef".into()))),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ClusterRoleBinding".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "subjects".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("Subject".into()))),
+                        ),
+                    ),
+                    (3, ("roleRef".into(), FieldType::Message("RoleRef".into()))),
+                ]),
+            },
+        );
+
         // Batch types
         schemas.insert(
             "Job".into(),
@@ -1381,8 +1744,8 @@ impl ProtoRegistry {
             "VolumeResourceRequirements".into(),
             MessageSchema {
                 fields: HashMap::from([
-                    (1, ("limits".into(), FieldType::StringMap)),
-                    (2, ("requests".into(), FieldType::StringMap)),
+                    (1, ("limits".into(), FieldType::QuantityMap)),
+                    (2, ("requests".into(), FieldType::QuantityMap)),
                 ]),
             },
         );
@@ -2263,7 +2626,7 @@ impl ProtoRegistry {
                     ),
                 ),
                 (30, ("runtimeClassName".into(), FieldType::String)),
-                (32, ("overhead".into(), FieldType::StringMap)),
+                (32, ("overhead".into(), FieldType::QuantityMap)),
                 (33, ("enableServiceLinks".into(), FieldType::Bool)),
                 (
                     34,
@@ -2467,8 +2830,8 @@ impl ProtoRegistry {
     fn resource_requirements_schema() -> MessageSchema {
         MessageSchema {
             fields: HashMap::from([
-                (1, ("limits".into(), FieldType::StringMap)),
-                (2, ("requests".into(), FieldType::StringMap)),
+                (1, ("limits".into(), FieldType::QuantityMap)),
+                (2, ("requests".into(), FieldType::QuantityMap)),
                 (
                     3,
                     (
@@ -2481,61 +2844,275 @@ impl ProtoRegistry {
     }
 
     fn volume_schema() -> MessageSchema {
-        // Volumes have many source types — we handle the most common
+        // Real k8s.io/api/core/v1 `Volume` message: `{ name = 1; volumeSource
+        // VolumeSource = 2; }` — VolumeSource is a genuine NESTED sub-message,
+        // not fields flattened directly onto Volume's own field numbers (the
+        // pre-fix bug: Volume's field 2 was treated as directly being
+        // `hostPath`, which decoded a real `emptyDir` volume as a broken,
+        // empty `hostPath` object missing its required `path`). The JSON
+        // representation flattens VolumeSource's fields onto Volume though
+        // (matching Go's `VolumeSource \`json:",inline\`` embedding), hence
+        // `FlattenedMessage` here rather than a plain nested `Message`.
         MessageSchema {
             fields: HashMap::from([
                 (1, ("name".into(), FieldType::String)),
-                // VolumeSource is inlined — each source type has its own field number
-                // We handle the most common ones
+                (2, ("__volumeSource".into(), FieldType::FlattenedMessage("VolumeSource".into()))),
+            ]),
+        }
+    }
+
+    /// `VolumeSource` — we handle the source types actually likely to appear
+    /// in real workloads; legacy/deprecated cloud-specific types (GCE/AWS/
+    /// Azure/vSphere/Cinder/RBD/etc.) are intentionally omitted. Field
+    /// numbers verified against the real upstream
+    /// k8s.io/api/core/v1 generated.proto.
+    fn volume_source_schema() -> MessageSchema {
+        MessageSchema {
+            fields: HashMap::from([
+                (1, ("hostPath".into(), FieldType::Message("HostPathVolumeSource".into()))),
+                (2, ("emptyDir".into(), FieldType::Message("EmptyDirVolumeSource".into()))),
+                (6, ("secret".into(), FieldType::Message("SecretVolumeSource".into()))),
                 (
-                    2,
-                    (
-                        "hostPath".into(),
-                        FieldType::Message("HostPathVolumeSource".into()),
-                    ),
-                ),
-                (
-                    3,
-                    (
-                        "emptyDir".into(),
-                        FieldType::Message("EmptyDirVolumeSource".into()),
-                    ),
-                ),
-                (
-                    6,
-                    (
-                        "secret".into(),
-                        FieldType::Message("SecretVolumeSource".into()),
-                    ),
-                ),
-                (
-                    9,
+                    10,
                     (
                         "persistentVolumeClaim".into(),
                         FieldType::Message("PersistentVolumeClaimVolumeSource".into()),
                     ),
                 ),
+                (16, ("downwardAPI".into(), FieldType::Message("DownwardAPIVolumeSource".into()))),
+                (19, ("configMap".into(), FieldType::Message("ConfigMapVolumeSource".into()))),
+                (26, ("projected".into(), FieldType::Message("ProjectedVolumeSource".into()))),
+            ]),
+        }
+    }
+
+    fn host_path_volume_source_schema() -> MessageSchema {
+        MessageSchema {
+            fields: HashMap::from([
+                (1, ("path".into(), FieldType::String)),
+                (2, ("type".into(), FieldType::String)),
+            ]),
+        }
+    }
+
+    fn empty_dir_volume_source_schema() -> MessageSchema {
+        MessageSchema {
+            fields: HashMap::from([
+                (1, ("medium".into(), FieldType::String)),
+                (2, ("sizeLimit".into(), FieldType::Quantity)),
+            ]),
+        }
+    }
+
+    fn secret_volume_source_schema() -> MessageSchema {
+        MessageSchema {
+            fields: HashMap::from([
+                (1, ("secretName".into(), FieldType::String)),
                 (
-                    19,
+                    2,
                     (
-                        "configMap".into(),
-                        FieldType::Message("ConfigMapVolumeSource".into()),
+                        "items".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message("KeyToPath".into()))),
+                    ),
+                ),
+                (3, ("defaultMode".into(), FieldType::Int)),
+                (4, ("optional".into(), FieldType::Bool)),
+            ]),
+        }
+    }
+
+    fn persistent_volume_claim_volume_source_schema() -> MessageSchema {
+        MessageSchema {
+            fields: HashMap::from([
+                (1, ("claimName".into(), FieldType::String)),
+                (2, ("readOnly".into(), FieldType::Bool)),
+            ]),
+        }
+    }
+
+    fn config_map_volume_source_schema() -> MessageSchema {
+        MessageSchema {
+            fields: HashMap::from([
+                (
+                    1,
+                    (
+                        "__localObjectReference".into(),
+                        FieldType::FlattenedMessage("LocalObjectReference".into()),
                     ),
                 ),
                 (
-                    26,
+                    2,
                     (
-                        "projected".into(),
-                        FieldType::Message("ProjectedVolumeSource".into()),
+                        "items".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message("KeyToPath".into()))),
+                    ),
+                ),
+                (3, ("defaultMode".into(), FieldType::Int)),
+                (4, ("optional".into(), FieldType::Bool)),
+            ]),
+        }
+    }
+
+    fn key_to_path_schema() -> MessageSchema {
+        MessageSchema {
+            fields: HashMap::from([
+                (1, ("key".into(), FieldType::String)),
+                (2, ("path".into(), FieldType::String)),
+                (3, ("mode".into(), FieldType::Int)),
+            ]),
+        }
+    }
+
+    fn downward_api_volume_source_schema() -> MessageSchema {
+        MessageSchema {
+            fields: HashMap::from([
+                (
+                    1,
+                    (
+                        "items".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message(
+                            "DownwardAPIVolumeFile".into(),
+                        ))),
+                    ),
+                ),
+                (2, ("defaultMode".into(), FieldType::Int)),
+            ]),
+        }
+    }
+
+    fn downward_api_volume_file_schema() -> MessageSchema {
+        MessageSchema {
+            fields: HashMap::from([
+                (1, ("path".into(), FieldType::String)),
+                (
+                    2,
+                    (
+                        "fieldRef".into(),
+                        FieldType::Message("ObjectFieldSelector".into()),
                     ),
                 ),
                 (
-                    28,
+                    3,
+                    (
+                        "resourceFieldRef".into(),
+                        FieldType::Message("ResourceFieldSelector".into()),
+                    ),
+                ),
+                (4, ("mode".into(), FieldType::Int)),
+            ]),
+        }
+    }
+
+    fn projected_volume_source_schema() -> MessageSchema {
+        MessageSchema {
+            fields: HashMap::from([
+                (
+                    1,
+                    (
+                        "sources".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message(
+                            "VolumeProjection".into(),
+                        ))),
+                    ),
+                ),
+                (2, ("defaultMode".into(), FieldType::Int)),
+            ]),
+        }
+    }
+
+    fn volume_projection_schema() -> MessageSchema {
+        MessageSchema {
+            fields: HashMap::from([
+                (1, ("secret".into(), FieldType::Message("SecretProjection".into()))),
+                (
+                    2,
                     (
                         "downwardAPI".into(),
-                        FieldType::Message("DownwardAPIVolumeSource".into()),
+                        FieldType::Message("DownwardAPIProjection".into()),
                     ),
                 ),
+                (
+                    3,
+                    (
+                        "configMap".into(),
+                        FieldType::Message("ConfigMapProjection".into()),
+                    ),
+                ),
+                (
+                    4,
+                    (
+                        "serviceAccountToken".into(),
+                        FieldType::Message("ServiceAccountTokenProjection".into()),
+                    ),
+                ),
+            ]),
+        }
+    }
+
+    fn secret_projection_schema() -> MessageSchema {
+        MessageSchema {
+            fields: HashMap::from([
+                (
+                    1,
+                    (
+                        "__localObjectReference".into(),
+                        FieldType::FlattenedMessage("LocalObjectReference".into()),
+                    ),
+                ),
+                (
+                    2,
+                    (
+                        "items".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message("KeyToPath".into()))),
+                    ),
+                ),
+                (4, ("optional".into(), FieldType::Bool)),
+            ]),
+        }
+    }
+
+    fn config_map_projection_schema() -> MessageSchema {
+        MessageSchema {
+            fields: HashMap::from([
+                (
+                    1,
+                    (
+                        "__localObjectReference".into(),
+                        FieldType::FlattenedMessage("LocalObjectReference".into()),
+                    ),
+                ),
+                (
+                    2,
+                    (
+                        "items".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message("KeyToPath".into()))),
+                    ),
+                ),
+                (4, ("optional".into(), FieldType::Bool)),
+            ]),
+        }
+    }
+
+    fn downward_api_projection_schema() -> MessageSchema {
+        MessageSchema {
+            fields: HashMap::from([(
+                1,
+                (
+                    "items".into(),
+                    FieldType::Repeated(Box::new(FieldType::Message(
+                        "DownwardAPIVolumeFile".into(),
+                    ))),
+                ),
+            )]),
+        }
+    }
+
+    fn service_account_token_projection_schema() -> MessageSchema {
+        MessageSchema {
+            fields: HashMap::from([
+                (1, ("audience".into(), FieldType::String)),
+                (2, ("expirationSeconds".into(), FieldType::Int)),
+                (3, ("path".into(), FieldType::String)),
             ]),
         }
     }
@@ -2608,9 +3185,22 @@ impl ProtoRegistry {
     fn probe_schema() -> MessageSchema {
         MessageSchema {
             fields: HashMap::from([
+                // FlattenedMessage, not Message: Go's `corev1.Probe` embeds
+                // `ProbeHandler` via `json:",inline"` — exec/httpGet/tcpSocket
+                // appear directly on the probe object in JSON, matching this
+                // crate's own Probe struct. Decoding this as a literal nested
+                // `handler` message (this field's previous behavior) produced
+                // JSON that didn't match the Rust struct's shape at all,
+                // silently failing strict-field-validation with "unknown
+                // field ...handler" on every real client's Pod create —
+                // live-hit via CNPG's own instance pod creation. Same bug
+                // class as `Volume`/`VolumeSource` elsewhere in this file.
                 (
                     1,
-                    ("handler".into(), FieldType::Message("ProbeHandler".into())),
+                    (
+                        "__probeHandler".into(),
+                        FieldType::FlattenedMessage("ProbeHandler".into()),
+                    ),
                 ),
                 (2, ("initialDelaySeconds".into(), FieldType::Int)),
                 (3, ("timeoutSeconds".into(), FieldType::Int)),
@@ -2784,6 +3374,18 @@ impl ProtoRegistry {
                                     m.insert(key, Value::String(val));
                                 }
                             }
+                            FieldType::QuantityMap => {
+                                // map<string, resource.Quantity> — the value is
+                                // itself a nested Quantity message, not a plain
+                                // string; unwrap it (see decode_quantity_map_entry).
+                                let (key, val) = decode_quantity_map_entry(field_data);
+                                let map = obj
+                                    .entry(name.clone())
+                                    .or_insert_with(|| Value::Object(Map::new()));
+                                if let Value::Object(ref mut m) = map {
+                                    m.insert(key, Value::String(val));
+                                }
+                            }
                             FieldType::MessageMap(ref msg_type) => {
                                 // map<string, Message> — decode MapEntry with message value
                                 let (key, val) =
@@ -2793,6 +3395,18 @@ impl ProtoRegistry {
                                     .or_insert_with(|| Value::Object(Map::new()));
                                 if let Value::Object(ref mut m) = map {
                                     m.insert(key, val);
+                                }
+                            }
+                            FieldType::FlattenedMessage(ref msg_type) => {
+                                // Decode the nested message, then merge its keys
+                                // directly into the parent object — matching a
+                                // real k8s Go struct embedded with `json:",inline"`.
+                                if let Some(Value::Object(inner)) =
+                                    self.decode_message(msg_type, field_data)
+                                {
+                                    for (k, v) in inner {
+                                        obj.insert(k, v);
+                                    }
                                 }
                             }
                             _ => {
@@ -2868,8 +3482,16 @@ impl ProtoRegistry {
                 // Should be handled at the caller level as MapEntry
                 Value::Object(Map::new())
             }
+            FieldType::QuantityMap => {
+                // Should be handled at the caller level as a Quantity MapEntry
+                Value::Object(Map::new())
+            }
             FieldType::MessageMap(_) => {
                 // Should be handled at the caller level as MessageMapEntry
+                Value::Object(Map::new())
+            }
+            FieldType::FlattenedMessage(_) => {
+                // Should be handled at the caller level, merged into the parent
                 Value::Object(Map::new())
             }
             FieldType::IntOrString => {
@@ -2877,6 +3499,7 @@ impl ProtoRegistry {
                 // field 1 (type: int32), field 2 (intVal: int32), field 3 (strVal: string)
                 decode_int_or_string(data)
             }
+            FieldType::Quantity => Value::String(decode_quantity_message(data)),
             FieldType::JsonRaw => {
                 // K8s JSON type: a message with field 1 = bytes containing raw JSON.
                 // Decode the message to extract the raw bytes, then parse as JSON.
@@ -3169,6 +3792,90 @@ fn decode_map_entry(data: &[u8]) -> (String, String) {
     (key, val)
 }
 
+/// Decode a `resource.Quantity` protobuf message (`{ optional string string = 1; }`)
+/// into its plain string form (e.g. "8Gi", "500m").
+fn decode_quantity_message(data: &[u8]) -> String {
+    let mut pos = 0;
+    while pos < data.len() {
+        let (tag, new_pos) = match read_varint(data, pos) {
+            Some(v) => v,
+            None => break,
+        };
+        pos = new_pos;
+        let field_num = (tag >> 3) as u32;
+        let wire_type = (tag & 0x07) as u8;
+        if wire_type == WIRE_LENGTH_DELIMITED {
+            let (len, new_pos) = match read_varint(data, pos) {
+                Some(v) => v,
+                None => break,
+            };
+            pos = new_pos;
+            let len = len as usize;
+            if pos + len > data.len() {
+                break;
+            }
+            if field_num == 1 {
+                return String::from_utf8_lossy(&data[pos..pos + len]).to_string();
+            }
+            pos += len;
+        } else if wire_type == WIRE_VARINT {
+            let (_, new_pos) = match read_varint(data, pos) {
+                Some(v) => v,
+                None => break,
+            };
+            pos = new_pos;
+        } else {
+            break;
+        }
+    }
+    String::new()
+}
+
+/// Decode a MapEntry whose value is a `resource.Quantity` message (used for
+/// ResourceList-typed fields: limits/requests/overhead) — key stays a plain
+/// string, value is unwrapped via `decode_quantity_message` into its plain
+/// string form rather than being treated as raw UTF-8 bytes.
+fn decode_quantity_map_entry(data: &[u8]) -> (String, String) {
+    let mut key = String::new();
+    let mut val = String::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        let (tag, new_pos) = match read_varint(data, pos) {
+            Some(v) => v,
+            None => break,
+        };
+        pos = new_pos;
+        let field_num = (tag >> 3) as u32;
+        let wire_type = (tag & 0x07) as u8;
+        if wire_type == WIRE_LENGTH_DELIMITED {
+            let (len, new_pos) = match read_varint(data, pos) {
+                Some(v) => v,
+                None => break,
+            };
+            pos = new_pos;
+            let len = len as usize;
+            if pos + len > data.len() {
+                break;
+            }
+            match field_num {
+                1 => key = String::from_utf8_lossy(&data[pos..pos + len]).to_string(),
+                2 => val = decode_quantity_message(&data[pos..pos + len]),
+                _ => {}
+            }
+            pos += len;
+        } else if wire_type == WIRE_VARINT {
+            let (_, new_pos) = match read_varint(data, pos) {
+                Some(v) => v,
+                None => break,
+            };
+            pos = new_pos;
+        } else {
+            break;
+        }
+    }
+    (key, val)
+}
+
 /// Decode a K8s Timestamp protobuf to RFC3339 string
 fn decode_timestamp(data: &[u8]) -> Value {
     let mut seconds: i64 = 0;
@@ -3400,6 +4107,282 @@ mod tests {
         assert!(val.get("group").is_none());
         assert!(val.get("names").is_none());
         assert!(val.get("versions").is_none());
+    }
+
+    #[test]
+    fn test_decode_pod_disruption_budget_uses_its_own_schema_not_crd_fallback() {
+        // Regression test for a real bug found live continuing the same
+        // guts-shell-bundle/CNPG investigation as the Lease bug above: once the
+        // Service-creation bug was fixed, CNPG's Cluster reconcile moved on to
+        // creating a PodDisruptionBudget and hit the identical symptom — no
+        // "PodDisruptionBudget" entry existed in the schema registry at all, so
+        // decode_k8s_resource() fell through to the generic CRD-fallback
+        // decoder for every protobuf-encoded PodDisruptionBudget write.
+        let registry = ProtoRegistry::new();
+
+        // Build a real-shaped PodDisruptionBudgetSpec:
+        // field 2 (selector, LabelSelector message) with one matchLabels entry,
+        // field 4 (unhealthyPodEvictionPolicy, string).
+        let mut match_labels_entry = Vec::new();
+        match_labels_entry.push(0x0a); // key field 1, wire type 2
+        match_labels_entry.push(3);
+        match_labels_entry.extend_from_slice(b"app");
+        match_labels_entry.push(0x12); // value field 2, wire type 2
+        match_labels_entry.push(8);
+        match_labels_entry.extend_from_slice(b"postgres");
+
+        let mut label_selector = Vec::new();
+        label_selector.push(0x0a); // matchLabels field 1, wire type 2
+        label_selector.push(match_labels_entry.len() as u8);
+        label_selector.extend_from_slice(&match_labels_entry);
+
+        let mut pdb_spec = Vec::new();
+        pdb_spec.push(0x12); // selector field 2, wire type 2
+        pdb_spec.push(label_selector.len() as u8);
+        pdb_spec.extend_from_slice(&label_selector);
+        pdb_spec.push(0x22); // unhealthyPodEvictionPolicy field 4, wire type 2
+        pdb_spec.push(15);
+        pdb_spec.extend_from_slice(b"IfHealthyBudget");
+
+        let result = registry.decode_message("PodDisruptionBudgetSpec", &pdb_spec);
+        assert!(result.is_some());
+        let val = result.unwrap();
+        assert_eq!(
+            val.get("selector").and_then(|s| s.get("matchLabels")),
+            Some(&serde_json::json!({"app": "postgres"})),
+            "must decode the real selector.matchLabels, not a CRD-shaped fallback; got {:?}",
+            val
+        );
+        assert_eq!(
+            val.get("unhealthyPodEvictionPolicy"),
+            Some(&Value::String("IfHealthyBudget".into()))
+        );
+        // The CRD-fallback bug's telltale signature: these fields must never
+        // appear on a decoded PodDisruptionBudgetSpec.
+        assert!(val.get("group").is_none());
+        assert!(val.get("names").is_none());
+        assert!(val.get("versions").is_none());
+    }
+
+    #[test]
+    fn test_decode_role_uses_its_own_schema_not_crd_fallback() {
+        // Regression test for a real bug found live in the same investigation
+        // as Lease and PodDisruptionBudget above: immediately after those two
+        // were fixed, CNPG's Cluster reconcile moved on to creating a
+        // per-cluster Role and hit the identical symptom — no "Role"/
+        // "PolicyRule" entries existed in the schema registry at all. Field
+        // numbers verified against the real upstream
+        // k8s.io/api/rbac/v1 generated.proto.
+        let registry = ProtoRegistry::new();
+
+        let mut rule = Vec::new();
+        // verbs (field 1, repeated string) — one entry "get"
+        rule.push(0x0a);
+        rule.push(3);
+        rule.extend_from_slice(b"get");
+        // resources (field 3, repeated string) — one entry "secrets"
+        rule.push(0x1a);
+        rule.push(7);
+        rule.extend_from_slice(b"secrets");
+
+        let mut role = Vec::new();
+        // rules (field 2, repeated message)
+        role.push(0x12);
+        role.push(rule.len() as u8);
+        role.extend_from_slice(&rule);
+
+        let result = registry.decode_message("Role", &role);
+        assert!(result.is_some());
+        let val = result.unwrap();
+        let rules = val.get("rules").and_then(|r| r.as_array()).cloned();
+        assert!(rules.is_some(), "expected a rules array; got {:?}", val);
+        let rules = rules.unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0].get("verbs"),
+            Some(&serde_json::json!(["get"])),
+            "must decode the real verbs, not a CRD-shaped fallback; got {:?}",
+            val
+        );
+        assert_eq!(rules[0].get("resources"), Some(&serde_json::json!(["secrets"])));
+        // The CRD-fallback bug's telltale signature: these fields must never
+        // appear on a decoded Role.
+        assert!(val.get("group").is_none());
+        assert!(val.get("names").is_none());
+        assert!(val.get("versions").is_none());
+    }
+
+    /// Regression test for a real bug found live in the same investigation,
+    /// right after the PodDisruptionBudget/Role fixes above: CNPG's Cluster
+    /// reconcile created the primary instance's PVC, and its `spec.resources.
+    /// requests.storage` came back as `"\n\x038Gi"` instead of `"8Gi"`.
+    /// `VolumeResourceRequirements.limits`/`.requests` (and the identical
+    /// `ResourceRequirements`/`overhead` fields elsewhere) are
+    /// `map<string, resource.Quantity>`, not `map<string, string>` — each map
+    /// entry's *value* is itself a nested `Quantity` message
+    /// (`{ optional string string = 1; }`). Treating that value's raw message
+    /// bytes as a plain UTF-8 string (the pre-fix `StringMap` behavior) leaks
+    /// the wrapping message's own tag (`\n` = 0x0a) and length (`\x03`) bytes
+    /// straight into the string.
+    #[test]
+    fn test_decode_quantity_map_unwraps_nested_quantity_message() {
+        let registry = ProtoRegistry::new();
+
+        // A Quantity message wrapping the string "8Gi"
+        let mut quantity = vec![0x0a, 3]; // field 1, wire type 2, length 3
+        quantity.extend_from_slice(b"8Gi");
+
+        // A MapEntry: field 1 = key "storage", field 2 = the Quantity message above
+        let mut map_entry = Vec::new();
+        map_entry.push(0x0a); // key field 1, wire type 2
+        map_entry.push(7);
+        map_entry.extend_from_slice(b"storage");
+        map_entry.push(0x12); // value field 2, wire type 2
+        map_entry.push(quantity.len() as u8);
+        map_entry.extend_from_slice(&quantity);
+
+        // VolumeResourceRequirements.requests (field 2, repeated MapEntry)
+        let mut requirements = Vec::new();
+        requirements.push(0x12); // field 2, wire type 2
+        requirements.push(map_entry.len() as u8);
+        requirements.extend_from_slice(&map_entry);
+
+        let result = registry.decode_message("VolumeResourceRequirements", &requirements);
+        assert!(result.is_some());
+        let val = result.unwrap();
+        assert_eq!(
+            val.get("requests"),
+            Some(&serde_json::json!({"storage": "8Gi"})),
+            "must unwrap the nested Quantity message to a plain string, not leak its tag/length bytes; got {:?}",
+            val
+        );
+    }
+
+    /// Regression test for a real bug found live continuing the same
+    /// investigation, right after the Quantity fix above: CNPG's initdb Job
+    /// pod template has an `emptyDir` scratch volume, and it decoded as a
+    /// broken, empty `hostPath` object (missing its required `path`), which
+    /// then failed axum's `Json<Job>` extraction. Real k8s's `Volume` message
+    /// wraps every source type in a nested `VolumeSource` sub-message at
+    /// field 2 — the old schema wrongly treated Volume's OWN field 2 as
+    /// directly being `hostPath`.
+    #[test]
+    fn test_decode_volume_flattens_nested_volume_source() {
+        let registry = ProtoRegistry::new();
+
+        // EmptyDirVolumeSource { medium: "Memory" }
+        let mut empty_dir = vec![0x0a, 6]; // field 1, wire type 2, length 6
+        empty_dir.extend_from_slice(b"Memory");
+
+        // VolumeSource { emptyDir = 2: <empty_dir> }
+        let mut volume_source = Vec::new();
+        volume_source.push(0x12); // field 2, wire type 2
+        volume_source.push(empty_dir.len() as u8);
+        volume_source.extend_from_slice(&empty_dir);
+
+        // Volume { name = 1: "scratch-data", volumeSource = 2: <volume_source> }
+        let mut volume = Vec::new();
+        volume.push(0x0a); // field 1, wire type 2
+        volume.push(12);
+        volume.extend_from_slice(b"scratch-data");
+        volume.push(0x12); // field 2, wire type 2
+        volume.push(volume_source.len() as u8);
+        volume.extend_from_slice(&volume_source);
+
+        let result = registry.decode_message("Volume", &volume);
+        assert!(result.is_some());
+        let val = result.unwrap();
+        assert_eq!(val.get("name"), Some(&Value::String("scratch-data".into())));
+        assert_eq!(
+            val.get("emptyDir"),
+            Some(&serde_json::json!({"medium": "Memory"})),
+            "must flatten VolumeSource's emptyDir onto Volume directly, not decode it as a broken hostPath; got {:?}",
+            val
+        );
+        // The bug's telltale signature: a spurious, empty hostPath object
+        // (missing its required `path`) must never appear.
+        assert!(val.get("hostPath").is_none());
+    }
+
+    /// Regression test for a real bug found live getting CNPG's own instance
+    /// pod running: Go's `corev1.Probe` embeds `ProbeHandler` via
+    /// `json:",inline"` — exec/httpGet/tcpSocket appear directly on the
+    /// probe object in JSON, matching this crate's own `Probe` struct.
+    /// Decoding `handler` as a literal nested message (rather than
+    /// flattening it) produced JSON shaped like `{"handler": {"httpGet":
+    /// ...}}`, which doesn't match the Rust struct's fields at all — this
+    /// silently failed strict-field-validation with "unknown field
+    /// ...handler" on every real client's Pod create, since the decoded
+    /// `handler` key never survives a deserialize+reserialize round-trip
+    /// through `Probe`.
+    #[test]
+    fn test_decode_probe_flattens_nested_probe_handler() {
+        let registry = ProtoRegistry::new();
+
+        // HTTPGetAction { path = 1: "/healthz" }
+        let mut http_get = vec![0x0a, 8];
+        http_get.extend_from_slice(b"/healthz");
+
+        // ProbeHandler { httpGet = 2: <http_get> }
+        let mut handler = vec![0x12, http_get.len() as u8];
+        handler.extend_from_slice(&http_get);
+
+        // Probe { handler = 1: <handler> }
+        let mut probe = vec![0x0a, handler.len() as u8];
+        probe.extend_from_slice(&handler);
+
+        let result = registry.decode_message("Probe", &probe);
+        assert!(result.is_some());
+        let val = result.unwrap();
+        assert_eq!(
+            val.get("httpGet"),
+            Some(&serde_json::json!({"path": "/healthz"})),
+            "must flatten ProbeHandler's httpGet onto Probe directly, matching corev1.Probe's json:\",inline\"; got {:?}",
+            val
+        );
+        // The bug's telltale signature: a nested "handler" wrapper key,
+        // which this crate's own Probe struct has no field for at all.
+        assert!(val.get("handler").is_none());
+    }
+
+    /// Regression test for a real bug found live in the same Job/pod-template
+    /// investigation as the Volume fix above: a container's
+    /// `env[].valueFrom.secretKeyRef` decoded with `name` set to
+    /// `"\n\x17platform-db-cluster-app"` instead of
+    /// `"platform-db-cluster-app"`. Real k8s's `SecretKeySelector` (and
+    /// `ConfigMapKeySelector`/`SecretEnvSource`/`ConfigMapEnvSource`) embed
+    /// `LocalObjectReference` FLATTENED at field 1 — treating that field as a
+    /// plain string (the pre-fix behavior) decoded the wrapping message's own
+    /// tag+length bytes straight into the name, the same bug class as the
+    /// Volume/VolumeSource fix, just recurring in a different family of
+    /// embedded types.
+    #[test]
+    fn test_decode_secret_key_selector_flattens_local_object_reference() {
+        let registry = ProtoRegistry::new();
+
+        // LocalObjectReference { name: "platform-db-cluster-app" }
+        let mut local_ref = vec![0x0a, 23]; // field 1, wire type 2, length 23
+        local_ref.extend_from_slice(b"platform-db-cluster-app");
+
+        // SecretKeySelector { localObjectReference = 1: <local_ref>, key = 2: "username" }
+        let mut selector = Vec::new();
+        selector.push(0x0a); // field 1, wire type 2
+        selector.push(local_ref.len() as u8);
+        selector.extend_from_slice(&local_ref);
+        selector.push(0x12); // field 2, wire type 2
+        selector.push(8);
+        selector.extend_from_slice(b"username");
+
+        let result = registry.decode_message("SecretKeySelector", &selector);
+        assert!(result.is_some());
+        let val = result.unwrap();
+        assert_eq!(
+            val.get("name"),
+            Some(&Value::String("platform-db-cluster-app".into())),
+            "must flatten LocalObjectReference's name directly, not leak the wrapping message's tag/length bytes; got {:?}",
+            val
+        );
+        assert_eq!(val.get("key"), Some(&Value::String("username".into())));
     }
 
     #[test]
