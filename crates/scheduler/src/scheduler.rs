@@ -207,10 +207,17 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         if !is_pending {
             return Ok(()); // not pending
         }
+        // K8s treats an explicit empty string the same as "not specified" —
+        // real protobuf-encoding clients (confirmed live via a real CNPG-created
+        // Job's pod template) send `schedulerName` as a genuine zero-length
+        // string on the wire rather than omitting the field, so `.unwrap_or(...)`
+        // alone (only covering `None`) left those pods permanently invisible
+        // to this filter, silently stuck Pending forever.
         let pod_scheduler = pod
             .spec
             .as_ref()
             .and_then(|s| s.scheduler_name.as_deref())
+            .filter(|s| !s.is_empty())
             .unwrap_or("default-scheduler");
         if pod_scheduler != self.scheduler_name {
             return Ok(()); // wrong scheduler
@@ -293,11 +300,14 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 }
 
                 // Check if pod is assigned to this scheduler
-                // If schedulerName is not specified, defaults to "default-scheduler"
+                // If schedulerName is not specified (None, or an explicit
+                // empty string — real protobuf-encoding clients send the
+                // latter), defaults to "default-scheduler"
                 let pod_scheduler_name = p
                     .spec
                     .as_ref()
                     .and_then(|s| s.scheduler_name.as_deref())
+                    .filter(|s| !s.is_empty())
                     .unwrap_or("default-scheduler");
 
                 pod_scheduler_name == self.scheduler_name
@@ -1619,6 +1629,42 @@ mod tests {
             .iter()
             .any(|c| c.condition_type == "PodScheduled" && c.status == "True");
         assert!(has_scheduled, "Pod should have PodScheduled=True condition");
+    }
+
+    /// Regression test for a real bug found live: real protobuf-encoding
+    /// clients (confirmed via a Job/Pod created by CloudNativePG) send
+    /// `schedulerName` as a genuine zero-length string on the wire rather
+    /// than omitting the field entirely. `.unwrap_or("default-scheduler")`
+    /// only covers the `None` case, so a pod with `scheduler_name:
+    /// Some("".into())` was silently filtered out of every scheduling cycle
+    /// and stuck `Pending` forever — with no error, no log line, nothing to
+    /// indicate why.
+    #[tokio::test]
+    async fn test_scheduler_treats_empty_scheduler_name_as_default() {
+        let storage = Arc::new(MemoryStorage::new());
+        let scheduler =
+            Scheduler::new_with_name(storage.clone(), 1, "default-scheduler".to_string());
+
+        let node = make_node("node-1");
+        storage.create("/registry/nodes/node-1", &node).await.unwrap();
+
+        let mut pod = make_pending_pod("empty-scheduler-name-pod", "default");
+        pod.spec.as_mut().unwrap().scheduler_name = Some(String::new());
+        storage
+            .create("/registry/pods/default/empty-scheduler-name-pod", &pod)
+            .await
+            .unwrap();
+
+        scheduler.schedule_pending_pods().await.unwrap();
+
+        let scheduled_pod: Pod = storage
+            .get("/registry/pods/default/empty-scheduler-name-pod")
+            .await
+            .unwrap();
+        assert!(
+            scheduled_pod.spec.as_ref().and_then(|s| s.node_name.as_ref()).is_some(),
+            "a pod with an explicit empty schedulerName must still be scheduled, matching real k8s semantics where empty == unspecified"
+        );
     }
 
     #[tokio::test]
