@@ -185,6 +185,26 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
         if let Some(incoming_rv) = incoming_rv.as_deref() {
             let expected_mod_revision = concurrency::resource_version_to_mod_revision(incoming_rv)?;
 
+            // A write identical to what's already stored (aside from
+            // resourceVersion) is a no-op: skip the actual write/revision
+            // bump/watch-event entirely, so a controller's own idempotent
+            // re-writes don't re-trigger its own watch and loop forever
+            // (see `concurrency::is_no_op_update`). This check reads the
+            // current value first, then still performs the real CAS-guarded
+            // write below when it decides one is needed, so it never
+            // silently drops a genuine concurrent change — the existing
+            // resourceVersion-based conflict detection is unchanged.
+            if let Ok((_rev, Some(current_kv))) = self.backend.get(key, "", 1, 0, false).await {
+                if let Ok(current_json) = String::from_utf8(current_kv.value.clone()) {
+                    if concurrency::is_no_op_update(&json, &current_json) {
+                        debug!("Skipping no-op update at key: {}", key);
+                        let json_with_rv =
+                            Self::inject_resource_version(&current_json, current_kv.mod_revision);
+                        return serde_json::from_str(&json_with_rv).map_err(Error::Serialization);
+                    }
+                }
+            }
+
             let (rev, prev_kv, succeeded) = self
                 .backend
                 .update(key, json.as_bytes(), expected_mod_revision, 0)
@@ -220,6 +240,15 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
                 .map_err(|e| Error::Storage(format!("Failed to check resource: {}", e)))?;
 
             let existing_kv = existing_kv.ok_or_else(|| Error::NotFound(key.to_string()))?;
+
+            if let Ok(existing_json) = String::from_utf8(existing_kv.value.clone()) {
+                if concurrency::is_no_op_update(&json, &existing_json) {
+                    debug!("Skipping no-op update at key: {}", key);
+                    let json_with_rv =
+                        Self::inject_resource_version(&existing_json, existing_kv.mod_revision);
+                    return serde_json::from_str(&json_with_rv).map_err(Error::Serialization);
+                }
+            }
 
             let (new_rev, _prev_kv, succeeded) = self
                 .backend

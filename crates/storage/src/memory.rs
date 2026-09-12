@@ -147,8 +147,19 @@ impl Storage for MemoryStorage {
         let serialized = serde_json::to_string(value)?;
 
         let mut data = self.data.write().unwrap();
-        if !data.contains_key(key) {
+        let existing = data.get(key).cloned();
+        let Some(existing) = existing else {
             return Err(Error::NotFound(key.to_string()));
+        };
+
+        // A write identical to what's already stored (aside from
+        // resourceVersion) is a no-op: skip it entirely rather than bumping
+        // state and re-emitting a watch event, so a controller's own
+        // idempotent re-writes don't re-trigger its own watch and loop
+        // forever (see `concurrency::is_no_op_update`).
+        if crate::concurrency::is_no_op_update(&serialized, &existing) {
+            drop(data);
+            return Ok(serde_json::from_str(&existing)?);
         }
 
         data.insert(key.to_string(), serialized.clone());

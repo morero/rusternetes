@@ -166,6 +166,28 @@ impl Storage for EtcdStorage {
 
         // Validate optimistic concurrency if resourceVersion is provided
         if let Some(incoming_rv) = incoming_rv.as_deref() {
+            // A write identical to what's already stored (aside from
+            // resourceVersion) is a no-op: skip the actual write/revision
+            // bump/watch-event entirely, so a controller's own idempotent
+            // re-writes don't re-trigger its own watch and loop forever
+            // (see `concurrency::is_no_op_update`). Reads current content
+            // first, then still runs the real CAS-guarded transaction below
+            // when a write is actually needed, so this never silently drops
+            // a genuine concurrent change.
+            if let Ok(current_resp) = client.get(key, None).await {
+                if let Some(kv) = current_resp.kvs().first() {
+                    if let Ok(current_json) = std::str::from_utf8(kv.value()) {
+                        if crate::concurrency::is_no_op_update(&json, current_json) {
+                            debug!("Skipping no-op update at key: {}", key);
+                            let json_with_rv =
+                                Self::inject_resource_version(current_json, kv.mod_revision());
+                            return serde_json::from_str(&json_with_rv)
+                                .map_err(Error::Serialization);
+                        }
+                    }
+                }
+            }
+
             // Use a transaction to ensure atomic update with version check
             let expected_mod_revision =
                 crate::concurrency::resource_version_to_mod_revision(incoming_rv)?;
@@ -231,12 +253,21 @@ impl Storage for EtcdStorage {
         } else {
             // No resourceVersion provided — check key exists, then put
             let get_resp = client
-                .get(key, Some(GetOptions::new().with_keys_only()))
+                .get(key, None)
                 .await
                 .map_err(|e| Error::Storage(format!("Failed to check resource: {}", e)))?;
 
-            if get_resp.kvs().is_empty() {
+            let Some(existing_kv) = get_resp.kvs().first() else {
                 return Err(Error::NotFound(key.to_string()));
+            };
+
+            if let Ok(existing_json) = std::str::from_utf8(existing_kv.value()) {
+                if crate::concurrency::is_no_op_update(&json, existing_json) {
+                    debug!("Skipping no-op update at key: {}", key);
+                    let json_with_rv =
+                        Self::inject_resource_version(existing_json, existing_kv.mod_revision());
+                    return serde_json::from_str(&json_with_rv).map_err(Error::Serialization);
+                }
             }
 
             client

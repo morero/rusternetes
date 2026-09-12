@@ -32,6 +32,37 @@ pub fn validate_resource_version(
     }
 }
 
+/// Whether an incoming write is a genuine no-op — identical to the
+/// currently-stored resource except for `metadata.resourceVersion` (the
+/// incoming resource legitimately carries the client's own last-known,
+/// about-to-be-stale resourceVersion; that's expected and must not count as
+/// a difference).
+///
+/// Real Kubernetes' `storage.Interface.GuaranteedUpdate` contract requires
+/// this: "updating an object twice with the same data except
+/// ResourceVersion... must be a no-op" (no revision bump, no watch event) —
+/// otherwise a well-behaved controller's own repeated identical
+/// status/resource writes re-trigger its own watch and loop forever.
+/// Confirmed live: an unmodified real-world operator (CloudNativePG)
+/// re-issuing identical RoleBinding/Lease/status writes against a backend
+/// with no no-op detection produced a tight, indefinite reconcile loop (see
+/// ISSUES.md).
+pub fn is_no_op_update(incoming_json: &str, stored_json: &str) -> bool {
+    let Ok(mut incoming) = serde_json::from_str::<serde_json::Value>(incoming_json) else {
+        return false;
+    };
+    let Ok(mut stored) = serde_json::from_str::<serde_json::Value>(stored_json) else {
+        return false;
+    };
+    if let Some(m) = incoming.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+        m.remove("resourceVersion");
+    }
+    if let Some(m) = stored.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+        m.remove("resourceVersion");
+    }
+    incoming == stored
+}
+
 /// Convert etcd mod_revision to resourceVersion string
 pub fn mod_revision_to_resource_version(mod_revision: i64) -> String {
     mod_revision.to_string()
@@ -78,6 +109,25 @@ mod tests {
 
         // Expected version but actual is missing should fail
         assert!(validate_resource_version(Some("100"), None).is_err());
+    }
+
+    #[test]
+    fn is_no_op_update_true_when_only_resource_version_differs() {
+        let incoming = json!({"metadata": {"name": "x", "resourceVersion": "5"}, "spec": {"a": 1}}).to_string();
+        let stored = json!({"metadata": {"name": "x", "resourceVersion": "4"}, "spec": {"a": 1}}).to_string();
+        assert!(is_no_op_update(&incoming, &stored));
+    }
+
+    #[test]
+    fn is_no_op_update_false_when_content_actually_differs() {
+        let incoming = json!({"metadata": {"name": "x", "resourceVersion": "5"}, "spec": {"a": 2}}).to_string();
+        let stored = json!({"metadata": {"name": "x", "resourceVersion": "4"}, "spec": {"a": 1}}).to_string();
+        assert!(!is_no_op_update(&incoming, &stored));
+    }
+
+    #[test]
+    fn is_no_op_update_false_on_unparseable_json() {
+        assert!(!is_no_op_update("not json", "{}"));
     }
 
     #[test]
