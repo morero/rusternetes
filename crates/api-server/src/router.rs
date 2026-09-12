@@ -2496,7 +2496,7 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
 
     app.layer(axum_middleware::map_request(
         |mut req: axum::extract::Request| async move {
-            let path = req.uri().path();
+            let path = req.uri().path().to_string();
             // Strip trailing slash for non-root paths (but not /console/ paths,
             // which are handled by ServeDir and need trailing slashes intact)
             if path.len() > 1 && path.ends_with('/') && !path.starts_with("/console") {
