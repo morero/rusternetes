@@ -171,6 +171,26 @@ fn crash_loop_backoff_secs(restart_count: u32) -> i64 {
     std::cmp::min(10 * (1_i64 << exponent), 300)
 }
 
+/// Whether a pod-sync failure is a transient "the volume isn't ready yet"
+/// condition that real Kubernetes retries (leaving the pod Pending with
+/// containers Waiting{ContainerCreating}) rather than a hard failure.
+///
+/// Covers Secret/ConfigMap volumes not yet materialized, and — live-hit via
+/// CNPG's own initdb Job against platform-db-cluster — a PVC that isn't
+/// bound yet or a PV that doesn't exist yet. Both are *expected* on a pod's
+/// first sync attempt(s) under a WaitForFirstConsumer StorageClass, where
+/// binding only starts once this pod is scheduled. Treating this as a hard
+/// failure races the pv_binder/dynamic_provisioner controllers: each hard
+/// failure handed straight to a Job controller spins up a brand-new pod
+/// attempt within seconds, burning through the whole backoffLimit before
+/// binding could ever complete.
+fn is_transient_volume_wait_error(err_msg: &str) -> bool {
+    (err_msg.contains("not found in namespace")
+        && (err_msg.contains("Secret") || err_msg.contains("ConfigMap")))
+        || err_msg.contains("PersistentVolumeClaim is not bound to a volume")
+        || (err_msg.contains("PersistentVolume") && err_msg.contains("not found"))
+}
+
 impl Kubelet {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
@@ -2100,15 +2120,15 @@ impl Kubelet {
                             let err_msg = e.to_string();
 
                             // K8s retries volume mounting when secrets/configmaps
-                            // aren't available yet. The pod stays Pending with
-                            // containers in Waiting{ContainerCreating} state.
-                            // syncPod returns early without creating any containers.
-                            // The pod worker retries on the next sync cycle.
+                            // or a PVC/PV aren't ready yet. The pod stays Pending
+                            // with containers in Waiting{ContainerCreating} state;
+                            // syncPod returns early without creating any containers,
+                            // and the pod worker retries on the next sync cycle.
                             // K8s ref: pkg/kubelet/kubelet.go:2204 — WaitForAttachAndMount
                             //          pkg/kubelet/kubelet_pods.go:2496 — defaultWaitingState
-                            if err_msg.contains("not found in namespace")
-                                && (err_msg.contains("Secret") || err_msg.contains("ConfigMap"))
-                            {
+                            // See is_transient_volume_wait_error's doc comment for why
+                            // the PVC/PV cases matter as much as Secret/ConfigMap here.
+                            if is_transient_volume_wait_error(&err_msg) {
                                 warn!(
                                     "Pod {}/{} waiting for volume (will retry): {}",
                                     namespace, pod_name, err_msg
@@ -4205,7 +4225,7 @@ impl Kubelet {
 mod tests {
     use super::{
         all_terminations_already_recorded, container_termination_already_recorded,
-        crash_loop_backoff_secs, should_forget_pod_worker,
+        crash_loop_backoff_secs, is_transient_volume_wait_error, should_forget_pod_worker,
     };
     use rusternetes_common::resources::pod::PodSpec;
     use rusternetes_common::resources::{
@@ -4948,5 +4968,43 @@ mod tests {
         // Step 3: Kubelet completes resize, sets to ""
         pod.status.as_mut().unwrap().resize = Some(String::new());
         assert_eq!(pod.status.as_ref().unwrap().resize.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_is_transient_volume_wait_error_pvc_not_bound() {
+        assert!(is_transient_volume_wait_error(
+            "PersistentVolumeClaim is not bound to a volume"
+        ));
+    }
+
+    #[test]
+    fn test_is_transient_volume_wait_error_pv_not_found() {
+        assert!(is_transient_volume_wait_error(
+            "PersistentVolume pvc-default-platform-db-cluster-1 not found"
+        ));
+    }
+
+    #[test]
+    fn test_is_transient_volume_wait_error_secret_not_found() {
+        assert!(is_transient_volume_wait_error(
+            "Secret my-secret not found in namespace default"
+        ));
+    }
+
+    #[test]
+    fn test_is_transient_volume_wait_error_configmap_not_found() {
+        assert!(is_transient_volume_wait_error(
+            "ConfigMap my-config not found in namespace default"
+        ));
+    }
+
+    #[test]
+    fn test_is_transient_volume_wait_error_rejects_unrelated_errors() {
+        // A real, non-retryable failure (e.g. hostPath directory creation
+        // blocked by permissions) must NOT be swallowed into a silent retry.
+        assert!(!is_transient_volume_wait_error(
+            "Failed to create PersistentVolumeClaim host path directory"
+        ));
+        assert!(!is_transient_volume_wait_error("ErrImagePull"));
     }
 }
