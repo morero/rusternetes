@@ -222,3 +222,61 @@ async fn status_merge_patch_already_unwrapped_still_works() {
     let stored = read_stored(&mem, &key).await;
     assert_eq!(stored["status"]["phase"], json!("Running"));
 }
+
+/// Regression test for a real bug found live continuing the same
+/// investigation as the merge-patch double-wrapping bug above (flagged at
+/// the time as a "plausible but unconfirmed sibling issue", now confirmed):
+/// a PUT to a status subresource sends the FULL resource object in the body
+/// (real clients — CloudNativePG via controller-runtime's `Status().Update()`
+/// confirmed live — read the object, mutate `.status` in memory, then PUT the
+/// whole thing back). `update_custom_resource_status` stored that raw
+/// whole-body value directly as `.status`, so the stored status became a
+/// nested copy of the entire object (metadata+spec+status inside itself)
+/// instead of just the `.status` portion — and each subsequent PUT compounded
+/// the corruption as the client read back its own already-corrupted status
+/// and built the next update from it. Confirmed live: `CloudNativePG`'s own
+/// `Cluster.status.image`/`.status.phase` silently disappeared over the
+/// course of repeated reconciles.
+#[tokio::test]
+async fn status_put_unwraps_whole_object_body_to_just_status() {
+    let (mem, router) = spawn_router();
+    seed_crd_with_status_subresource(&mem).await;
+    let key = seed_crontab_with_status(
+        &mem,
+        "put-crontab",
+        json!({"phase": "Pending"}),
+    )
+    .await;
+
+    // Real clients PUT the full object — apiVersion/kind/metadata/spec
+    // alongside the mutated status — not just a bare status value.
+    let full_object_body = json!({
+        "apiVersion": format!("{}/v1", GROUP),
+        "kind": "CronTab",
+        "metadata": {"name": "put-crontab", "namespace": TEST_NS},
+        "spec": {"cronSpec": "* * * * */5"},
+        "status": {"phase": "Running", "lastScheduleTime": "2026-01-01T00:00:00Z"}
+    });
+
+    let (status_code, response_body) = send_with_ct(
+        router,
+        Method::PUT,
+        &format!(
+            "/apis/{}/v1/namespaces/{}/{}/put-crontab/status",
+            GROUP, TEST_NS, PLURAL
+        ),
+        "application/json",
+        serde_json::to_vec(&full_object_body).unwrap(),
+    )
+    .await;
+
+    assert_eq!(status_code, 200, "body={}", response_body);
+
+    let stored = read_stored(&mem, &key).await;
+    assert_eq!(
+        stored["status"],
+        json!({"phase": "Running", "lastScheduleTime": "2026-01-01T00:00:00Z"}),
+        "must store just the extracted .status content, not the whole PUT body nested inside itself; got {}",
+        stored["status"]
+    );
+}

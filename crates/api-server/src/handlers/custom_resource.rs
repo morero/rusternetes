@@ -23,6 +23,26 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+/// Whether an update/patch to a custom resource just cleared its last
+/// finalizer while a deletion was already pending. Real Kubernetes'
+/// generic apiserver store completes a pending deletion the instant a
+/// controller's update removes the last finalizer — it doesn't wait for a
+/// fresh DELETE request (see k8s.io/apiserver's
+/// registry/generic/registry/store.go, shouldDeleteDuringUpdate). Without
+/// this check, an object whose finalizers all get cleared via UPDATE/PATCH
+/// (rather than a client re-issuing DELETE) sits in storage forever with
+/// deletionTimestamp set and an empty finalizers list — live-hit: a Release
+/// stayed listable indefinitely after release-operator removed its own
+/// `platform.ertia.io/release-bindings` finalizer via a merge patch.
+fn should_complete_pending_deletion(cr: &CustomResource) -> bool {
+    cr.metadata.deletion_timestamp.is_some()
+        && cr
+            .metadata
+            .finalizers
+            .as_ref()
+            .is_none_or(|f| f.is_empty())
+}
+
 /// Create a new custom resource instance
 pub async fn create_custom_resource(
     State(state): State<Arc<ApiServerState>>,
@@ -577,6 +597,19 @@ pub async fn update_custom_resource(
     // instance replaced via PUT — found live re-testing
     // `platform-db-real-cluster`'s render Workflow, whose edited spec
     // never re-triggered a render because generation never moved.
+    //
+    // Also captures the pre-update object as `old_object_for_webhook`: real
+    // Kubernetes always populates AdmissionRequest.oldObject for UPDATE (not
+    // just DELETE), and some webhooks — live-hit via CNPG's own Cluster
+    // validating webhook — decode oldObject unconditionally to compare
+    // against the new spec. Passing `None` for it here (this handler's
+    // previous behavior) meant CNPG's own webhook server rejected the
+    // request outright with "there is no content to decode" (its decoder's
+    // literal message for an empty oldObject.Raw), which this handler
+    // enforcement path had no way to distinguish from a real validation
+    // failure — the request was silently getting denied on every single
+    // Cluster update.
+    let mut old_object_for_webhook: Option<serde_json::Value> = None;
     {
         let resource_type_for_gen = format!("{}_{}", group.replace('.', "_"), plural);
         let key_for_gen = if let Some(ref ns) = namespace {
@@ -593,6 +626,7 @@ pub async fn update_custom_resource(
                     &new_json,
                     &mut cr.metadata,
                 );
+                old_object_for_webhook = Some(old_json);
             }
         }
     }
@@ -631,7 +665,7 @@ pub async fn update_custom_resource(
                 namespace.as_deref(),
                 &name,
                 cr_value,
-                None,
+                old_object_for_webhook,
                 &user_info,
                 cr_is_dry_run,
             )
@@ -653,6 +687,11 @@ pub async fn update_custom_resource(
     } else {
         build_key(&resource_type, None, &name)
     };
+
+    if should_complete_pending_deletion(&cr) {
+        state.storage.delete(&key).await?;
+        return Ok(Json(cr));
+    }
 
     let updated = state.storage.update(&key, &cr).await?;
 
@@ -824,6 +863,9 @@ pub async fn patch_custom_resource(
                         applied.metadata.ensure_creation_timestamp();
                         crate::handlers::lifecycle::set_initial_generation(&mut applied.metadata);
                         state.storage.create(&key, &applied).await?
+                    } else if should_complete_pending_deletion(&applied) {
+                        state.storage.delete(&key).await?;
+                        applied
                     } else {
                         state.storage.update(&key, &applied).await?
                     };
@@ -1115,6 +1157,10 @@ pub async fn patch_custom_resource(
 
     // Update or create the resource in storage
     let updated = if current_result.is_ok() {
+        if should_complete_pending_deletion(&patched) {
+            state.storage.delete(&key).await?;
+            return Ok(Json(patched));
+        }
         state.storage.update(&key, &patched).await?
     } else {
         // Server-side apply creates new resource
@@ -1780,6 +1826,26 @@ pub async fn update_custom_resource_status(
 
     let mut cr: CustomResource = state.storage.get(&key).await?;
 
+    // A PUT to a status subresource sends the FULL resource object in the
+    // body (real clients read the object, mutate `.status` in-memory, then
+    // PUT the whole thing back) — the API server is responsible for
+    // extracting just `.status` and ignoring changes to spec/metadata, since
+    // the subresource scopes what this write is authorized to touch. This
+    // used to store the raw whole-body value directly as `.status` — a real
+    // bug, confirmed live: CNPG's `Status().Update()` calls silently wiped
+    // `Cluster.status` fields (`image`, `phase`, `phaseReason`, ...) on every
+    // PUT, since the stored status became a copy of the entire incoming
+    // object (metadata+spec+status nested inside itself) rather than just
+    // its `.status` portion — compounding across repeated reconciles as CNPG
+    // read back its own corrupted status and built the next update from it.
+    // Mirrors the same unwrap already applied in `patch_custom_resource_status`.
+    let status = match &status {
+        serde_json::Value::Object(obj) if obj.contains_key("status") => {
+            obj.get("status").cloned().unwrap_or(serde_json::Value::Null)
+        }
+        other => other.clone(),
+    };
+
     // Update only the status field (optimistic concurrency control)
     cr.status = Some(status);
 
@@ -2129,6 +2195,35 @@ mod tests {
         let cr = create_test_custom_resource();
 
         assert!(validate_custom_resource(&crd, "v1", &cr).is_ok());
+    }
+
+    #[test]
+    fn test_should_complete_pending_deletion_when_last_finalizer_removed() {
+        let mut cr = create_test_custom_resource();
+        cr.metadata.deletion_timestamp = Some(chrono::Utc::now());
+        cr.metadata.finalizers = None;
+        assert!(should_complete_pending_deletion(&cr));
+
+        cr.metadata.finalizers = Some(vec![]);
+        assert!(should_complete_pending_deletion(&cr));
+    }
+
+    #[test]
+    fn test_should_not_complete_pending_deletion_with_finalizers_remaining() {
+        let mut cr = create_test_custom_resource();
+        cr.metadata.deletion_timestamp = Some(chrono::Utc::now());
+        cr.metadata.finalizers = Some(vec!["platform.ertia.io/release-bindings".to_string()]);
+        assert!(!should_complete_pending_deletion(&cr));
+    }
+
+    #[test]
+    fn test_should_not_complete_pending_deletion_without_deletion_timestamp() {
+        // No finalizers and no deletionTimestamp — an ordinary object,
+        // not one mid-deletion. Must not be treated as ready to purge.
+        let mut cr = create_test_custom_resource();
+        cr.metadata.deletion_timestamp = None;
+        cr.metadata.finalizers = None;
+        assert!(!should_complete_pending_deletion(&cr));
     }
 
     #[test]
