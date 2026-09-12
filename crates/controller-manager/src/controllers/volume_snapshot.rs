@@ -212,11 +212,15 @@ impl<S: Storage + 'static> VolumeSnapshotController<S> {
             .await
             .with_context(|| format!("PVC {}/{} not found", namespace, pvc_name))?;
 
-        // Ensure PVC is bound
+        // Ensure PVC is bound. An explicit empty string means genuinely
+        // unbound (same convention confirmed live and fixed elsewhere:
+        // dynamic_provisioner, pv_binder, kubelet, volume_expansion) — not
+        // "has a volume".
         let pv_name = pvc
             .spec
             .volume_name
             .as_ref()
+            .filter(|s| !s.is_empty())
             .context("PVC must be bound to a PV before taking a snapshot")?;
 
         info!(

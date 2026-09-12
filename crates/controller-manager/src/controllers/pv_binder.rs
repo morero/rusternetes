@@ -150,8 +150,15 @@ impl<S: Storage + 'static> PVBinderController<S> {
         let pvc_name = &pvc.metadata.name;
         let namespace = pvc.metadata.namespace.as_deref().unwrap_or("default");
 
-        // Skip if already bound
-        if pvc.spec.volume_name.is_some() {
+        // Skip if already bound. A real client-created PVC can carry
+        // `volumeName` as an explicit empty string rather than omitting the
+        // field entirely (confirmed live: CloudNativePG's own PVC) — treating
+        // that the same as "already bound" via a bare `.is_some()` left such
+        // a PVC invisible to this controller too, compounding the identical
+        // mistake in `dynamic_provisioner.rs`'s own "is this PVC unbound?"
+        // check (which used `.is_none()`, the opposite direction, with the
+        // same blind spot) — neither controller ever touched it.
+        if pvc.spec.volume_name.as_deref().is_some_and(|s| !s.is_empty()) {
             return Ok(());
         }
 
@@ -347,6 +354,7 @@ impl<S: Storage + 'static> PVBinderController<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusternetes_common::types::{ObjectMeta, TypeMeta};
     use rusternetes_storage::memory::MemoryStorage;
 
     #[test]
@@ -359,5 +367,99 @@ mod tests {
         assert!(!controller.storage_sufficient("5Gi", "10Gi"));
         assert!(controller.storage_sufficient("100Mi", "50Mi"));
         assert!(!controller.storage_sufficient("50Mi", "100Mi"));
+    }
+
+    fn minimal_pv(name: &str) -> PersistentVolume {
+        PersistentVolume {
+            type_meta: TypeMeta {
+                kind: "PersistentVolume".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta::new(name),
+            spec: rusternetes_common::resources::PersistentVolumeSpec {
+                capacity: Default::default(),
+                access_modes: vec![],
+                persistent_volume_reclaim_policy: None,
+                storage_class_name: None,
+                mount_options: None,
+                volume_mode: None,
+                node_affinity: None,
+                claim_ref: None,
+                host_path: None,
+                nfs: None,
+                iscsi: None,
+                local: None,
+                csi: None,
+                volume_attributes_class_name: None,
+            },
+            status: None,
+        }
+    }
+
+    fn minimal_pvc(name: &str, volume_name: Option<String>) -> PersistentVolumeClaim {
+        PersistentVolumeClaim {
+            type_meta: TypeMeta {
+                kind: "PersistentVolumeClaim".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: {
+                let mut m = ObjectMeta::new(name);
+                m.namespace = Some("default".to_string());
+                m
+            },
+            spec: rusternetes_common::resources::PersistentVolumeClaimSpec {
+                access_modes: vec![],
+                resources: Default::default(),
+                volume_name,
+                storage_class_name: None,
+                volume_mode: None,
+                selector: None,
+                data_source: None,
+                data_source_ref: None,
+                volume_attributes_class_name: None,
+            },
+            status: None,
+        }
+    }
+
+    /// Regression test for a real bug found live in the same investigation as
+    /// `dynamic_provisioner.rs`'s matching fix: a real client-created PVC
+    /// (confirmed: CloudNativePG's own `platform-db-cluster-1`) can carry
+    /// `volumeName` as an explicit empty string rather than omitting the
+    /// field entirely. `.is_some()` treated that the same as "already has a
+    /// volume", so `bind_pvc` returned immediately without ever looking for
+    /// a PV to bind — compounding `dynamic_provisioner.rs`'s identical blind
+    /// spot from the opposite direction, so neither controller ever touched
+    /// such a PVC and it sat `Pending` forever.
+    #[tokio::test]
+    async fn bind_pvc_treats_explicit_empty_volume_name_as_unbound() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = PVBinderController::new(storage.clone());
+
+        let pv = minimal_pv("pvc-default-empty-volume-name-pvc");
+        storage
+            .create(
+                &build_key("persistentvolumes", None, &pv.metadata.name),
+                &pv,
+            )
+            .await
+            .unwrap();
+
+        let mut pvc = minimal_pvc("empty-volume-name-pvc", Some(String::new()));
+        storage
+            .create(
+                &build_key("persistentvolumeclaims", Some("default"), &pvc.metadata.name),
+                &pvc,
+            )
+            .await
+            .unwrap();
+
+        controller.bind_pvc(&mut pvc).await.unwrap();
+
+        assert_eq!(
+            pvc.spec.volume_name.as_deref(),
+            Some("pvc-default-empty-volume-name-pvc"),
+            "a PVC with an explicit empty volumeName must still be matched and bound, matching real k8s semantics where empty == unset"
+        );
     }
 }

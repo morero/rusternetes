@@ -106,7 +106,22 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
                     // live here too, and fixing only the dead-code copy
                     // first (an easy mistake to make — they read
                     // identically) would have changed nothing real.
-                    if pvc.spec.volume_name.is_none() {
+                    // A real client-created PVC (confirmed live: CloudNativePG's
+                    // own `platform-db-cluster-1` PVC) can carry `volumeName` as
+                    // an explicit empty string rather than omitting the field —
+                    // the same wire-level convention already confirmed for
+                    // `schedulerName` in the scheduler. `.is_none()` alone left
+                    // such a PVC looking "already bound" forever, so
+                    // `provision_volume` was never even called — and the
+                    // inverse check in `pv_binder.rs` independently treated the
+                    // same empty string as "already has a volume", so neither
+                    // controller ever touched it from either direction.
+                    let already_bound = pvc
+                        .spec
+                        .volume_name
+                        .as_deref()
+                        .is_some_and(|s| !s.is_empty());
+                    if !already_bound {
                         match self.provision_volume(&pvc).await {
                             Ok(()) => queue.forget(&key).await,
                             Err(e) => {
@@ -161,8 +176,15 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
             // entirely, real, standard Kubernetes behavior for "use
             // whatever the cluster's default StorageClass is", used to
             // be silently skipped right here, before ever reaching that
-            // resolution logic).
-            if pvc.spec.volume_name.is_none() {
+            // resolution logic). An explicit empty-string `volumeName`
+            // (confirmed live) must also count as unbound — see the
+            // matching fix and comment in `worker()`, the actual live path.
+            let already_bound = pvc
+                .spec
+                .volume_name
+                .as_deref()
+                .is_some_and(|s| !s.is_empty());
+            if !already_bound {
                 if let Err(e) = self.provision_volume(&pvc).await {
                     error!(
                         "Failed to provision volume for PVC {}/{}: {}",
@@ -646,6 +668,40 @@ mod tests {
 
         let pv_key = build_key("persistentvolumes", None, "pvc-default-no-class-pvc-2");
         assert!(storage.get::<PersistentVolume>(&pv_key).await.is_err());
+    }
+
+    /// Regression test for a real bug found live: a real client-created PVC
+    /// (confirmed: CloudNativePG's own `platform-db-cluster-1`) can carry
+    /// `volumeName` as an explicit empty string rather than omitting the
+    /// field entirely. `reconcile_all`'s (and the live `worker()`'s)
+    /// `volume_name.is_none()` check treated that as "already bound",
+    /// silently never provisioning it — no error, no log, the PVC just sat
+    /// `Pending` forever. `pv_binder.rs` independently had the exact same
+    /// blind spot from the opposite direction (`.is_some()`), so neither
+    /// controller ever touched such a PVC.
+    #[tokio::test]
+    async fn reconcile_all_treats_explicit_empty_volume_name_as_unbound() {
+        let storage = Arc::new(MemoryStorage::new());
+        let sc_key = build_key("storageclasses", None, "standard");
+        storage
+            .create(&sc_key, &storage_class("standard", true))
+            .await
+            .unwrap();
+
+        let controller = DynamicProvisionerController::new(storage.clone());
+        let mut pvc = pvc_without_storage_class("empty-volume-name-pvc");
+        pvc.spec.storage_class_name = Some("standard".to_string());
+        pvc.spec.volume_name = Some(String::new());
+        let pvc_key = build_key("persistentvolumeclaims", Some("default"), "empty-volume-name-pvc");
+        storage.create(&pvc_key, &pvc).await.unwrap();
+
+        controller.reconcile_all().await.unwrap();
+
+        let pv_key = build_key("persistentvolumes", None, "pvc-default-empty-volume-name-pvc");
+        assert!(
+            storage.get::<PersistentVolume>(&pv_key).await.is_ok(),
+            "a PVC with an explicit empty volumeName must still be provisioned, matching real k8s semantics where empty == unset"
+        );
     }
 
     #[tokio::test]

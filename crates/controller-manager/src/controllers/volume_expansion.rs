@@ -244,11 +244,14 @@ impl<S: Storage + 'static> VolumeExpansionController<S> {
             namespace, pvc_name, requested_storage
         );
 
-        // Get the bound PV
+        // Get the bound PV. An explicit empty string means genuinely unbound
+        // (same convention confirmed live and fixed elsewhere: dynamic_provisioner,
+        // pv_binder, kubelet's volume-path resolution) — not "has a volume".
         let pv_name = pvc
             .spec
             .volume_name
             .as_ref()
+            .filter(|s| !s.is_empty())
             .context("PVC has no volume name")?;
 
         let pv_key = build_key("persistentvolumes", None, pv_name);
