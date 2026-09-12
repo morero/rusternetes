@@ -411,14 +411,28 @@ impl<B: Backend + Send + Sync + 'static> AuthzStorage for RhinoStorage<B> {
     {
         let full_key = match namespace {
             Some(ns) => {
-                if std::any::type_name::<T>().contains("Role")
-                    && !std::any::type_name::<T>().contains("Cluster")
-                {
-                    format!("/registry/roles/{}/{}", ns, key)
-                } else if std::any::type_name::<T>().contains("RoleBinding")
+                // Check RoleBinding BEFORE Role: every "RoleBinding" type
+                // name trivially contains the substring "Role" too, so
+                // checking Role first (without excluding "Binding", unlike
+                // the ClusterRole/ClusterRoleBinding branch below, which
+                // already excludes it correctly) made the RoleBinding arm
+                // unreachable dead code — every RoleBinding lookup silently
+                // resolved to a Role's storage path instead, then failed to
+                // deserialize the stored Role JSON as RoleBinding (missing
+                // its required `subjects` field). Live-hit: this broke RBAC
+                // authorization for every RoleBinding-granted ServiceAccount
+                // in the whole system — including CNPG's own initdb Job,
+                // which was denied with "User does not have permission to
+                // perform this action" despite its RoleBinding existing and
+                // being entirely correct.
+                if std::any::type_name::<T>().contains("RoleBinding")
                     && !std::any::type_name::<T>().contains("Cluster")
                 {
                     format!("/registry/rolebindings/{}/{}", ns, key)
+                } else if std::any::type_name::<T>().contains("Role")
+                    && !std::any::type_name::<T>().contains("Cluster")
+                {
+                    format!("/registry/roles/{}/{}", ns, key)
                 } else {
                     format!("/registry/unknown/{}/{}", ns, key)
                 }
@@ -445,14 +459,17 @@ impl<B: Backend + Send + Sync + 'static> AuthzStorage for RhinoStorage<B> {
     {
         let prefix = match namespace {
             Some(ns) => {
-                if std::any::type_name::<T>().contains("Role")
-                    && !std::any::type_name::<T>().contains("Cluster")
-                {
-                    format!("/registry/roles/{}/", ns)
-                } else if std::any::type_name::<T>().contains("RoleBinding")
+                // See get()'s comment: RoleBinding must be checked before
+                // Role, since every RoleBinding type name also contains the
+                // substring "Role".
+                if std::any::type_name::<T>().contains("RoleBinding")
                     && !std::any::type_name::<T>().contains("Cluster")
                 {
                     format!("/registry/rolebindings/{}/", ns)
+                } else if std::any::type_name::<T>().contains("Role")
+                    && !std::any::type_name::<T>().contains("Cluster")
+                {
+                    format!("/registry/roles/{}/", ns)
                 } else {
                     format!("/registry/unknown/{}/", ns)
                 }

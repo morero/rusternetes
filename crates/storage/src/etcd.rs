@@ -595,14 +595,18 @@ impl AuthzStorage for EtcdStorage {
         // Build the full key based on the resource type and namespace
         let full_key = match namespace {
             Some(ns) => {
-                if std::any::type_name::<T>().contains("Role")
-                    && !std::any::type_name::<T>().contains("Cluster")
-                {
-                    format!("/registry/roles/{}/{}", ns, key)
-                } else if std::any::type_name::<T>().contains("RoleBinding")
+                // RoleBinding checked before Role — see rhino.rs's AuthzStorage
+                // impl for why: every RoleBinding type name also contains the
+                // substring "Role", so checking Role first made this arm dead
+                // code and silently misrouted every RoleBinding lookup.
+                if std::any::type_name::<T>().contains("RoleBinding")
                     && !std::any::type_name::<T>().contains("Cluster")
                 {
                     format!("/registry/rolebindings/{}/{}", ns, key)
+                } else if std::any::type_name::<T>().contains("Role")
+                    && !std::any::type_name::<T>().contains("Cluster")
+                {
+                    format!("/registry/roles/{}/{}", ns, key)
                 } else {
                     format!("/registry/unknown/{}/{}", ns, key)
                 }
@@ -629,14 +633,14 @@ impl AuthzStorage for EtcdStorage {
     {
         let prefix = match namespace {
             Some(ns) => {
-                if std::any::type_name::<T>().contains("Role")
-                    && !std::any::type_name::<T>().contains("Cluster")
-                {
-                    format!("/registry/roles/{}/", ns)
-                } else if std::any::type_name::<T>().contains("RoleBinding")
+                if std::any::type_name::<T>().contains("RoleBinding")
                     && !std::any::type_name::<T>().contains("Cluster")
                 {
                     format!("/registry/rolebindings/{}/", ns)
+                } else if std::any::type_name::<T>().contains("Role")
+                    && !std::any::type_name::<T>().contains("Cluster")
+                {
+                    format!("/registry/roles/{}/", ns)
                 } else {
                     format!("/registry/unknown/{}/", ns)
                 }

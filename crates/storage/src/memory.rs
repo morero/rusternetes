@@ -261,11 +261,15 @@ impl rusternetes_common::authz::AuthzStorage for MemoryStorage {
         // Mirror the EtcdStorage pattern: derive a full /registry path from type name.
         let full_key = match namespace {
             Some(ns) => {
+                // RoleBinding checked before Role — see rhino.rs's AuthzStorage
+                // impl for why: every RoleBinding type name also contains the
+                // substring "Role", so checking Role first made this arm dead
+                // code and silently misrouted every RoleBinding lookup.
                 let tn = std::any::type_name::<T>();
-                if tn.contains("Role") && !tn.contains("Cluster") {
-                    format!("/registry/roles/{}/{}", ns, key)
-                } else if tn.contains("RoleBinding") && !tn.contains("Cluster") {
+                if tn.contains("RoleBinding") && !tn.contains("Cluster") {
                     format!("/registry/rolebindings/{}/{}", ns, key)
+                } else if tn.contains("Role") && !tn.contains("Cluster") {
+                    format!("/registry/roles/{}/{}", ns, key)
                 } else {
                     build_key("unknown", Some(ns), key)
                 }
@@ -291,10 +295,10 @@ impl rusternetes_common::authz::AuthzStorage for MemoryStorage {
         let prefix = match namespace {
             Some(ns) => {
                 let tn = std::any::type_name::<T>();
-                if tn.contains("Role") && !tn.contains("Cluster") {
-                    format!("/registry/roles/{}/", ns)
-                } else if tn.contains("RoleBinding") && !tn.contains("Cluster") {
+                if tn.contains("RoleBinding") && !tn.contains("Cluster") {
                     format!("/registry/rolebindings/{}/", ns)
+                } else if tn.contains("Role") && !tn.contains("Cluster") {
+                    format!("/registry/roles/{}/", ns)
                 } else {
                     format!("/registry/unknown/{}/", ns)
                 }
@@ -337,6 +341,58 @@ mod tests {
         let retrieved: TestResource = storage.get("/test/key").await.unwrap();
 
         assert_eq!(resource, retrieved);
+    }
+
+    /// A RoleBinding's type name trivially contains the substring "Role"
+    /// too. Checking `contains("Role")` before `contains("RoleBinding")`
+    /// (this file's — and rhino.rs's, and etcd.rs's — previous order) made
+    /// the RoleBinding branch dead code: every RoleBinding lookup silently
+    /// resolved to a Role's storage path instead, then failed to
+    /// deserialize the stored Role JSON as RoleBinding (missing its
+    /// required `subjects` field). Live-hit: broke RBAC authorization for
+    /// every RoleBinding-granted ServiceAccount system-wide — including
+    /// CNPG's own initdb Job, denied "User does not have permission" despite
+    /// a correct RoleBinding existing.
+    #[tokio::test]
+    async fn authz_storage_resolves_role_and_rolebinding_to_distinct_keys() {
+        use rusternetes_common::authz::AuthzStorage;
+        use rusternetes_common::resources::rbac::{Role, RoleBinding};
+
+        let storage = MemoryStorage::new();
+
+        let role = Role::new("platform-db-cluster", "default");
+        Storage::create(
+            &storage,
+            "/registry/roles/default/platform-db-cluster",
+            &role,
+        )
+        .await
+        .unwrap();
+
+        let binding = RoleBinding::new("platform-db-cluster", "default");
+        Storage::create(
+            &storage,
+            "/registry/rolebindings/default/platform-db-cluster",
+            &binding,
+        )
+        .await
+        .unwrap();
+
+        let fetched_role: Role = AuthzStorage::get(&storage, "platform-db-cluster", Some("default"))
+            .await
+            .expect("Role lookup must resolve to /registry/roles/..., not fail to deserialize a RoleBinding");
+        assert_eq!(fetched_role.metadata.name, "platform-db-cluster");
+
+        let fetched_binding: RoleBinding =
+            AuthzStorage::get(&storage, "platform-db-cluster", Some("default"))
+                .await
+                .expect("RoleBinding lookup must resolve to /registry/rolebindings/..., not the Role's path");
+        assert_eq!(fetched_binding.metadata.name, "platform-db-cluster");
+
+        let listed_bindings: Vec<RoleBinding> =
+            AuthzStorage::list(&storage, Some("default")).await.unwrap();
+        assert_eq!(listed_bindings.len(), 1);
+        assert_eq!(listed_bindings[0].metadata.name, "platform-db-cluster");
     }
 
     #[tokio::test]
