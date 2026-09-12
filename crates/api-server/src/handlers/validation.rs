@@ -327,6 +327,41 @@ pub fn find_duplicate_json_key_public(json_str: &str) -> Option<String> {
     find_duplicate_json_key(json_str)
 }
 
+/// Whether a value that vanished on re-serialization is expected to have
+/// vanished — i.e. not actually evidence of an unknown field.
+///
+/// This codebase's structs skip fields on serialize via several
+/// `skip_serializing_if` idioms, not just `Option::is_none` (which turns
+/// into JSON `null`): `String::is_empty` (e.g. `ObjectMeta::uid`),
+/// `Vec::is_empty`/map-empty checks, and — found in adversarial review,
+/// live-reproduced against a real CRD body — `skip_false_or_none` in
+/// `crd.rs` (`JSONSchemaProps::unique_items`/`nullable`/etc.), which skips
+/// on `None` *or* `Some(false)`. A real client can send any of those
+/// "empty" shapes explicitly instead of omitting the field — e.g. CNPG's
+/// own Pod creation sends `"uid": ""` for a not-yet-assigned UID, and a
+/// CRD can genuinely send `"uniqueItems": false` — and treating only
+/// literal `null` as exempt (this function's original scope) flagged both
+/// as a bogus unknown field, rejecting an otherwise entirely valid request
+/// outright.
+///
+/// `false` specifically is exempted for this reason, but `true` and all
+/// numbers are not: nothing in this codebase ever skips serializing a
+/// `true` or a nonzero-or-zero number, so a present number or `true` is
+/// exactly as likely to be a real client's genuine value for a field name
+/// this server genuinely doesn't recognize — exempting those would hide
+/// real typos instead of an encoding quirk. `false` is the one scalar value
+/// that both idioms above actually do skip.
+fn is_exempt_from_unknown_field_check(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(s) => s.is_empty(),
+        serde_json::Value::Array(a) => a.is_empty(),
+        serde_json::Value::Object(o) => o.is_empty(),
+        serde_json::Value::Bool(b) => !b,
+        serde_json::Value::Number(_) => false,
+    }
+}
+
 /// Recursively find fields in `original` that are not present in `canonical`.
 /// Returns a list of dotted field paths for unknown fields.
 fn find_unknown_fields_recursive(
@@ -346,15 +381,14 @@ fn find_unknown_fields_recursive(
                 if let Some(canon_val) = canon_map.get(key) {
                     // Recurse into nested objects
                     find_unknown_fields_recursive(orig_val, canon_val, &field_path, unknown);
-                } else if !orig_val.is_null() {
+                } else if !is_exempt_from_unknown_field_check(orig_val) {
                     // A field present in the original but missing from the
                     // canonical (re-serialized) JSON is unknown — unless its
-                    // value is `null`.  Optional fields annotated with
-                    // `skip_serializing_if = "Option::is_none"` deserialize
-                    // `null` as `None` and then disappear on re-serialization,
-                    // so a `null` value is never evidence of an unknown field.
-                    // This matches upstream k8s behaviour: clients routinely
-                    // send `"creationTimestamp": null` and similar.
+                    // value round-trips to nothing under this codebase's own
+                    // `skip_serializing_if` idioms (see
+                    // `is_exempt_from_unknown_field_check`). This matches
+                    // upstream k8s behaviour: clients routinely send
+                    // `"creationTimestamp": null` and similar.
                     unknown.push(field_path);
                 }
             }
@@ -569,6 +603,118 @@ pub fn validate_resource_name(name: &str) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Real client structs in this codebase skip fields on serialize via
+    /// several idioms, not just `Option::is_none` — a value that vanishes
+    /// on re-serialization because it round-tripped through one of those
+    /// idioms must not be flagged as an unknown field. Live-hit via CNPG's
+    /// own Pod creation sending `"uid": ""` for a not-yet-assigned UID
+    /// (`ObjectMeta::uid` skips serializing when empty).
+    #[test]
+    fn test_is_exempt_from_unknown_field_check() {
+        use serde_json::json;
+        assert!(is_exempt_from_unknown_field_check(&json!(null)));
+        assert!(is_exempt_from_unknown_field_check(&json!("")));
+        assert!(is_exempt_from_unknown_field_check(&json!([])));
+        assert!(is_exempt_from_unknown_field_check(&json!({})));
+        // `crd.rs`'s `skip_false_or_none` skips serializing on `None` *or*
+        // `Some(false)` — a present `false` really can vanish legitimately.
+        assert!(is_exempt_from_unknown_field_check(&json!(false)));
+
+        // A present, non-empty value is real evidence of an unknown field —
+        // never exempt.
+        assert!(!is_exempt_from_unknown_field_check(&json!("some-value")));
+        assert!(!is_exempt_from_unknown_field_check(&json!(["item"])));
+        assert!(!is_exempt_from_unknown_field_check(&json!({"key": "value"})));
+
+        // Numbers, and `true`, are never exempt: nothing in this codebase
+        // skips serializing a `true` or a present number at any value, so
+        // exempting those would hide a real typo'd field name instead of an
+        // encoding quirk.
+        assert!(!is_exempt_from_unknown_field_check(&json!(0)));
+        assert!(!is_exempt_from_unknown_field_check(&json!(1)));
+        assert!(!is_exempt_from_unknown_field_check(&json!(true)));
+    }
+
+    #[test]
+    fn test_find_unknown_fields_recursive_exempts_empty_string_that_vanished() {
+        use serde_json::json;
+        let original = json!({"name": "my-pod", "uid": ""});
+        // Simulates ObjectMeta's `uid` field, whose empty value is dropped
+        // by `skip_serializing_if = "String::is_empty"` on re-serialization.
+        let canonical = json!({"name": "my-pod"});
+        let mut unknown = Vec::new();
+        find_unknown_fields_recursive(&original, &canonical, "", &mut unknown);
+        assert!(
+            unknown.is_empty(),
+            "an empty-string field that legitimately vanished must not be flagged, got {:?}",
+            unknown
+        );
+    }
+
+    /// End-to-end regression for the exact case found in adversarial
+    /// review: a CRD schema explicitly setting `uniqueItems: false` (a real,
+    /// valid OpenAPIV3 field) was rejected outright by strict-field
+    /// validation (the default mode) with a bogus "unknown field
+    /// ...uniqueItems", because `JSONSchemaProps::unique_items` uses
+    /// `crd.rs`'s `skip_false_or_none` (skips on `None` *or* `Some(false)`)
+    /// and the exemption logic didn't yet cover that idiom.
+    #[test]
+    fn test_validate_strict_fields_allows_explicit_false_on_skip_false_or_none_field() {
+        use rusternetes_common::resources::crd::CustomResourceDefinition;
+
+        let body = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": "foos.example.com"},
+            "spec": {
+                "group": "example.com",
+                "names": {"plural": "foos", "kind": "Foo"},
+                "scope": "Namespaced",
+                "versions": [{
+                    "name": "v1",
+                    "served": true,
+                    "storage": true,
+                    "schema": {
+                        "openAPIV3Schema": {
+                            "type": "object",
+                            "properties": {
+                                "spec": {
+                                    "type": "object",
+                                    "properties": {
+                                        "tags": {
+                                            "type": "array",
+                                            "uniqueItems": false
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }]
+            }
+        });
+        let body_bytes = serde_json::to_vec(&body).unwrap();
+        let crd: CustomResourceDefinition = serde_json::from_slice(&body_bytes).unwrap();
+
+        let warnings = validate_strict_fields(&HashMap::new(), &body_bytes, &crd)
+            .expect("an explicit `uniqueItems: false` must not be rejected as an unknown field");
+        assert!(
+            warnings.is_empty(),
+            "expected no unknown-field warnings, got {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_find_unknown_fields_recursive_still_catches_real_unknown_fields() {
+        use serde_json::json;
+        let original = json!({"name": "my-pod", "totallyMadeUpField": "value"});
+        let canonical = json!({"name": "my-pod"});
+        let mut unknown = Vec::new();
+        find_unknown_fields_recursive(&original, &canonical, "", &mut unknown);
+        assert_eq!(unknown, vec!["totallyMadeUpField".to_string()]);
+    }
 
     #[test]
     fn test_valid_names() {
