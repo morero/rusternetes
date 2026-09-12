@@ -510,8 +510,33 @@ fn extract_json_from_k8s_protobuf(data: &[u8]) -> Option<Vec<u8>> {
                     if !raw.is_empty() && (raw[0] == b'{' || raw[0] == b'[') {
                         return Some(raw.to_vec());
                     }
-                    // Log what field 2 contains if it's not JSON
-                    if field_number == 2 && !raw.is_empty() {
+                    // Field 2 is genuine native protobuf, not embedded JSON — this
+                    // function's whole premise (the `raw` field literally contains
+                    // JSON text) doesn't apply here. Return None immediately so the
+                    // caller falls through to the schema-aware protobuf decoder
+                    // (`ProtoRegistry::decode_k8s_resource`), instead of continuing
+                    // to the brace-scan fallback below.
+                    //
+                    // Falling through used to be actively harmful: the brace-scan
+                    // blindly searches the *entire* envelope (TypeMeta strings AND
+                    // the native-protobuf resource bytes) for any substring that
+                    // happens to parse as valid JSON. A resource whose own fields
+                    // embed a JSON-encoded string — e.g. CNPG's Service objects
+                    // carry a `cnpg.io/lastAppliedSpec` annotation whose *value* is
+                    // itself a small JSON blob — legitimately contains such a
+                    // syntactically-valid-on-its-own substring. The scan found and
+                    // returned that inner fragment (a `ServiceSpec`-shaped object,
+                    // 183 bytes) as if it were the whole resource, producing a
+                    // JSON body with no top-level `metadata`/`spec` and causing
+                    // axum's `Json<Service>` extractor to reject the request with
+                    // a generic "missing field `metadata`" 422 — which itself
+                    // isn't valid Kubernetes Status JSON, so client-go/CNPG could
+                    // only report its own generic fallback text ("the server
+                    // rejected our request due to an error in our request"),
+                    // observed live as every `platform-db-cluster-r`/`-ro`/`-rw`
+                    // Service create failing while every other CNPG write (Lease,
+                    // Cluster status) succeeded.
+                    if !raw.is_empty() {
                         let preview: String = raw
                             .iter()
                             .take(40)
@@ -524,6 +549,7 @@ fn extract_json_from_k8s_protobuf(data: &[u8]) -> Option<Vec<u8>> {
                             preview
                         );
                     }
+                    return None;
                 }
                 if pos + len > data.len() {
                     return None;
@@ -1292,6 +1318,43 @@ mod tests {
         let result = extract_json_from_k8s_protobuf(&data);
         // Should return None because field 2 doesn't start with { or [
         assert!(result.is_none());
+    }
+
+    /// Regression test for a real bug found live: CNPG's Service objects carry a
+    /// `cnpg.io/lastAppliedSpec` annotation whose *value* is itself a small JSON
+    /// blob. When that Service is protobuf-encoded, field 2 (the native-protobuf
+    /// resource bytes) legitimately contains a syntactically-valid-on-its-own
+    /// JSON substring buried inside it. The old fallback brace-scanned the whole
+    /// envelope and returned that inner fragment as if it were the entire
+    /// resource, producing a body with no top-level `metadata`/`spec` — which
+    /// then failed axum's `Json<Service>` extraction with a generic 422 that
+    /// client-go couldn't parse as Status JSON, surfacing only as CNPG's own
+    /// unhelpful "the server rejected our request due to an error in our
+    /// request (post services)". Once field 2 is confirmed to be genuine native
+    /// protobuf (doesn't start with `{`/`[`), this must return `None` so the
+    /// caller falls through to the schema-aware protobuf decoder instead.
+    #[test]
+    fn test_extract_json_from_k8s_protobuf_ignores_embedded_json_inside_native_protobuf() {
+        // field 2's raw bytes: starts with genuine protobuf-looking bytes (not
+        // `{`/`[`), but contains a fully valid, self-contained JSON object
+        // further in — mimicking an annotation value like `lastAppliedSpec`.
+        let mut native_pb_with_embedded_json = vec![0x08, 0x01]; // some varint field, value 1
+        native_pb_with_embedded_json.extend_from_slice(br#"{"foo":"bar"}"#);
+
+        let mut data = Vec::new();
+        data.extend_from_slice(b"k8s\0");
+        data.push(0x0a); // field 1 (TypeMeta), wire type 2
+        data.push(0x00); // length 0
+        data.push(0x12); // field 2, wire type 2
+        data.push(native_pb_with_embedded_json.len() as u8);
+        data.extend_from_slice(&native_pb_with_embedded_json);
+
+        let result = extract_json_from_k8s_protobuf(&data);
+        assert!(
+            result.is_none(),
+            "must not mistake an embedded JSON substring inside native protobuf bytes for the whole resource; got {:?}",
+            result.map(|r| String::from_utf8_lossy(&r).to_string())
+        );
     }
 
     #[test]
