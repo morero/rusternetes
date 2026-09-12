@@ -166,31 +166,41 @@ impl Storage for EtcdStorage {
 
         // Validate optimistic concurrency if resourceVersion is provided
         if let Some(incoming_rv) = incoming_rv.as_deref() {
+            let expected_mod_revision =
+                crate::concurrency::resource_version_to_mod_revision(incoming_rv)?;
+
             // A write identical to what's already stored (aside from
             // resourceVersion) is a no-op: skip the actual write/revision
             // bump/watch-event entirely, so a controller's own idempotent
             // re-writes don't re-trigger its own watch and loop forever
-            // (see `concurrency::is_no_op_update`). Reads current content
-            // first, then still runs the real CAS-guarded transaction below
-            // when a write is actually needed, so this never silently drops
-            // a genuine concurrent change.
+            // (see `concurrency::is_no_op_update`). Gated on the incoming
+            // resourceVersion actually matching what's currently stored —
+            // a *stale* resourceVersion must still be rejected as a real
+            // Conflict below even when its content happens to coincide
+            // with the current value, so a caller's optimistic-concurrency
+            // assumption is never silently papered over. Reads current
+            // content first, then still runs the real CAS-guarded
+            // transaction below when a write is actually needed, so this
+            // never silently drops a genuine concurrent change.
             if let Ok(current_resp) = client.get(key, None).await {
                 if let Some(kv) = current_resp.kvs().first() {
-                    if let Ok(current_json) = std::str::from_utf8(kv.value()) {
-                        if crate::concurrency::is_no_op_update(&json, current_json) {
-                            debug!("Skipping no-op update at key: {}", key);
-                            let json_with_rv =
-                                Self::inject_resource_version(current_json, kv.mod_revision());
-                            return serde_json::from_str(&json_with_rv)
-                                .map_err(Error::Serialization);
+                    if kv.mod_revision() == expected_mod_revision {
+                        if let Ok(current_json) = std::str::from_utf8(kv.value()) {
+                            if crate::concurrency::is_no_op_update(&json, current_json) {
+                                debug!("Skipping no-op update at key: {}", key);
+                                let json_with_rv = Self::inject_resource_version(
+                                    current_json,
+                                    kv.mod_revision(),
+                                );
+                                return serde_json::from_str(&json_with_rv)
+                                    .map_err(Error::Serialization);
+                            }
                         }
                     }
                 }
             }
 
             // Use a transaction to ensure atomic update with version check
-            let expected_mod_revision =
-                crate::concurrency::resource_version_to_mod_revision(incoming_rv)?;
             // Transaction: if mod_revision matches, PUT then GET (to read back mod_revision).
             // On failure, GET to report the current version in the error.
             let txn = etcd_client::Txn::new()

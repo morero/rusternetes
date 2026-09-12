@@ -189,18 +189,27 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
             // resourceVersion) is a no-op: skip the actual write/revision
             // bump/watch-event entirely, so a controller's own idempotent
             // re-writes don't re-trigger its own watch and loop forever
-            // (see `concurrency::is_no_op_update`). This check reads the
-            // current value first, then still performs the real CAS-guarded
-            // write below when it decides one is needed, so it never
-            // silently drops a genuine concurrent change — the existing
-            // resourceVersion-based conflict detection is unchanged.
+            // (see `concurrency::is_no_op_update`). Gated on the incoming
+            // resourceVersion actually matching what's currently stored —
+            // a *stale* resourceVersion must still be rejected as a real
+            // Conflict below even when its content happens to coincide
+            // with the current value, so a caller's optimistic-concurrency
+            // assumption is never silently papered over. This check reads
+            // the current value first, then still performs the real
+            // CAS-guarded write below when it decides one is needed, so it
+            // never silently drops a genuine concurrent change.
             if let Ok((_rev, Some(current_kv))) = self.backend.get(key, "", 1, 0, false).await {
-                if let Ok(current_json) = String::from_utf8(current_kv.value.clone()) {
-                    if concurrency::is_no_op_update(&json, &current_json) {
-                        debug!("Skipping no-op update at key: {}", key);
-                        let json_with_rv =
-                            Self::inject_resource_version(&current_json, current_kv.mod_revision);
-                        return serde_json::from_str(&json_with_rv).map_err(Error::Serialization);
+                if current_kv.mod_revision == expected_mod_revision {
+                    if let Ok(current_json) = String::from_utf8(current_kv.value.clone()) {
+                        if concurrency::is_no_op_update(&json, &current_json) {
+                            debug!("Skipping no-op update at key: {}", key);
+                            let json_with_rv = Self::inject_resource_version(
+                                &current_json,
+                                current_kv.mod_revision,
+                            );
+                            return serde_json::from_str(&json_with_rv)
+                                .map_err(Error::Serialization);
+                        }
                     }
                 }
             }

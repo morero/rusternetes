@@ -440,6 +440,52 @@ mod tests {
         assert_eq!(updated, retrieved);
     }
 
+    /// Regression: a write byte-identical to what's already stored must be
+    /// a true no-op — no watch event, so it can never re-trigger the
+    /// writer's own watch and loop forever (see `concurrency::is_no_op_update`,
+    /// ISSUES.md #49).
+    #[tokio::test]
+    async fn test_update_no_op_emits_no_watch_event() {
+        let storage = MemoryStorage::new();
+        let resource = TestResource {
+            name: "test".to_string(),
+            value: 42,
+        };
+        let mut rx = storage.watch_tx.subscribe();
+        storage.create("/test/key", &resource).await.unwrap();
+        rx.try_recv().expect("create() should have emitted Added");
+
+        storage.update("/test/key", &resource).await.unwrap();
+
+        assert!(
+            rx.try_recv().is_err(),
+            "identical update must not emit a watch event"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_real_change_still_emits_watch_event() {
+        let storage = MemoryStorage::new();
+        let resource = TestResource {
+            name: "test".to_string(),
+            value: 42,
+        };
+        let mut rx = storage.watch_tx.subscribe();
+        storage.create("/test/key", &resource).await.unwrap();
+        rx.try_recv().expect("create() should have emitted Added");
+
+        let updated = TestResource {
+            name: "test".to_string(),
+            value: 43,
+        };
+        storage.update("/test/key", &updated).await.unwrap();
+
+        assert!(
+            rx.try_recv().is_ok(),
+            "a real content change must still emit a watch event"
+        );
+    }
+
     #[tokio::test]
     async fn test_delete() {
         let storage = MemoryStorage::new();
