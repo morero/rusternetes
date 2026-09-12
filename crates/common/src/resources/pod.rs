@@ -109,10 +109,19 @@ pub struct PodSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_network: Option<bool>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    // Explicit renames, not the struct's default camelCase: real K8s JSON
+    // fully capitalizes these acronyms ("hostPID"/"hostIPC"), which
+    // `rename_all = "camelCase"` alone would render as "hostPid"/"hostIpc"
+    // instead — same convention as podIP/hostIP/containerID elsewhere in
+    // this file. Live-hit via CNPG's own Pod creation: the mismatch made
+    // serde silently drop both fields on deserialize (leaving them `None`),
+    // which then vanished from the re-serialized canonical JSON too,
+    // failing strict-field-validation with a bogus "unknown field" for a
+    // field this struct genuinely has.
+    #[serde(rename = "hostPID", skip_serializing_if = "Option::is_none")]
     pub host_pid: Option<bool>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "hostIPC", skip_serializing_if = "Option::is_none")]
     pub host_ipc: Option<bool>,
 
     /// Affinity rules for pod scheduling
@@ -200,7 +209,14 @@ pub struct PodSpec {
     pub host_users: Option<bool>,
 
     /// SetHostnameAsFQDN determines if the pod's hostname will be configured as the pod's FQDN
-    #[serde(skip_serializing_if = "Option::is_none")]
+    ///
+    /// Same acronym-casing gap as hostPID/hostIPC above, found in
+    /// adversarial review of that fix: real K8s JSON is
+    /// "setHostnameAsFQDN" (fully-capitalized FQDN), not the
+    /// `rename_all = "camelCase"` default of "setHostnameAsFqdn". Live-
+    /// reproduced: a spec sending `"setHostnameAsFQDN": true` deserialized
+    /// to `None` and the field vanished entirely from re-serialized JSON.
+    #[serde(rename = "setHostnameAsFQDN", skip_serializing_if = "Option::is_none")]
     pub set_hostname_as_fqdn: Option<bool>,
 
     /// TerminationGracePeriodSeconds is the grace period before forcible pod termination
@@ -1734,6 +1750,35 @@ pub struct PodResourceClaimStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Real K8s JSON fully capitalizes these acronyms ("hostPID"/"hostIPC"),
+    /// which `PodSpec`'s struct-level `rename_all = "camelCase"` alone would
+    /// render as "hostPid"/"hostIpc" instead — the mismatch made serde
+    /// silently ignore both fields on deserialize (a real client's actual
+    /// value never reaches the struct) and, being left at their `None`
+    /// default, they then vanished from re-serialized JSON too. Live-hit
+    /// via CNPG's own Pod creation, whose spec sets both explicitly.
+    #[test]
+    fn test_host_pid_and_host_ipc_use_fully_capitalized_json_keys() {
+        let json = serde_json::json!({
+            "containers": [{"name": "c", "image": "nginx:latest"}],
+            "hostPID": true,
+            "hostIPC": true,
+            "setHostnameAsFQDN": true,
+        });
+        let spec: PodSpec = serde_json::from_value(json).expect("must deserialize PodSpec");
+        assert_eq!(spec.host_pid, Some(true));
+        assert_eq!(spec.host_ipc, Some(true));
+        // Same acronym-casing gap, found via adversarial review of the two
+        // fixes above: real K8s JSON is "setHostnameAsFQDN", not the
+        // `rename_all = "camelCase"` default "setHostnameAsFqdn".
+        assert_eq!(spec.set_hostname_as_fqdn, Some(true));
+
+        let round_tripped = serde_json::to_value(&spec).expect("must serialize PodSpec");
+        assert_eq!(round_tripped["hostPID"], serde_json::json!(true));
+        assert_eq!(round_tripped["hostIPC"], serde_json::json!(true));
+        assert_eq!(round_tripped["setHostnameAsFQDN"], serde_json::json!(true));
+    }
 
     #[test]
     fn test_pod_with_pvc_volume_serialization() {
