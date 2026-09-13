@@ -405,30 +405,36 @@ impl<S: Storage + 'static> DeploymentController<S> {
             // Deployments accumulated ~61,000 stored revisions each (82% of
             // the entire backing database) and kept controller-manager at
             // >100% CPU on a completely idle cluster. See ISSUES.md.
+            // `replicaset_matches_template` serializes and normalizes both
+            // pod templates on every call, so evaluate it once per RS here
+            // and reuse the result for all three decisions below rather
+            // than paying for three deep compares per ReplicaSet.
+            let matches_template: Vec<bool> = owned_replicasets
+                .iter()
+                .map(|rs| self.replicaset_matches_template(rs, deployment))
+                .collect();
+            let revision_of = |rs: &ReplicaSet| -> Option<i64> {
+                rs.metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.get("deployment.kubernetes.io/revision"))
+                    .and_then(|v| v.parse::<i64>().ok())
+            };
+
             let max_old_revision = owned_replicasets
                 .iter()
-                .filter(|rs| !self.replicaset_matches_template(rs, deployment))
-                .filter_map(|rs| {
-                    rs.metadata
-                        .annotations
-                        .as_ref()
-                        .and_then(|a| a.get("deployment.kubernetes.io/revision"))
-                        .and_then(|v| v.parse::<i64>().ok())
-                })
+                .zip(&matches_template)
+                .filter(|(_, matches)| !**matches)
+                .filter_map(|(rs, _)| revision_of(rs))
                 .max()
                 .unwrap_or(0);
 
             // Also consider the new RS's current revision (it might already be higher)
             let new_rs_revision = owned_replicasets
                 .iter()
-                .filter(|rs| self.replicaset_matches_template(rs, deployment))
-                .filter_map(|rs| {
-                    rs.metadata
-                        .annotations
-                        .as_ref()
-                        .and_then(|a| a.get("deployment.kubernetes.io/revision"))
-                        .and_then(|v| v.parse::<i64>().ok())
-                })
+                .zip(&matches_template)
+                .filter(|(_, matches)| **matches)
+                .filter_map(|(rs, _)| revision_of(rs))
                 .max()
                 .unwrap_or(0);
 
@@ -439,8 +445,8 @@ impl<S: Storage + 'static> DeploymentController<S> {
             // predicate as the revision math above, so a stored
             // `pod-template-hash` label that no longer matches a freshly
             // recomputed hash can't split these two decisions apart.
-            for rs in &owned_replicasets {
-                if self.replicaset_matches_template(rs, deployment) {
+            for (rs, matches) in owned_replicasets.iter().zip(&matches_template) {
+                if *matches {
                     let current_rs_rev = rs
                         .metadata
                         .annotations
@@ -2595,6 +2601,78 @@ mod tests {
             "deployment revision ({}) should be >= 5 (max from owned ReplicaSets)",
             revision
         );
+    }
+
+    /// `compute_pod_template_hash` still names new ReplicaSets
+    /// (`{deployment}-{hash}`), so it must at least be stable *within* a
+    /// given binary — including across a JSON serialize/deserialize
+    /// round-trip, which is how templates actually reach this code (read
+    /// back out of storage). Map-ordering or number-formatting
+    /// nondeterminism here would mint a differently-named ReplicaSet on
+    /// every reconcile.
+    ///
+    /// Note what this deliberately does NOT promise: stability *across*
+    /// binary versions. Changing a serde attribute on any type reachable
+    /// from `PodSpec` changes the serialization and therefore the hash —
+    /// which is exactly what invalidated the stored `pod-template-hash`
+    /// labels behind the oscillation bug below (confirmed: the affected
+    /// Deployments' own templates never changed; the hash function's
+    /// output did, when `hostPID`/`hostIPC`/`setHostnameAsFQDN` gained
+    /// `skip_serializing_if`). That's tolerable *only* because matching no
+    /// longer depends on this hash — a stale label can no longer split the
+    /// revision math from `replicaset_matches_template`.
+    #[test]
+    fn test_pod_template_hash_is_stable_across_serialization_round_trips() {
+        let deploy_json = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "web", "namespace": "default" },
+            "spec": {
+                "replicas": 1,
+                "selector": { "matchLabels": { "app": "web" } },
+                "template": {
+                    "metadata": { "labels": { "app": "web", "tier": "fe", "zone": "a" } },
+                    "spec": {
+                        "containers": [{
+                            "name": "nginx",
+                            "image": "nginx:1.19",
+                            "resources": {
+                                "requests": { "cpu": "50m", "memory": "64Mi" },
+                                "limits": { "memory": "256Mi" }
+                            }
+                        }],
+                        "nodeSelector": { "disk": "ssd", "region": "eu", "arch": "amd64" }
+                    }
+                }
+            }
+        });
+        let deployment: Deployment = serde_json::from_value(deploy_json).unwrap();
+
+        let first = DeploymentController::<rusternetes_storage::MemoryStorage>::
+            compute_pod_template_hash(&deployment);
+
+        // Same object, repeated calls.
+        for _ in 0..25 {
+            assert_eq!(
+                DeploymentController::<rusternetes_storage::MemoryStorage>::
+                    compute_pod_template_hash(&deployment),
+                first,
+                "hash must be deterministic for an unchanged template"
+            );
+        }
+
+        // Round-tripped through JSON, the way templates actually reach
+        // this code after being read back out of storage.
+        for _ in 0..25 {
+            let round_tripped: Deployment =
+                serde_json::from_str(&serde_json::to_string(&deployment).unwrap()).unwrap();
+            assert_eq!(
+                DeploymentController::<rusternetes_storage::MemoryStorage>::
+                    compute_pod_template_hash(&round_tripped),
+                first,
+                "hash must survive a storage serialize/deserialize round-trip"
+            );
+        }
     }
 
     /// Regression for a real, live-confirmed runaway: a stored ReplicaSet
