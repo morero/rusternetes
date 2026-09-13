@@ -6,6 +6,7 @@
 // - Orphan deletion
 // - Finalizer handling for deletion protection
 
+use rusternetes_common::resources::crd::{CustomResourceDefinition, ResourceScope};
 use rusternetes_common::types::{DeletionPropagation, ObjectMeta};
 use rusternetes_storage::Storage;
 use serde::{Deserialize, Serialize};
@@ -180,6 +181,73 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         Ok(())
     }
 
+    /// Every registered custom resource type, as `(storage type, namespaced)`.
+    ///
+    /// The storage type must match how the api-server composes it —
+    /// `{group with '.' replaced by '_'}_{plural}` — see
+    /// `api-server/src/handlers/custom_resource.rs`. The same derivation
+    /// lives in the namespace controller; both are noted rather than shared,
+    /// because if that composition ever changes, the symptom here is
+    /// silently orphaned objects rather than a compile error.
+    async fn discover_custom_resource_types(
+        &self,
+    ) -> rusternetes_common::Result<Vec<(String, bool)>> {
+        let crds: Vec<CustomResourceDefinition> =
+            self.storage.list("/registry/customresourcedefinitions/").await?;
+        Ok(crds
+            .into_iter()
+            .map(|crd| {
+                (
+                    format!(
+                        "{}_{}",
+                        crd.spec.group.replace('.', "_"),
+                        crd.spec.names.plural
+                    ),
+                    crd.spec.scope == ResourceScope::Namespaced,
+                )
+            })
+            .collect())
+    }
+
+    /// The storage type an `ownerReference` points at, for built-in *and*
+    /// custom kinds.
+    ///
+    /// `kind_to_plural` only knows built-ins and returns `""` otherwise,
+    /// which made the verification step skip every custom-owned resource —
+    /// conservative, but it meant `ownerReference` cascade never fired for
+    /// any CRD. Resolving the custom case needs the owner's **apiVersion**,
+    /// not just its kind: the group is what distinguishes
+    /// `Cluster.postgresql.cnpg.io` from any other `Cluster`.
+    async fn owner_storage_type(
+        &self,
+        owner_ref: &rusternetes_common::types::OwnerReference,
+    ) -> Option<String> {
+        let plural = kind_to_plural(&owner_ref.kind);
+        if !plural.is_empty() {
+            return Some(plural.to_string());
+        }
+        // `apiVersion` is either "group/version" or a bare "version" for
+        // core types. A bare version has no group, so it cannot be a CRD.
+        let group = owner_ref.api_version.split('/').next()?;
+        if group.is_empty() || !owner_ref.api_version.contains('/') {
+            return None;
+        }
+        let crds: Vec<CustomResourceDefinition> = self
+            .storage
+            .list("/registry/customresourcedefinitions/")
+            .await
+            .ok()?;
+        crds.into_iter()
+            .find(|crd| crd.spec.group == group && crd.spec.names.kind == owner_ref.kind)
+            .map(|crd| {
+                format!(
+                    "{}_{}",
+                    crd.spec.group.replace('.', "_"),
+                    crd.spec.names.plural
+                )
+            })
+    }
+
     /// Get all resources from storage
     async fn get_all_resources(&self) -> rusternetes_common::Result<Vec<ResourceInfo>> {
         let mut resources = Vec::new();
@@ -218,7 +286,30 @@ impl<S: Storage + 'static> GarbageCollector<S> {
             ("clusterrolebindings", false), // cluster-scoped
         ];
 
-        for (resource_type, namespaced) in resource_types {
+        // Custom resources are not in that list and cannot be: the CRD set
+        // is not known at compile time. Without discovery, an
+        // `ownerReference` between two custom resources is set correctly and
+        // then never acted on — deleting an owning object leaves every child
+        // permanently orphaned, for every CRD in the cluster. See ISSUES.md
+        // #15, and #56 for the same gap in the namespace controller.
+        let mut resource_types: Vec<(String, bool)> = resource_types
+            .into_iter()
+            .map(|(t, n)| (t.to_string(), n))
+            .collect();
+        match self.discover_custom_resource_types().await {
+            Ok(custom) => resource_types.extend(custom),
+            // Non-fatal: failing to enumerate CRDs must not stop the GC
+            // scanning built-in kinds. Logged because the consequence is
+            // silently orphaned custom resources.
+            Err(e) => warn!(
+                "GC: could not enumerate custom resource types; ownerReference \
+                 cascade will not fire for any custom resource this pass: {}",
+                e
+            ),
+        }
+
+        for (resource_type, namespaced) in &resource_types {
+            let (resource_type, namespaced) = (resource_type.as_str(), *namespaced);
             if namespaced {
                 // For namespaced resources, we need to list across all namespaces
                 // This is simplified - in reality we'd list all namespaces first
@@ -411,15 +502,21 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         let namespace = fresh_meta.namespace.as_deref();
 
         for owner_ref in owner_refs {
-            let plural = kind_to_plural(&owner_ref.kind);
-            if plural.is_empty() {
-                // Unknown kind — be conservative, don't delete
+            // Resolves built-in kinds and, via the owner's apiVersion group,
+            // registered custom kinds too. Before this, every custom owner
+            // was unresolvable and the orphan was skipped, so ownerReference
+            // cascade never fired for any CRD (ISSUES.md #15).
+            let Some(plural) = self.owner_storage_type(owner_ref).await else {
+                // Genuinely unknown — be conservative, don't delete. This is
+                // now a real "we have never heard of this kind" rather than
+                // "this kind is custom".
                 debug!(
-                    "GC: {} has owner of unknown kind '{}', skipping",
-                    orphan.key, owner_ref.kind
+                    "GC: {} has owner of unresolvable kind '{}' (apiVersion '{}'), skipping",
+                    orphan.key, owner_ref.kind, owner_ref.api_version
                 );
                 return Ok(false);
-            }
+            };
+            let plural = plural.as_str();
             let owner_key = if let Some(ns) = namespace {
                 format!("/registry/{}/{}/{}", plural, ns, owner_ref.name)
             } else {
