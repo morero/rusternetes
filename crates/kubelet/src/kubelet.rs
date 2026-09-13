@@ -3478,13 +3478,22 @@ impl Kubelet {
                                         pod_ip.as_ref().map(|ip| vec![PodIP { ip: ip.clone() }]);
                                     status.pod_ip = pod_ip;
                                 }
-                                if all_ready {
+                                // Preserve lastTransitionTime for conditions whose
+                                // status did not actually change — otherwise the
+                                // status-unchanged guard below can never fire, and
+                                // every sync rewrites the pod.
+                                let fresh = if all_ready {
                                     status.message = Some("All containers ready".to_string());
-                                    status.conditions = Some(Self::running_pod_conditions());
+                                    Self::running_pod_conditions()
                                 } else {
                                     status.message = Some("Some containers not ready".to_string());
-                                    status.conditions = Some(Self::not_ready_pod_conditions());
-                                }
+                                    Self::not_ready_pod_conditions()
+                                };
+                                let conditions = Self::preserve_condition_transition_times(
+                                    fresh,
+                                    status.conditions.as_deref(),
+                                );
+                                status.conditions = Some(conditions);
                             }
 
                             // Skip update if status hasn't changed — avoids unnecessary
@@ -3795,9 +3804,55 @@ impl Kubelet {
         Ok(())
     }
 
+    /// Carries `last_transition_time` forward from `previous` for every
+    /// condition whose `status` has not actually changed.
+    ///
+    /// `running_pod_conditions`/`not_ready_pod_conditions` are pure
+    /// constructors: they stamp `Utc::now()` because they have no idea what
+    /// came before. That is correct when a pod's conditions are first
+    /// created and wrong on every subsequent status sync, for two reasons:
+    ///
+    /// 1. It is a lie. Kubernetes defines `lastTransitionTime` as "last time
+    ///    the condition transitioned from one status to another". A `Ready`
+    ///    condition that has been `True` for an hour must still say so.
+    /// 2. It defeats the status-unchanged skip-guard a few lines below,
+    ///    which diffs old and new status JSON and returns early when they
+    ///    match. A regenerated timestamp makes every sync differ, so the
+    ///    guard never fires and every pod is rewritten on every sync loop
+    ///    forever — found live at ~4 writes/min/pod, several thousand
+    ///    stored revisions per pod.
+    ///
+    /// `eviction.rs`'s node-condition update already gets this right
+    /// (`if status_changed { condition.last_transition_time = Some(now) }`);
+    /// this is the pod-condition equivalent, applied where the previous
+    /// conditions are actually in hand.
+    fn preserve_condition_transition_times(
+        mut fresh: Vec<PodCondition>,
+        previous: Option<&[PodCondition]>,
+    ) -> Vec<PodCondition> {
+        let Some(previous) = previous else {
+            return fresh;
+        };
+        for condition in &mut fresh {
+            if let Some(old) = previous
+                .iter()
+                .find(|p| p.condition_type == condition.condition_type)
+            {
+                if old.status == condition.status {
+                    condition.last_transition_time = old.last_transition_time;
+                }
+            }
+        }
+        fresh
+    }
+
     /// Build the standard pod conditions for a Running pod.
     /// Real Kubernetes sets Initialized, PodScheduled, ContainersReady, and Ready=True
     /// when all containers are running. The e2e conformance suite checks these conditions.
+    ///
+    /// Stamps `now` on every condition — see
+    /// [`preserve_condition_transition_times`](Self::preserve_condition_transition_times),
+    /// which every *re*-sync must pass the result through.
     fn running_pod_conditions() -> Vec<PodCondition> {
         let now = Some(chrono::Utc::now());
         vec![
@@ -5006,5 +5061,99 @@ mod tests {
             "Failed to create PersistentVolumeClaim host path directory"
         ));
         assert!(!is_transient_volume_wait_error("ErrImagePull"));
+    }
+}
+
+#[cfg(test)]
+mod pod_condition_transition_tests {
+    use super::Kubelet;
+    use rusternetes_common::resources::pod::PodCondition;
+
+    fn cond(t: &str, status: &str, at: &str) -> PodCondition {
+        PodCondition {
+            condition_type: t.to_string(),
+            status: status.to_string(),
+            reason: None,
+            message: None,
+            last_transition_time: Some(at.parse().expect("valid RFC3339")),
+            observed_generation: None,
+        }
+    }
+
+    /// The bug this guards: `running_pod_conditions()` stamps `Utc::now()`
+    /// unconditionally, so an unchanged `Ready=True` got a fresh
+    /// `lastTransitionTime` on every sync. That is both a lie about when
+    /// the transition happened and the reason the status-unchanged
+    /// skip-guard could never fire — found live with several thousand
+    /// stored revisions per pod, ~4 writes/min each, indefinitely.
+    #[test]
+    fn unchanged_status_keeps_its_original_transition_time() {
+        let previous = vec![
+            cond("Ready", "True", "2026-09-13T10:00:00Z"),
+            cond("ContainersReady", "True", "2026-09-13T10:00:00Z"),
+        ];
+        let fresh = vec![
+            cond("Ready", "True", "2026-09-13T14:00:00Z"),
+            cond("ContainersReady", "True", "2026-09-13T14:00:00Z"),
+        ];
+
+        let out = Kubelet::preserve_condition_transition_times(fresh, Some(&previous));
+
+        for c in &out {
+            assert_eq!(
+                c.last_transition_time, previous[0].last_transition_time,
+                "{} was True before and is True now — its transition time must not move",
+                c.condition_type
+            );
+        }
+    }
+
+    /// The other half: a condition that genuinely flipped must take the new
+    /// timestamp, or the field becomes useless in the opposite direction.
+    #[test]
+    fn changed_status_takes_the_new_transition_time() {
+        let previous = vec![cond("Ready", "False", "2026-09-13T10:00:00Z")];
+        let fresh = vec![cond("Ready", "True", "2026-09-13T14:00:00Z")];
+        let new_time = fresh[0].last_transition_time;
+
+        let out = Kubelet::preserve_condition_transition_times(fresh, Some(&previous));
+
+        assert_eq!(
+            out[0].last_transition_time, new_time,
+            "Ready flipped False->True, so the transition time must advance"
+        );
+    }
+
+    /// First time a pod gets conditions there is nothing to preserve, and
+    /// `now` is the honest answer.
+    #[test]
+    fn no_previous_conditions_keeps_fresh_timestamps() {
+        let fresh = vec![cond("Ready", "True", "2026-09-13T14:00:00Z")];
+        let expected = fresh[0].last_transition_time;
+        let out = Kubelet::preserve_condition_transition_times(fresh, None);
+        assert_eq!(out[0].last_transition_time, expected);
+    }
+
+    /// A condition type absent from the previous set is new, so it keeps
+    /// its fresh stamp rather than silently inheriting an unrelated one.
+    #[test]
+    fn newly_appearing_condition_keeps_its_fresh_timestamp() {
+        let previous = vec![cond("Ready", "True", "2026-09-13T10:00:00Z")];
+        let fresh = vec![
+            cond("Ready", "True", "2026-09-13T14:00:00Z"),
+            cond("PodScheduled", "True", "2026-09-13T14:00:00Z"),
+        ];
+        let new_time = fresh[1].last_transition_time;
+
+        let out = Kubelet::preserve_condition_transition_times(fresh, Some(&previous));
+
+        assert_eq!(
+            out[0].last_transition_time,
+            previous[0].last_transition_time
+        );
+        assert_eq!(
+            out[1].last_transition_time, new_time,
+            "PodScheduled did not exist before; it is a real first transition"
+        );
     }
 }
