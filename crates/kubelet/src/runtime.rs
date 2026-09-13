@@ -475,6 +475,38 @@ fn apply_fsgroup_to_path(path: &str, fs_group: i64) {
         let new_mode = (mode & !0o070) | (owner_bits << 3) | 0o2000;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(new_mode));
     }
+
+    // Verify the chown actually happened, and say so loudly if it did not.
+    //
+    // Every step above is deliberately best-effort and silent, which is
+    // correct for a background sync loop — but it means a kubelet that
+    // *cannot* chown produces no signal at all, and the failure surfaces
+    // much later as an unrelated-looking permission error from inside a
+    // container ("initdb: could not create directory ... Permission
+    // denied"). That cost a long investigation: a CloudNativePG cluster
+    // appeared to be ignoring its own `bootstrap.initdb` settings, when in
+    // fact initdb was never able to run at all.
+    //
+    // chown(2) to an arbitrary GID requires CAP_CHOWN. A kubelet running
+    // unprivileged has it only via a file capability on this binary, and
+    // **every `cargo build` that produces a new file wipes it** — so the
+    // normal way to reach this state is simply rebuilding the kubelet and
+    // forgetting to re-run setcap.
+    if let Ok(meta) = std::fs::metadata(path) {
+        use std::os::unix::fs::MetadataExt;
+        if meta.gid() != fs_group as u32 {
+            warn!(
+                "fsGroup {} requested for volume {} but its group is still {} — chown(2) \
+                 failed, almost certainly because this kubelet lacks CAP_CHOWN. Containers \
+                 running as a UID outside that group will get permission-denied errors \
+                 writing to their own volumes. Fix: `sudo setcap cap_chown+ep <kubelet \
+                 binary>` (a file capability, wiped by every rebuild).",
+                fs_group,
+                path,
+                meta.gid()
+            );
+        }
+    }
 }
 
 fn write_file_if_changed(path: &str, contents: &[u8]) {
