@@ -384,20 +384,30 @@ impl<S: Storage + 'static> DeploymentController<S> {
         // 3. Set new RS annotation to newRevision
         // 4. Set deployment annotation to newRevision
         {
-            let template_hash = Self::compute_pod_template_hash(deployment);
+            // Classify "old" vs "new" RSes with the SAME deep template
+            // comparison the rest of this controller uses
+            // (`replicaset_matches_template`), not a raw `pod-template-hash`
+            // label-string comparison against a freshly recomputed hash.
+            //
+            // Real, live-confirmed bug this fixes: when a stored RS's
+            // `pod-template-hash` label doesn't equal what
+            // `compute_pod_template_hash` now returns (different creation
+            // path, or any serialization/defaulting drift since the RS was
+            // created), the two mechanisms disagree permanently — the deep
+            // compare says "this RS matches" (so no new RS is created, and
+            // nothing is logged as a mismatch) while this hash comparison
+            // says "old", making the revision math compute
+            // `max_old_revision + 1`. The status-update path further down
+            // independently computes the RS's own revision instead, so the
+            // two paths wrote alternating values (1, 2, 1, 2, ...) to the
+            // Deployment forever — each write re-triggering the watch that
+            // scheduled the next reconcile. Live impact: three operator
+            // Deployments accumulated ~61,000 stored revisions each (82% of
+            // the entire backing database) and kept controller-manager at
+            // >100% CPU on a completely idle cluster. See ISSUES.md.
             let max_old_revision = owned_replicasets
                 .iter()
-                .filter(|rs| {
-                    // "Old" RSes: those that DON'T match the current template
-                    let rs_hash = rs
-                        .metadata
-                        .labels
-                        .as_ref()
-                        .and_then(|l| l.get("pod-template-hash"))
-                        .map(|s| s.as_str())
-                        .unwrap_or("");
-                    rs_hash != template_hash
-                })
+                .filter(|rs| !self.replicaset_matches_template(rs, deployment))
                 .filter_map(|rs| {
                     rs.metadata
                         .annotations
@@ -411,16 +421,7 @@ impl<S: Storage + 'static> DeploymentController<S> {
             // Also consider the new RS's current revision (it might already be higher)
             let new_rs_revision = owned_replicasets
                 .iter()
-                .filter(|rs| {
-                    let rs_hash = rs
-                        .metadata
-                        .labels
-                        .as_ref()
-                        .and_then(|l| l.get("pod-template-hash"))
-                        .map(|s| s.as_str())
-                        .unwrap_or("");
-                    rs_hash == template_hash
-                })
+                .filter(|rs| self.replicaset_matches_template(rs, deployment))
                 .filter_map(|rs| {
                     rs.metadata
                         .annotations
@@ -434,16 +435,12 @@ impl<S: Storage + 'static> DeploymentController<S> {
             let new_revision = std::cmp::max(max_old_revision + 1, new_rs_revision);
             let revision_str = std::cmp::max(new_revision, 1).to_string();
 
-            // Update new RS annotation if needed
+            // Update new RS annotation if needed — same deep-compare
+            // predicate as the revision math above, so a stored
+            // `pod-template-hash` label that no longer matches a freshly
+            // recomputed hash can't split these two decisions apart.
             for rs in &owned_replicasets {
-                let rs_hash = rs
-                    .metadata
-                    .labels
-                    .as_ref()
-                    .and_then(|l| l.get("pod-template-hash"))
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
-                if rs_hash == template_hash {
+                if self.replicaset_matches_template(rs, deployment) {
                     let current_rs_rev = rs
                         .metadata
                         .annotations
@@ -2597,6 +2594,116 @@ mod tests {
             revision.parse::<i64>().unwrap() >= 5,
             "deployment revision ({}) should be >= 5 (max from owned ReplicaSets)",
             revision
+        );
+    }
+
+    /// Regression for a real, live-confirmed runaway: a stored ReplicaSet
+    /// whose `pod-template-hash` label does NOT equal what
+    /// `compute_pod_template_hash` currently returns, but whose pod template
+    /// still deep-matches the Deployment's.
+    ///
+    /// The revision math used to classify "old" vs "new" ReplicaSets by
+    /// comparing that label against a freshly recomputed hash, while
+    /// `replicaset_matches_template` (used everywhere else, including the
+    /// decision to create a new RS) does a deep template compare. When the
+    /// two disagreed, the sync path computed `max_old_revision + 1` (= 2
+    /// here) while the status-update path independently computed the RS's
+    /// own revision (= 1) — so the two wrote alternating values to the
+    /// Deployment forever, each write re-triggering the watch that
+    /// scheduled the next reconcile. Live impact: three operator
+    /// Deployments reached ~61,000 stored revisions each (82% of the whole
+    /// backing database) and pinned controller-manager above 100% CPU on an
+    /// otherwise idle cluster.
+    ///
+    /// Reconciling twice must converge on one stable revision, not alternate.
+    #[tokio::test]
+    async fn test_stale_pod_template_hash_label_does_not_oscillate_revision() {
+        use rusternetes_storage::MemoryStorage;
+        use std::sync::Arc;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = DeploymentController::new(storage.clone(), 2);
+        let ns = "default";
+
+        // RS template deep-matches the Deployment's, but its
+        // `pod-template-hash` label is deliberately stale/wrong.
+        let rs_json = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": {
+                "name": "web-stalehash",
+                "namespace": ns,
+                "uid": "rs-uid-stale",
+                "annotations": { "deployment.kubernetes.io/revision": "1" },
+                "labels": { "app": "web", "pod-template-hash": "deadbeef" },
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "name": "web",
+                    "uid": "deploy-uid-stale",
+                    "controller": true
+                }]
+            },
+            "spec": {
+                "replicas": 1,
+                "selector": { "matchLabels": { "app": "web" } },
+                "template": {
+                    "metadata": { "labels": { "app": "web" } },
+                    "spec": { "containers": [{ "name": "nginx", "image": "nginx:1.19" }] }
+                }
+            }
+        });
+        let rs: ReplicaSet = serde_json::from_value(rs_json).unwrap();
+        storage
+            .create(&format!("/registry/replicasets/{ns}/web-stalehash"), &rs)
+            .await
+            .unwrap();
+
+        let deploy_json = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "web",
+                "namespace": ns,
+                "uid": "deploy-uid-stale",
+                "annotations": { "deployment.kubernetes.io/revision": "1" }
+            },
+            "spec": {
+                "replicas": 1,
+                "selector": { "matchLabels": { "app": "web" } },
+                "template": {
+                    "metadata": { "labels": { "app": "web" } },
+                    "spec": { "containers": [{ "name": "nginx", "image": "nginx:1.19" }] }
+                }
+            }
+        });
+        let deployment: Deployment = serde_json::from_value(deploy_json).unwrap();
+        let deploy_key = format!("/registry/deployments/{ns}/web");
+        storage.create(&deploy_key, &deployment).await.unwrap();
+
+        let read_revision = |storage: Arc<MemoryStorage>, key: String| async move {
+            let d: Deployment = storage.get(&key).await.unwrap();
+            d.metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get("deployment.kubernetes.io/revision"))
+                .cloned()
+                .unwrap_or_default()
+        };
+
+        let d: Deployment = storage.get(&deploy_key).await.unwrap();
+        controller.reconcile_deployment(&d).await.unwrap();
+        let first = read_revision(storage.clone(), deploy_key.clone()).await;
+
+        let d: Deployment = storage.get(&deploy_key).await.unwrap();
+        controller.reconcile_deployment(&d).await.unwrap();
+        let second = read_revision(storage.clone(), deploy_key.clone()).await;
+
+        assert_eq!(
+            first, second,
+            "revision must converge across reconciles, not alternate \
+             (got {first} then {second}) — a stale pod-template-hash label \
+             must not split the revision math from replicaset_matches_template"
         );
     }
 
