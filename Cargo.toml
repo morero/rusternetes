@@ -73,3 +73,28 @@ lto = "thin"
 codegen-units = 1
 opt-level = 3
 strip = "symbols"
+
+# The dev profile is what actually gets *run* here: RUNBOOK.md,
+# scripts/test-integration.sh and platformctl all build and launch
+# `target/debug/<binary>` (the release profile's thin-LTO +
+# codegen-units=1 makes full builds too slow to iterate on). That left
+# every long-running component — api-server, controller-manager, kubelet
+# — executing completely unoptimized code on a workload that is almost
+# entirely JSON serialize/deserialize, hashing and map churn, i.e. the
+# work unoptimized Rust is worst at.
+#
+# opt-level = 2 without LTO and with the dev profile's default
+# codegen-units keeps builds parallel and incremental (no thin-LTO
+# serialization step) while removing that penalty. Deliberately NOT a
+# separate named profile: every path above hardcodes `target/debug/`, so
+# a custom profile would silently keep launching the old unoptimized
+# binaries from a stale directory.
+#
+# debug = 1 emits line tables only, not full DWARF: panics and
+# backtraces still report file:line (heavily relied on while debugging
+# this cluster), but the binaries drop from ~800MB to a fraction of
+# that, which also speeds up linking noticeably.
+[profile.dev]
+opt-level = 2
+debug = 1
+lto = false
