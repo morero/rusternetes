@@ -8474,7 +8474,8 @@ impl ContainerRuntime {
     /// Container garbage collector — removes dead containers to prevent buildup.
     /// Matches K8s kuberuntime_gc.go:
     /// - For deleted pods (not in existing_pods): removes ALL dead containers
-    /// - For existing pods: keeps at most 1 dead container per pod (for log access)
+    /// - For existing pods: keeps at most 1 dead container per container
+    ///   name (for log access) — not 1 total per pod
     /// - Removes orphaned pause containers with no running app containers
     /// - Removes stale "created" containers older than 5 minutes
     ///
