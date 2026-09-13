@@ -119,11 +119,13 @@ impl<S: Storage + 'static> GarbageCollector<S> {
             );
 
             let mut deleted_count = 0;
+            let mut skipped_count = 0;
             let mut failed_count = 0;
 
             for orphan in &orphans {
                 match self.delete_orphan(orphan).await {
-                    Ok(_) => deleted_count += 1,
+                    Ok(true) => deleted_count += 1,
+                    Ok(false) => skipped_count += 1,
                     Err(e) => {
                         failed_count += 1;
                         error!("Failed to delete orphan {}: {}", orphan.key, e);
@@ -131,9 +133,13 @@ impl<S: Storage + 'static> GarbageCollector<S> {
                 }
             }
 
+            // Skips are reported separately and deliberately: a steady
+            // nonzero `skipped` every pass is the signal that something is
+            // permanently unresolvable (e.g. an owner of a custom kind),
+            // which the old "N deleted" line actively hid.
             info!(
-                "GC orphan deletion complete: {} deleted, {} failed",
-                deleted_count, failed_count
+                "GC orphan deletion complete: {} deleted, {} skipped, {} failed",
+                deleted_count, skipped_count, failed_count
             );
         }
 
@@ -371,23 +377,32 @@ impl<S: Storage + 'static> GarbageCollector<S> {
     ///
     /// We re-read both the dependent (to get fresh ownerRefs) and then look up
     /// each owner by constructing the storage key from the ownerReference fields.
-    async fn delete_orphan(&self, orphan: &ResourceInfo) -> rusternetes_common::Result<()> {
+    /// Returns `Ok(true)` only when this call actually removed the
+    /// resource. Every other `Ok` path is a deliberate skip — already gone,
+    /// unparsable, no owners, an owner of a kind we cannot resolve, an
+    /// owner that still exists, or a storage error we refuse to act on.
+    ///
+    /// The distinction is the whole point: the summary counter previously
+    /// treated skips as deletions, so the log reported "N deleted, 0
+    /// failed" on every pass while deleting nothing, forever. A count that
+    /// includes work not done is worse than no count.
+    async fn delete_orphan(&self, orphan: &ResourceInfo) -> rusternetes_common::Result<bool> {
         // Re-read the resource from storage to get fresh ownerReferences.
         // It may have been updated since the scan snapshot.
         let fresh: Value = match self.storage.get(&orphan.key).await {
             Ok(v) => v,
-            Err(rusternetes_common::Error::NotFound(_)) => return Ok(()), // already gone
+            Err(rusternetes_common::Error::NotFound(_)) => return Ok(false), // already gone
             Err(e) => return Err(e),
         };
         let fresh_meta = match self.extract_metadata(&fresh) {
             Ok(m) => m,
-            Err(_) => return Ok(()), // can't parse metadata, skip
+            Err(_) => return Ok(false), // can't parse metadata, skip
         };
 
         // If ownerReferences were removed (orphan policy processed), skip deletion
         let owner_refs = match &fresh_meta.owner_references {
             Some(refs) if !refs.is_empty() => refs,
-            _ => return Ok(()), // no owners = not an orphan (or already orphaned)
+            _ => return Ok(false), // no owners = not an orphan (or already orphaned)
         };
 
         // For each ownerReference, construct the storage key and check if the owner exists.
@@ -403,7 +418,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
                     "GC: {} has owner of unknown kind '{}', skipping",
                     orphan.key, owner_ref.kind
                 );
-                return Ok(());
+                return Ok(false);
             }
             let owner_key = if let Some(ns) = namespace {
                 format!("/registry/{}/{}/{}", plural, ns, owner_ref.name)
@@ -425,7 +440,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
                                 "GC: {} is NOT orphan — owner {}/{} (uid={}) still exists",
                                 orphan.key, owner_ref.kind, owner_ref.name, uid
                             );
-                            return Ok(());
+                            return Ok(false);
                         }
                         // UID mismatch — the resource was recreated with a different UID.
                         // The old owner is gone, this ownerRef is dangling.
@@ -436,7 +451,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
                 }
                 Err(_) => {
                     // Storage error — be conservative, don't delete
-                    return Ok(());
+                    return Ok(false);
                 }
             }
         }
@@ -446,7 +461,8 @@ impl<S: Storage + 'static> GarbageCollector<S> {
             "Deleting orphaned resource: {} ({}) — all owners verified gone",
             orphan.key, orphan.resource_type
         );
-        self.storage.delete(&orphan.key).await
+        self.storage.delete(&orphan.key).await?;
+        Ok(true)
     }
 
     /// Process deletion for a resource with deletion timestamp

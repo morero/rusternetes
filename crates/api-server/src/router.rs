@@ -483,6 +483,12 @@ async fn custom_resource_fallback(
                         plural.to_string(),
                         namespace.map(|s| s.to_string()),
                     )),
+                    // This site dispatches manually rather than through
+                    // axum's Handler, so the query string has to be parsed
+                    // here — otherwise labelSelector silently never reaches
+                    // the handler on this path, which is exactly the bug
+                    // being fixed.
+                    axum::extract::Query(query_params.clone()),
                     req.headers().clone(),
                 )
                 .await

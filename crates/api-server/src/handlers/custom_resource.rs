@@ -7,7 +7,7 @@
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Extension, Json,
@@ -55,6 +55,18 @@ pub async fn create_custom_resource(
     let mut cr: CustomResource = serde_json::from_slice(&body).map_err(|e| {
         rusternetes_common::Error::InvalidResource(format!("failed to decode: {}", e))
     })?;
+
+    // Names must be RFC 1123 subdomains, exactly as for built-in kinds.
+    // Custom resources skipped this entirely until now, and the failure is a
+    // one-way door rather than a cosmetic one: a name containing a space was
+    // accepted, and the object then became permanently unreachable — the
+    // space percent-encodes on the way out, is not decoded on the way back
+    // in, so every get/delete returns NotFound while the object still shows
+    // up in list output. It cannot be removed through the API at all.
+    //
+    // `validate_resource_name` already existed for this; it was simply never
+    // called here (only `configmap` and `secret` used it).
+    crate::handlers::validation::validate_resource_name(&cr.metadata.name)?;
 
     let cr_name = cr.metadata.name.clone();
     info!(
@@ -422,6 +434,7 @@ pub async fn list_custom_resources(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((group, version, plural, namespace)): Path<(String, String, String, Option<String>)>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<axum::response::Response> {
     debug!("Listing custom resources {}/{}/{}", group, version, plural);
@@ -460,6 +473,17 @@ pub async fn list_custom_resources(
     for cr in &mut crs {
         apply_schema_defaults(&crd, &version, cr);
     }
+
+    // `labelSelector` was ignored entirely for custom resources until now:
+    // this handler never called `filtering::` at all, so a selector was
+    // silently a no-op and every object came back. That is worse than being
+    // unsupported — a selector matching nothing returned everything, so a
+    // query written against it looks like it succeeded. (Built-in kinds
+    // filter correctly; only the CR path was missing it.)
+    //
+    // Applied here, before the table conversion below, so `kubectl get <cr>
+    // -l ...` and a raw JSON list agree.
+    crate::handlers::filtering::apply_label_selector(&mut crs, &params)?;
 
     // Table format (kubectl get <cr>) — use the CRD version's own
     // additionalPrinterColumns when declared, instead of always falling

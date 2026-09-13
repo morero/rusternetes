@@ -1,6 +1,7 @@
 use anyhow::Result;
 use chrono::Utc;
 use futures::StreamExt;
+use rusternetes_common::resources::crd::{CustomResourceDefinition, ResourceScope};
 use rusternetes_common::resources::{Namespace, NamespaceCondition, NamespaceStatus, Pod};
 use rusternetes_common::types::Phase;
 use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
@@ -338,6 +339,37 @@ impl<S: Storage + 'static> NamespaceController<S> {
             "csistoragecapacities",
         ];
 
+        // The list above is every BUILT-IN namespaced kind. Custom resources
+        // are not in it and cannot be: a CRD can be registered at any time,
+        // so there is nothing to hardcode.
+        //
+        // Real Kubernetes solves this with discovery — the namespaced-resource
+        // deleter enumerates every namespaced API resource the server serves
+        // and deletes whatever it finds. Without that step a CRD's objects
+        // simply outlive their own namespace: still readable, still returned
+        // by `get`, owned by a namespace that no longer exists, and collected
+        // by nothing. Observed live with a `Workflow` after a tenant teardown.
+        //
+        // Discovery here reads the registered CRDs and derives each one's
+        // storage prefix the same way the api-server composes it
+        // (`{group with dots as underscores}_{plural}` — see
+        // `api-server/src/handlers/custom_resource.rs`). Cluster-scoped CRDs
+        // are skipped: they do not belong to a namespace.
+        let mut resource_types: Vec<String> =
+            resource_types.into_iter().map(String::from).collect();
+        match self.discover_namespaced_custom_resources().await {
+            Ok(custom) => resource_types.extend(custom),
+            // Deliberately non-fatal: failing to enumerate CRDs must not
+            // block deleting the built-in resources. It is logged loudly
+            // because the consequence is a silent leak of custom objects.
+            Err(e) => warn!(
+                "Namespace {}: could not enumerate custom resource types, \
+                 any custom resources in it will be leaked: {}",
+                name, e
+            ),
+        }
+        let resource_types = resource_types;
+
         // Delete pods first and wait briefly for graceful termination.
         // K8s deletes pods before other resources so pods can access configmaps/secrets
         // during shutdown. We set deletionTimestamp on pods, wait, then delete everything.
@@ -631,6 +663,31 @@ impl<S: Storage + 'static> NamespaceController<S> {
     /// Returns `true` if any resources had finalizers and could not be fully deleted.
     /// Resources with finalizers get a deletionTimestamp set but remain in storage
     /// until their finalizers are removed (matching real K8s behavior).
+    /// Every namespaced custom resource type currently registered, as
+    /// storage prefixes.
+    ///
+    /// The prefix must match how the api-server writes custom resources:
+    /// `{group with '.' replaced by '_'}_{plural}`. Deriving it here rather
+    /// than sharing a helper is a real duplication — noted rather than
+    /// hidden, because if the api-server ever changes that composition this
+    /// silently stops deleting anything and the symptom is a leak, not an
+    /// error.
+    async fn discover_namespaced_custom_resources(&self) -> Result<Vec<String>> {
+        let prefix = build_prefix("customresourcedefinitions", None);
+        let crds: Vec<CustomResourceDefinition> = self.storage.list(&prefix).await?;
+        Ok(crds
+            .into_iter()
+            .filter(|crd| crd.spec.scope == ResourceScope::Namespaced)
+            .map(|crd| {
+                format!(
+                    "{}_{}",
+                    crd.spec.group.replace('.', "_"),
+                    crd.spec.names.plural
+                )
+            })
+            .collect())
+    }
+
     async fn delete_all_resources(&self, namespace: &str, resource_type: &str) -> Result<bool> {
         let prefix = build_prefix(resource_type, Some(namespace));
 
@@ -772,9 +829,25 @@ impl<S: Storage + 'static> NamespaceController<S> {
             "controllerrevisions",
             "podtemplates",
         ];
+        // Custom resources count too. Without them this reports a namespace
+        // as empty while custom objects remain in it, so finalization
+        // proceeds and those objects are stranded — the same leak the
+        // deletion path had, but reached through the "is it safe to
+        // finalize?" question instead.
+        let mut resource_types: Vec<String> =
+            resource_types.into_iter().map(String::from).collect();
+        match self.discover_namespaced_custom_resources().await {
+            Ok(custom) => resource_types.extend(custom),
+            Err(e) => warn!(
+                "Namespace {}: could not enumerate custom resource types while counting \
+                 remaining resources; the count is an undercount: {}",
+                namespace, e
+            ),
+        }
+
         let mut total = 0;
 
-        for resource_type in resource_types {
+        for resource_type in &resource_types {
             let prefix = build_prefix(resource_type, Some(namespace));
             let resources: Vec<serde_json::Value> =
                 self.storage.list(&prefix).await.unwrap_or_default();
