@@ -148,6 +148,10 @@ async fn run() -> Result<()> {
     info!("Starting Rusternetes (all-in-one)");
 
     // Initialize storage — all components share one instance
+    // Refuse a backend this binary cannot actually provide, rather than
+    // letting the match below fall through to etcd and coming up on a
+    // backend nobody asked for (ISSUES.md #66).
+    rusternetes_storage::ensure_backend_compiled_in(&args.storage_backend)?;
     let storage_config = match args.storage_backend.as_str() {
         #[cfg(feature = "sqlite")]
         "sqlite" => {

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use rusternetes_common::authz::AuthzStorage;
-use rusternetes_common::Result;
+use rusternetes_common::{Error, Result};
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::Arc;
 
@@ -130,6 +130,49 @@ impl<S: Storage> Storage for std::sync::Arc<S> {
     async fn is_revision_compacted(&self, revision: i64) -> Result<bool> {
         (**self).is_revision_compacted(revision).await
     }
+}
+
+/// Checks that the storage backend the operator asked for on the command line
+/// is actually compiled into this binary, and returns a usable error if it is
+/// not.
+///
+/// Every binary selects its backend with a `match` whose `sqlite` and `redis`
+/// arms are behind `#[cfg(feature = ...)]`. Without the feature the arm does not
+/// exist, so `--storage-backend sqlite` falls through to the catch-all and the
+/// process comes up on **etcd** — a backend nobody asked for — logging
+/// `Connecting to etcd` as though that had been the request. It then serves
+/// HTTP perfectly happily and fails every single write with
+/// `grpc request error: status: Unavailable, message: "tcp connect error"`,
+/// which names etcd nowhere and reads like a network fault.
+///
+/// The cost of that is not theoretical: it has burned this project twice, once
+/// on the kubelet and once on the api-server, and both times the visible
+/// symptom was several layers away from a `cargo build` that omitted a feature
+/// flag. A binary asked for a backend it cannot provide must say so and exit,
+/// not substitute a different one silently. Being told "sqlite support was not
+/// compiled into this binary" costs one line; discovering it from a gRPC error
+/// costs an afternoon.
+///
+/// Call this before building the `StorageConfig`, so the refusal happens at
+/// startup rather than at the first write.
+pub fn ensure_backend_compiled_in(requested: &str) -> Result<()> {
+    let available = match requested {
+        "sqlite" => cfg!(feature = "sqlite"),
+        "redis" => cfg!(feature = "redis"),
+        // etcd is always compiled in, and an unrecognised name legitimately
+        // falls through to the etcd default — neither is a silent substitution
+        // of something the caller explicitly named.
+        _ => true,
+    };
+    if available {
+        return Ok(());
+    }
+    Err(Error::Internal(format!(
+        "--storage-backend {requested} was requested, but `{requested}` support is not compiled \
+         into this binary. Rebuild it with `cargo build --features {requested}`. Refusing to \
+         start rather than silently falling back to etcd, which would come up, serve requests, \
+         and fail every write with an opaque gRPC connection error."
+    )))
 }
 
 /// Configuration for selecting a storage backend.
