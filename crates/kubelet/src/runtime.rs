@@ -331,6 +331,46 @@ pub(crate) fn token_needs_rotation(token_age: Option<Duration>, expiration_secon
     }
 }
 
+/// Where a container's projected ServiceAccount token is mounted from inside
+/// the container. Kubelet-managed and identical on every pod, which is what
+/// makes it a reliable probe for the check below.
+pub(crate) const SA_TOKEN_MOUNT_DESTINATION: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
+
+/// Whether a running container's ServiceAccount-token bind mount points
+/// somewhere this kubelet does not write — i.e. the container is *stranded*.
+///
+/// `volume_dir` defaults to `{root_dir}/volumes`, and `root_dir` defaults to
+/// `std::env::current_dir()` (`crates/kubelet/src/config.rs`), so the location
+/// of every pod's volumes is decided by whatever directory the kubelet process
+/// was started from. A container's bind mount, by contrast, is baked in at
+/// creation with an *absolute* source. Restart the kubelet from a different
+/// directory and every already-running pod keeps reading a path that nothing
+/// updates any more.
+///
+/// The consequence is specifically nasty because it is silent and delayed: the
+/// kubelet goes on faithfully rotating tokens (into the new path), the
+/// container goes on reading the old one, and an hour later
+/// (`expiration_seconds.unwrap_or(3600)`) that token expires and the
+/// api-server correctly rejects every request the pod makes — forever, with no
+/// restart and no event, because the process is perfectly healthy and is
+/// merely being told no. See ISSUES.md #64; it had already happened three
+/// times on one cluster before anyone noticed.
+///
+/// Pure so the path comparison is testable without Docker or a running pod.
+pub(crate) fn token_mount_is_stranded(mount_source: &str, volumes_base_path: &str) -> bool {
+    let base = volumes_base_path.trim_end_matches('/');
+    if base.is_empty() {
+        // No configured base to compare against — report nothing rather than
+        // flagging every pod on the node. Failing loud is right for a genuine
+        // mismatch; it is not right for "we don't know".
+        return false;
+    }
+    let source = mount_source.trim_end_matches('/');
+    // Prefix match on a path *component* boundary: `/a/volumes` must not be
+    // treated as the parent of `/a/volumes-old/...`.
+    source != base && !source.starts_with(&format!("{base}/"))
+}
+
 /// Write `contents` to `path` only if the file doesn't already hold exactly
 /// those bytes — best-effort, errors on either the read or the write are
 /// silently ignored (matching every other volume-refresh write in this
@@ -7905,6 +7945,66 @@ impl ContainerRuntime {
 
     /// Refresh Secret and ConfigMap volumes for a running pod.
     /// Re-reads the data from storage and overwrites files on disk.
+    /// Report — loudly — when a running pod's ServiceAccount-token mount
+    /// points at a volume root this kubelet does not write to.
+    ///
+    /// This does not repair anything, and deliberately so: the pod's bind
+    /// mounts were fixed when its containers were created and can only be
+    /// changed by recreating them, which is the pod controller's decision and
+    /// not the kubelet's to make silently. What it must not do is stay quiet,
+    /// which is the entire defect in ISSUES.md #64 — the failure is invisible
+    /// (`Running 1/1`, no events, no restarts), delayed by an hour, and
+    /// presents as an unexplained 401 storm in whatever the pod talks to,
+    /// which is nowhere near the cause.
+    ///
+    /// Logged at `error!` rather than `debug!` for the same reason: the
+    /// original instance was found only because someone went looking, and
+    /// every other message on this path is invisible at the `info` level the
+    /// cluster actually runs at.
+    async fn warn_if_pod_volumes_stranded(&self, pod: &Pod, namespace: &str, pod_name: &str) {
+        let Some(spec) = pod.spec.as_ref() else {
+            return;
+        };
+        let Some(container) = spec.containers.first() else {
+            return;
+        };
+        let full_container_name = format!("{}_{}", pod_name, container.name);
+        let Ok(inspect) = self
+            .docker
+            .inspect_container(&full_container_name, None::<InspectContainerOptions>)
+            .await
+        else {
+            // Container not present (starting, or already gone). Absence is
+            // not evidence of a mismatch, so say nothing.
+            return;
+        };
+        let Some(mounts) = inspect.mounts else {
+            return;
+        };
+        for mount in mounts {
+            let (Some(destination), Some(source)) = (&mount.destination, &mount.source) else {
+                continue;
+            };
+            if destination != SA_TOKEN_MOUNT_DESTINATION {
+                continue;
+            }
+            if token_mount_is_stranded(source, &self.volumes_base_path) {
+                error!(
+                    "Pod {}/{} mounts its ServiceAccount token from {}, but this kubelet writes \
+                     volumes under {}. The pod is reading a path nothing updates: its token will \
+                     expire and every API request it makes will fail with 401 while the pod still \
+                     reports Running. This happens when the kubelet is restarted from a different \
+                     working directory than the one the pod's containers were created under — see \
+                     ISSUES.md #64. Recreate the pod (delete it and let its controller replace it) \
+                     to bind it to the current volume root, and start the kubelet with an explicit \
+                     --root-dir so it cannot drift again.",
+                    namespace, pod_name, source, self.volumes_base_path
+                );
+            }
+            return;
+        }
+    }
+
     pub async fn refresh_volumes(&self, pod: &Pod) -> Result<()> {
         let storage = match &self.storage {
             Some(s) => s,
@@ -8066,6 +8166,25 @@ impl ContainerRuntime {
                             let needs_rotation =
                                 token_needs_rotation(token_age, expiration_seconds);
                             if needs_rotation {
+                                // Before rotating, check the pod is actually
+                                // reading the path we are about to write. If
+                                // the kubelet was restarted from a different
+                                // working directory than the one this pod's
+                                // containers were created under, it is not:
+                                // the bind mount is baked in with an absolute
+                                // source and still points at the old volume
+                                // root. Rotation then succeeds forever while
+                                // the pod's token quietly expires — ISSUES.md
+                                // #64, which went unnoticed through three
+                                // different volume roots on one cluster.
+                                //
+                                // Deliberately inside the rotation branch:
+                                // this runs at ~80% of the token's TTL (~48
+                                // min/pod), not on the 3-second sync path,
+                                // where an added Docker round-trip per pod is
+                                // exactly the cost ISSUES.md #52 removed.
+                                self.warn_if_pod_volumes_stranded(pod, namespace, pod_name)
+                                    .await;
                                 if let Some(parent) = std::path::Path::new(&token_path).parent() {
                                     let _ = std::fs::create_dir_all(parent);
                                 }
@@ -8601,7 +8720,11 @@ impl ContainerRuntime {
         for (pod_name, containers_by_name) in &exited_by_pod {
             // For pods still in etcd, keep 1 dead container for log access.
             // For deleted pods, remove ALL dead containers.
-            let keep_count = if existing_pods.contains(pod_name) { 1 } else { 0 };
+            let keep_count = if existing_pods.contains(pod_name) {
+                1
+            } else {
+                0
+            };
             for exited in containers_by_name.values() {
                 let mut exited = exited.clone();
                 // Sort by created time descending — keep the newest
@@ -8633,7 +8756,10 @@ impl ContainerRuntime {
             // unconditionally, so a failed pod's logs became unavailable
             // within the same GC pass they were supposed to survive (see
             // ISSUES.md).
-            if should_fully_cleanup_pod(pods_with_running.contains(pod_name), existing_pods.contains(pod_name)) {
+            if should_fully_cleanup_pod(
+                pods_with_running.contains(pod_name),
+                existing_pods.contains(pod_name),
+            ) {
                 for exited in containers_by_name.values() {
                     let mut exited = exited.clone();
                     exited.sort_by(|a, b| b.1.cmp(&a.1));
@@ -8900,7 +9026,7 @@ mod tests {
     use super::{
         apply_fsgroup_to_path, bound_pv_name, effective_probe_host, effective_sub_path_expr,
         effective_termination_message_path, security_opts_for, should_fully_cleanup_pod,
-        token_needs_rotation, write_file_if_changed, ContainerRuntime,
+        token_mount_is_stranded, token_needs_rotation, write_file_if_changed, ContainerRuntime,
     };
     use rusternetes_common::resources::pod::PodSecurityContext as PodLevelSecurityContext;
     use rusternetes_common::resources::{
@@ -8946,6 +9072,63 @@ mod tests {
     fn token_needs_rotation_false_for_a_fresh_token() {
         assert!(!token_needs_rotation(Some(Duration::from_secs(0)), 3600));
         assert!(!token_needs_rotation(Some(Duration::from_secs(60)), 3600));
+    }
+
+    #[test]
+    fn token_mount_under_the_configured_base_is_not_stranded() {
+        assert!(!token_mount_is_stranded(
+            "/srv/rinr/.rinr/integration/volumes/my-pod/kube-api-access",
+            "/srv/rinr/.rinr/integration/volumes"
+        ));
+    }
+
+    /// The exact shape of ISSUES.md #64: three volume roots were found on one
+    /// cluster, each left behind by starting the kubelet from a different
+    /// working directory.
+    #[test]
+    fn token_mount_under_a_different_root_is_stranded() {
+        let base = "/srv/rinr/vendor/rusternetes/volumes";
+        for stranded in [
+            "/srv/rinr/volumes/my-pod/kube-api-access",
+            "/srv/rinr/operators/volumes/my-pod/kube-api-access",
+        ] {
+            assert!(
+                token_mount_is_stranded(stranded, base),
+                "{stranded} should be stranded relative to {base}"
+            );
+        }
+    }
+
+    /// A sibling directory sharing a textual prefix is a *different* root. A
+    /// naive `starts_with` would call this one healthy and let the pod die
+    /// exactly as quietly as before.
+    #[test]
+    fn a_prefix_sharing_sibling_root_is_still_stranded() {
+        assert!(token_mount_is_stranded(
+            "/srv/rinr/volumes-old/my-pod/kube-api-access",
+            "/srv/rinr/volumes"
+        ));
+    }
+
+    #[test]
+    fn a_trailing_slash_on_either_side_does_not_create_a_false_alarm() {
+        assert!(!token_mount_is_stranded(
+            "/srv/rinr/volumes/my-pod/",
+            "/srv/rinr/volumes/"
+        ));
+        assert!(!token_mount_is_stranded(
+            "/srv/rinr/volumes",
+            "/srv/rinr/volumes/"
+        ));
+    }
+
+    /// "We don't know where we write" must not become "every pod on this node
+    /// is broken". Reporting nothing is right when there is nothing to compare
+    /// against; it is only silence about a *real* mismatch that is the bug.
+    #[test]
+    fn an_empty_configured_base_reports_nothing() {
+        assert!(!token_mount_is_stranded("/anywhere/at/all", ""));
+        assert!(!token_mount_is_stranded("/anywhere/at/all", "/"));
     }
 
     #[test]
