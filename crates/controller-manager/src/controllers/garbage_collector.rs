@@ -580,7 +580,47 @@ impl<S: Storage + 'static> GarbageCollector<S> {
             }
         }
 
-        // All owners verified as gone — this is truly an orphan
+        // All owners verified as gone — this is truly an orphan.
+        //
+        // But an orphan with finalizers is not ours to hard-delete. A finalizer
+        // is a controller's declaration that it has external state to clean up
+        // first, and deleting the object straight out of storage skips that
+        // entirely: `release-operator`'s binding-target cleanup,
+        // `tenant-operator`'s teardown guard and `workflow-operator`'s runner-Job
+        // cleanup all hang off finalizers and simply never run when the GC is
+        // the one doing the deleting. The object vanishes and whatever it owned
+        // elsewhere is stranded, silently.
+        //
+        // Real Kubernetes sets `deletionTimestamp` and waits for the owning
+        // controller to clear its finalizer. So does the foreground-deletion
+        // path a few hundred lines below — this one just never learned to. Mark
+        // it and report "not deleted this pass"; a later scan finds it with no
+        // finalizers left and removes it.
+        if let Ok(meta) = self.extract_metadata(&fresh) {
+            if meta.has_finalizers() {
+                if meta.deletion_timestamp.is_none() {
+                    info!(
+                        "Orphaned resource {} has finalizers {:?} — marking for deletion rather \
+                         than deleting it out from under them",
+                        orphan.key, meta.finalizers
+                    );
+                    let mut marked = fresh.clone();
+                    if let Some(metadata) = marked.get_mut("metadata") {
+                        metadata["deletionTimestamp"] = serde_json::Value::String(
+                            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        );
+                    }
+                    self.storage.update_raw(&orphan.key, &marked).await?;
+                } else {
+                    debug!(
+                        "Orphaned resource {} still has finalizers {:?}, waiting",
+                        orphan.key, meta.finalizers
+                    );
+                }
+                return Ok(false);
+            }
+        }
+
         info!(
             "Deleting orphaned resource: {} ({}) — all owners verified gone",
             orphan.key, orphan.resource_type
