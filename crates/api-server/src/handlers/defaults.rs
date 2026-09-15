@@ -14,20 +14,42 @@ use rusternetes_common::resources::workloads::{
 /// K8s ref: pkg/apis/apps/v1/defaults.go
 use rusternetes_common::resources::PodSpec;
 
+/// Whether an optional string field counts as *unset* for defaulting purposes.
+///
+/// `None` and `Some("")` both mean unset, and conflating them is not pedantry:
+/// Kubernetes' own defaulting compares against the empty string
+/// (`if obj.RestartPolicy == ""`), because a Go client serializing an
+/// undefaulted PodSpec over **protobuf** emits empty strings for unset
+/// value-type fields rather than omitting them. A defaulter that only checks
+/// `is_none()` therefore defaults correctly for JSON clients and silently skips
+/// every protobuf one.
+///
+/// That is not theoretical. CloudNativePG creates its instance pods over
+/// protobuf, and every string field Kubernetes would have defaulted arrived as
+/// `""` and stayed `""` — including `restartPolicy`. The kubelet's
+/// exit-detection branch matches on `"Always" | "OnFailure"`, and `""` matches
+/// neither, so when the postgres container exited cleanly nothing restarted it
+/// and nothing updated its status: the API reported `running` for nine hours
+/// while the container was gone. Every other pod in that cluster was fine,
+/// because nothing else spoke protobuf.
+fn is_unset(field: &Option<String>) -> bool {
+    field.as_deref().map_or(true, str::is_empty)
+}
+
 /// Apply K8s defaults to a PodSpec.
 /// Matches SetDefaults_PodSpec from pkg/apis/core/v1/defaults.go
 pub fn apply_pod_spec_defaults(spec: &mut PodSpec) {
     // K8s: SetDefaults_PodSpec
-    if spec.dns_policy.is_none() {
+    if is_unset(&spec.dns_policy) {
         spec.dns_policy = Some("ClusterFirst".to_string());
     }
-    if spec.restart_policy.is_none() {
+    if is_unset(&spec.restart_policy) {
         spec.restart_policy = Some("Always".to_string());
     }
     if spec.termination_grace_period_seconds.is_none() {
         spec.termination_grace_period_seconds = Some(30);
     }
-    if spec.scheduler_name.is_none() {
+    if is_unset(&spec.scheduler_name) {
         spec.scheduler_name = Some("default-scheduler".to_string());
     }
     // K8s defaults securityContext to empty struct (not nil).
@@ -52,13 +74,13 @@ pub fn apply_pod_spec_defaults(spec: &mut PodSpec) {
 /// Apply K8s defaults to a Container.
 /// Matches SetDefaults_Container from pkg/apis/core/v1/defaults.go
 fn apply_container_defaults(container: &mut rusternetes_common::resources::Container) {
-    if container.termination_message_path.is_none() {
+    if is_unset(&container.termination_message_path) {
         container.termination_message_path = Some("/dev/termination-log".to_string());
     }
-    if container.termination_message_policy.is_none() {
+    if is_unset(&container.termination_message_policy) {
         container.termination_message_policy = Some("File".to_string());
     }
-    if container.image_pull_policy.is_none() {
+    if is_unset(&container.image_pull_policy) {
         if container.image.contains(":latest") || !container.image.contains(':') {
             container.image_pull_policy = Some("Always".to_string());
         } else {

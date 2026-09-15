@@ -2867,7 +2867,39 @@ impl Kubelet {
                     // - Always: restart all terminated containers
                     // - OnFailure: restart containers that exited with non-zero code
                     // See: pkg/kubelet/kubelet.go — syncPod() → computePodActions()
-                    if restart_policy == "Always" || restart_policy == "OnFailure" {
+                    //
+                    // Tested by exclusion rather than by inclusion, deliberately.
+                    // By the time a pod reaches a kubelet the api-server has
+                    // defaulted `restartPolicy`, so the only values that should
+                    // exist are the three below and anything else is a bug
+                    // upstream of here. Matching `== "Always" || == "OnFailure"`
+                    // turned such a bug into *silence*: an empty string matched
+                    // neither arm, so terminated containers were never detected,
+                    // never restarted, and their status was never updated — the
+                    // api-server reported `running` for nine hours while the
+                    // container was gone (a protobuf client's undefaulted spec,
+                    // see `api-server/src/handlers/defaults.rs`'s `is_unset`).
+                    // Failing towards "restart it" is both real kubelet
+                    // semantics after defaulting and the safe direction: the
+                    // worst case is restarting a pod that meant `Never`, which
+                    // is visible, rather than silently abandoning one that meant
+                    // `Always`, which is not.
+                    let restarts_terminated_containers = restart_policy != "Never";
+                    if restart_policy != "Always"
+                        && restart_policy != "OnFailure"
+                        && restart_policy != "Never"
+                    {
+                        warn!(
+                            "Pod {}/{} has restartPolicy {:?}, which is not one of \
+                             Always/OnFailure/Never — treating it as Always. This means it \
+                             reached the kubelet undefaulted; check the api-server's PodSpec \
+                             defaulting for the client that created it.",
+                            pod.metadata.namespace.as_deref().unwrap_or("default"),
+                            pod.metadata.name,
+                            restart_policy
+                        );
+                    }
+                    if restarts_terminated_containers {
                         let any_terminated = self.runtime.has_terminated_containers(pod).await;
                         if any_terminated {
                             // Need full container statuses for restart count tracking
