@@ -2600,24 +2600,24 @@ impl ProtoRegistry {
                     ),
                 ),
                 (
-                    24,
+                    23,
                     (
                         "hostAliases".into(),
                         FieldType::Repeated(Box::new(FieldType::Message("HostAlias".into()))),
                     ),
                 ),
-                (25, ("priorityClassName".into(), FieldType::String)),
-                (26, ("priority".into(), FieldType::Int)),
+                (24, ("priorityClassName".into(), FieldType::String)),
+                (25, ("priority".into(), FieldType::Int)),
                 (
-                    27,
+                    26,
                     (
                         "dnsConfig".into(),
                         FieldType::Message("PodDNSConfig".into()),
                     ),
                 ),
-                (28, ("shareProcessNamespace".into(), FieldType::Bool)),
+                (27, ("shareProcessNamespace".into(), FieldType::Bool)),
                 (
-                    29,
+                    28,
                     (
                         "readinessGates".into(),
                         FieldType::Repeated(Box::new(FieldType::Message(
@@ -2625,9 +2625,9 @@ impl ProtoRegistry {
                         ))),
                     ),
                 ),
-                (30, ("runtimeClassName".into(), FieldType::String)),
+                (29, ("runtimeClassName".into(), FieldType::String)),
                 (32, ("overhead".into(), FieldType::QuantityMap)),
-                (33, ("enableServiceLinks".into(), FieldType::Bool)),
+                (30, ("enableServiceLinks".into(), FieldType::Bool)),
                 (
                     34,
                     (
@@ -2636,7 +2636,7 @@ impl ProtoRegistry {
                     ),
                 ),
                 (
-                    35,
+                    33,
                     (
                         "topologySpreadConstraints".into(),
                         FieldType::Repeated(Box::new(FieldType::Message(
@@ -2644,8 +2644,8 @@ impl ProtoRegistry {
                         ))),
                     ),
                 ),
-                (36, ("setHostnameAsFQDN".into(), FieldType::Bool)),
-                (37, ("os".into(), FieldType::Message("PodOS".into()))),
+                (35, ("setHostnameAsFQDN".into(), FieldType::Bool)),
+                (36, ("os".into(), FieldType::Message("PodOS".into()))),
                 (
                     39,
                     (
@@ -2656,7 +2656,7 @@ impl ProtoRegistry {
                     ),
                 ),
                 (
-                    40,
+                    38,
                     (
                         "schedulingGates".into(),
                         FieldType::Repeated(Box::new(FieldType::Message(
@@ -3974,6 +3974,60 @@ impl ProtoRegistry {
 
 #[cfg(test)]
 mod tests {
+    /// PodSpec protobuf field numbers, pinned against upstream
+    /// `kubernetes/api/core/v1/generated.proto`.
+    ///
+    /// These are wire-format identity: a protobuf client sends field *numbers*,
+    /// not names, so a number that disagrees with upstream silently decodes one
+    /// field as another or drops it entirely. Nothing else in this codebase can
+    /// catch that — the result is a structurally valid object with the wrong
+    /// contents, which is exactly the failure mode that made the `restartPolicy`
+    /// outage (ISSUES.md #69) take seventeen hours to notice.
+    ///
+    /// The schema was wrong from field 23 onward: `hostAliases` was numbered 24,
+    /// and everything after it shifted. `hostAliases` is not an arbitrary
+    /// example — this harness has no CoreDNS, so it pins database and identity
+    /// addresses through exactly that field.
+    #[test]
+    fn pod_spec_field_numbers_match_upstream() {
+        let schema = super::ProtoRegistry::pod_spec_schema();
+        // Only the fields whose numbering was verified against upstream. A
+        // partial pin that is correct beats a complete one that is guessed.
+        for (number, name) in [
+            (1u32, "volumes"),
+            (2, "containers"),
+            (3, "restartPolicy"),
+            (6, "dnsPolicy"),
+            (20, "initContainers"),
+            (22, "tolerations"),
+            (23, "hostAliases"),
+            (24, "priorityClassName"),
+            (25, "priority"),
+            (26, "dnsConfig"),
+            (27, "shareProcessNamespace"),
+            (28, "readinessGates"),
+            (29, "runtimeClassName"),
+            (30, "enableServiceLinks"),
+            (32, "overhead"),
+            (33, "topologySpreadConstraints"),
+            (34, "ephemeralContainers"),
+            (35, "setHostnameAsFQDN"),
+            (36, "os"),
+            (38, "schedulingGates"),
+            (39, "resourceClaims"),
+        ] {
+            let actual = schema.fields
+                .get(&number)
+                .unwrap_or_else(|| panic!("PodSpec field {number} ({name}) is missing"));
+            assert_eq!(
+                actual.0, name,
+                "PodSpec field {number} should be {name}, found {}",
+                actual.0
+            );
+        }
+    }
+
+
     use super::*;
 
     #[test]

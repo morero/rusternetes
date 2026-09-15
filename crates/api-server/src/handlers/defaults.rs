@@ -369,7 +369,6 @@ mod tests {
     use super::*;
     use rusternetes_common::resources::{Container, PodSpec, PodTemplateSpec};
 
-    #[test]
     /// The exact value that cost seventeen hours: `""` from a protobuf client's
     /// undefaulted spec. It must never reach storage — and after defaulting it
     /// cannot, because `is_unset` turns it into `Always` first. This asserts the
