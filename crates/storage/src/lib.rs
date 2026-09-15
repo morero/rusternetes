@@ -132,47 +132,36 @@ impl<S: Storage> Storage for std::sync::Arc<S> {
     }
 }
 
-/// Checks that the storage backend the operator asked for on the command line
-/// is actually compiled into this binary, and returns a usable error if it is
-/// not.
+/// The error a binary returns when it was asked for a storage backend it has no
+/// compiled-in support for.
 ///
-/// Every binary selects its backend with a `match` whose `sqlite` and `redis`
-/// arms are behind `#[cfg(feature = ...)]`. Without the feature the arm does not
-/// exist, so `--storage-backend sqlite` falls through to the catch-all and the
-/// process comes up on **etcd** — a backend nobody asked for — logging
-/// `Connecting to etcd` as though that had been the request. It then serves
-/// HTTP perfectly happily and fails every single write with
-/// `grpc request error: status: Unavailable, message: "tcp connect error"`,
-/// which names etcd nowhere and reads like a network fault.
+/// **This is a message builder, not a check, and that distinction is the whole
+/// point.** The check has to happen in the *binary*, because that is where the
+/// `#[cfg(feature = ...)]` match arms live. An earlier version did the check
+/// here with `cfg!(feature = "sqlite")` — which evaluates against the **storage
+/// crate's** features, not the caller's. Cargo unifies features across a
+/// workspace build, so storage could have `sqlite` enabled while the binary did
+/// not: the guard answered "available", the match arm was absent, and the
+/// process came up on etcd exactly as before. The guard was inert against the
+/// build shape it was written for.
 ///
-/// The cost of that is not theoretical: it has burned this project twice, once
-/// on the kubelet and once on the api-server, and both times the visible
-/// symptom was several layers away from a `cargo build` that omitted a feature
-/// flag. A binary asked for a backend it cannot provide must say so and exit,
-/// not substitute a different one silently. Being told "sqlite support was not
-/// compiled into this binary" costs one line; discovering it from a gRPC error
-/// costs an afternoon.
+/// It was worse for `redis`. Five of the six binaries forward a `redis` feature
+/// but have no `redis` match arm at all, so with that feature on the old guard
+/// actively sanctioned the silent substitution it existed to prevent —
+/// reproduced directly: `scheduler` built `--features redis` and asked for
+/// `--storage-backend redis` used to start on etcd, and now refuses.
 ///
-/// Call this before building the `StorageConfig`, so the refusal happens at
-/// startup rather than at the first write.
-pub fn ensure_backend_compiled_in(requested: &str) -> Result<()> {
-    let available = match requested {
-        "sqlite" => cfg!(feature = "sqlite"),
-        "redis" => cfg!(feature = "redis"),
-        // etcd is always compiled in, and an unrecognised name legitimately
-        // falls through to the etcd default — neither is a silent substitution
-        // of something the caller explicitly named.
-        _ => true,
-    };
-    if available {
-        return Ok(());
-    }
-    Err(Error::Internal(format!(
-        "--storage-backend {requested} was requested, but `{requested}` support is not compiled \
-         into this binary. Rebuild it with `cargo build --features {requested}`. Refusing to \
-         start rather than silently falling back to etcd, which would come up, serve requests, \
-         and fail every write with an opaque gRPC connection error."
-    )))
+/// Each binary decides for itself, in its own catch-all arm, and calls this only
+/// to phrase the refusal — so the answer cannot disagree with the code that
+/// implements it.
+pub fn backend_not_compiled_in(requested: &str) -> Error {
+    Error::Internal(format!(
+        "--storage-backend {requested} was requested, but this binary has no compiled-in support \
+         for it. Rebuild it with `cargo build --features {requested}` (and check that this \
+         binary implements that backend at all). Refusing to start rather than silently falling \
+         back to etcd, which would come up, serve requests, and fail every write with an opaque \
+         gRPC connection error."
+    ))
 }
 
 /// Configuration for selecting a storage backend.

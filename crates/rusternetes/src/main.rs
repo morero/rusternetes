@@ -148,10 +148,6 @@ async fn run() -> Result<()> {
     info!("Starting Rusternetes (all-in-one)");
 
     // Initialize storage — all components share one instance
-    // Refuse a backend this binary cannot actually provide, rather than
-    // letting the match below fall through to etcd and coming up on a
-    // backend nobody asked for (ISSUES.md #66).
-    rusternetes_storage::ensure_backend_compiled_in(&args.storage_backend)?;
     let storage_config = match args.storage_backend.as_str() {
         #[cfg(feature = "sqlite")]
         "sqlite" => {
@@ -176,7 +172,16 @@ async fn run() -> Result<()> {
                 url: args.redis_url,
             }
         }
+        // This binary already refused rather than falling through to etcd, which
+        // is the important half. What it could not do was say WHY: with the
+        // feature off, `--storage-backend sqlite` reported "Unknown storage
+        // backend: sqlite. Use 'sqlite', 'etcd', or 'redis'." — naming the value
+        // as both invalid and valid in one sentence. The two cases need
+        // different answers: rebuild with a feature, versus fix your spelling.
         other => {
+            if matches!(other, "sqlite" | "redis") {
+                return Err(rusternetes_storage::backend_not_compiled_in(other).into());
+            }
             anyhow::bail!(
                 "Unknown storage backend: {}. Use 'sqlite', 'etcd', or 'redis'.",
                 other

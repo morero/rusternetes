@@ -55,10 +55,6 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::fmt().with_max_level(level).init();
 
-    // Refuse a backend this binary cannot actually provide, rather than
-    // letting the match below fall through to etcd and coming up on a
-    // backend nobody asked for (ISSUES.md #66).
-    rusternetes_storage::ensure_backend_compiled_in(&args.storage_backend)?;
     let storage_config = match args.storage_backend.as_str() {
         #[cfg(feature = "sqlite")]
         "sqlite" => {
@@ -67,7 +63,16 @@ async fn main() -> Result<()> {
                 path: args.data_dir,
             }
         }
-        _ => {
+        // Reached only when no cfg-gated arm above matched. An explicitly named
+        // backend landing here means this binary has no compiled-in support for
+        // it, and falling through to etcd would be the silent substitution
+        // ISSUES.md #66 exists to prevent — so refuse instead. Decided here, in
+        // the binary, because this is where the `#[cfg(feature = ...)]` arms
+        // live; asking the storage crate answered about the wrong crate.
+        other => {
+            if matches!(other, "sqlite" | "redis") {
+                return Err(rusternetes_storage::backend_not_compiled_in(other).into());
+            }
             let endpoints: Vec<String> = args
                 .etcd_servers
                 .split(',')
