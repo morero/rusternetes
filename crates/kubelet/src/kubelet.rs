@@ -191,6 +191,29 @@ fn is_transient_volume_wait_error(err_msg: &str) -> bool {
         || (err_msg.contains("PersistentVolume") && err_msg.contains("not found"))
 }
 
+/// The restart policy to actually act on, normalised.
+///
+/// Returns one of exactly `"Never"`, `"OnFailure"`, `"Always"`. Anything else —
+/// absent, empty, or unrecognised — becomes `"Always"`, which is both real
+/// kubelet behaviour after api-server defaulting and the safe direction: the
+/// worst case is restarting a pod that meant `Never`, which is visible, rather
+/// than abandoning one that meant `Always`, which is not.
+///
+/// This exists because the raw value was compared against string literals at two
+/// separate sites, and an empty string matched no arm at either — falling into a
+/// silent `_ => {}`. A protobuf client's undefaulted PodSpec sends `""` for unset
+/// value-type fields (see the api-server's `is_unset`), so `platform-db-cluster-1`
+/// sat at `phase: Running` with both containers `Exited (0)` for sixteen hours:
+/// no restart, no status update, no log line. Normalising once means a new
+/// comparison site cannot reintroduce that.
+pub(crate) fn effective_restart_policy(raw: Option<&str>) -> &'static str {
+    match raw {
+        Some("Never") => "Never",
+        Some("OnFailure") => "OnFailure",
+        _ => "Always",
+    }
+}
+
 impl Kubelet {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
@@ -2747,11 +2770,10 @@ impl Kubelet {
                 // Check if all spec containers have terminated (pause container may still be running).
                 // This must happen before liveness probes, which may error on exited containers.
                 {
-                    let restart_policy = pod
-                        .spec
-                        .as_ref()
-                        .and_then(|s| s.restart_policy.as_deref())
-                        .unwrap_or("Always");
+                    let restart_policy =
+                        effective_restart_policy(pod.spec.as_ref().and_then(|s| {
+                            s.restart_policy.as_deref()
+                        }));
 
                     if restart_policy == "Never" || restart_policy == "OnFailure" {
                         if let Ok(container_statuses) =
@@ -2868,38 +2890,10 @@ impl Kubelet {
                     // - OnFailure: restart containers that exited with non-zero code
                     // See: pkg/kubelet/kubelet.go — syncPod() → computePodActions()
                     //
-                    // Tested by exclusion rather than by inclusion, deliberately.
-                    // By the time a pod reaches a kubelet the api-server has
-                    // defaulted `restartPolicy`, so the only values that should
-                    // exist are the three below and anything else is a bug
-                    // upstream of here. Matching `== "Always" || == "OnFailure"`
-                    // turned such a bug into *silence*: an empty string matched
-                    // neither arm, so terminated containers were never detected,
-                    // never restarted, and their status was never updated — the
-                    // api-server reported `running` for nine hours while the
-                    // container was gone (a protobuf client's undefaulted spec,
-                    // see `api-server/src/handlers/defaults.rs`'s `is_unset`).
-                    // Failing towards "restart it" is both real kubelet
-                    // semantics after defaulting and the safe direction: the
-                    // worst case is restarting a pod that meant `Never`, which
-                    // is visible, rather than silently abandoning one that meant
-                    // `Always`, which is not.
-                    let restarts_terminated_containers = restart_policy != "Never";
-                    if restart_policy != "Always"
-                        && restart_policy != "OnFailure"
-                        && restart_policy != "Never"
-                    {
-                        warn!(
-                            "Pod {}/{} has restartPolicy {:?}, which is not one of \
-                             Always/OnFailure/Never — treating it as Always. This means it \
-                             reached the kubelet undefaulted; check the api-server's PodSpec \
-                             defaulting for the client that created it.",
-                            pod.metadata.namespace.as_deref().unwrap_or("default"),
-                            pod.metadata.name,
-                            restart_policy
-                        );
-                    }
-                    if restarts_terminated_containers {
+                    // `restart_policy` is already normalised by
+                    // `effective_restart_policy`, so these two comparisons now
+                    // cover every possible value.
+                    if restart_policy == "Always" || restart_policy == "OnFailure" {
                         let any_terminated = self.runtime.has_terminated_containers(pod).await;
                         if any_terminated {
                             // Need full container statuses for restart count tracking
@@ -3575,11 +3569,10 @@ impl Kubelet {
             }
             Phase::Running if !is_running => {
                 // Containers have stopped — decide based on restart policy
-                let restart_policy = pod
-                    .spec
-                    .as_ref()
-                    .and_then(|s| s.restart_policy.as_deref())
-                    .unwrap_or("Always");
+                let restart_policy =
+                    effective_restart_policy(pod.spec.as_ref().and_then(|s| {
+                        s.restart_policy.as_deref()
+                    }));
 
                 let container_statuses = self.runtime.get_container_statuses(pod).await.ok();
                 let any_failed = container_statuses
@@ -4468,6 +4461,38 @@ mod tests {
     // termination — this is what stopped restart_count from climbing into
     // the hundreds within one backoff window. See
     // `container_termination_already_recorded`.
+    /// The value that caused `platform-db-cluster-1` to sit at `phase: Running`
+    /// with both containers `Exited (0)` for sixteen hours. A protobuf client's
+    /// undefaulted PodSpec sends `""`, which matched no arm at either
+    /// comparison site and fell into a silent `_ => {}`.
+    #[test]
+    fn an_empty_restart_policy_is_treated_as_always() {
+        assert_eq!(super::effective_restart_policy(Some("")), "Always");
+    }
+
+    #[test]
+    fn an_absent_restart_policy_is_treated_as_always() {
+        assert_eq!(super::effective_restart_policy(None), "Always");
+    }
+
+    /// Anything unrecognised also restarts. Failing towards "restart it" is the
+    /// safe direction: restarting a pod that meant Never is visible, abandoning
+    /// one that meant Always is not.
+    #[test]
+    fn an_unrecognised_restart_policy_is_treated_as_always() {
+        assert_eq!(super::effective_restart_policy(Some("Sometimes")), "Always");
+        assert_eq!(super::effective_restart_policy(Some("always")), "Always");
+    }
+
+    /// The three legal values must pass through untouched — normalising must not
+    /// quietly turn Never into Always for a pod that genuinely meant it.
+    #[test]
+    fn the_three_legal_restart_policies_are_preserved() {
+        assert_eq!(super::effective_restart_policy(Some("Never")), "Never");
+        assert_eq!(super::effective_restart_policy(Some("OnFailure")), "OnFailure");
+        assert_eq!(super::effective_restart_policy(Some("Always")), "Always");
+    }
+
     #[test]
     fn test_termination_already_recorded_when_container_id_and_ready_match() {
         let existing = vec![make_terminated_container_status("app", "abc123", 3, false)];
