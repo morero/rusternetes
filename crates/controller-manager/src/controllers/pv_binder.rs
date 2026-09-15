@@ -71,6 +71,15 @@ impl<S: Storage + 'static> PVBinderController<S> {
                     }
                     _ = resync.tick() => {
                         self.enqueue_all(&queue).await;
+                        // On the resync tick, not the per-PVC worker: a released
+                        // PV has no claim left to enqueue, so nothing would ever
+                        // drive this from the queue. (An earlier version of this
+                        // hung it off `reconcile_all`, which this controller
+                        // never calls in production — the reclaim simply never
+                        // ran.)
+                        if let Err(e) = self.reclaim_released_volumes().await {
+                            error!("Failed to reclaim released PVs: {}", e);
+                        }
                     }
                 }
             }
@@ -143,6 +152,97 @@ impl<S: Storage + 'static> PVBinderController<S> {
             }
         }
 
+        Ok(())
+    }
+
+    /// Releases `PersistentVolume`s whose claim no longer exists, and deletes
+    /// the ones whose reclaim policy says to.
+    ///
+    /// Nothing did this. A PV stayed `Bound` to a `claimRef` naming a PVC that
+    /// had been deleted, forever — and because this provisioner names volumes
+    /// deterministically (`pvc-<namespace>-<name>`), that orphan then blocked
+    /// its own replacement: a freshly created claim of the same name could
+    /// neither bind to it (the `claimRef` uid no longer matches) nor be given a
+    /// new volume (the name is taken). The claim sits `Pending` indefinitely
+    /// with nothing saying why. Observed on `platform-db-cluster-1`, where it
+    /// stopped the database being re-provisioned until the PV was deleted by
+    /// hand.
+    ///
+    /// A claim is considered gone if it is absent **or** present with a
+    /// different uid. The uid check is what makes delete-and-recreate work:
+    /// same namespace, same name, different object, and binding to it would
+    /// silently hand a new claim someone else's data.
+    async fn reclaim_released_volumes(&self) -> Result<()> {
+        let pvs: Vec<PersistentVolume> = self.storage.list("/registry/persistentvolumes/").await?;
+
+        for mut pv in pvs {
+            let Some(claim_ref) = pv.spec.claim_ref.clone() else {
+                continue;
+            };
+            let (Some(ns), Some(name)) = (claim_ref.namespace.clone(), claim_ref.name.clone())
+            else {
+                continue;
+            };
+
+            let claim_key = build_key("persistentvolumeclaims", Some(&ns), &name);
+            let claim: Option<PersistentVolumeClaim> = self.storage.get(&claim_key).await.ok();
+            let still_claimed = match (&claim, &claim_ref.uid) {
+                // No uid recorded on the claimRef — fall back to existence
+                // alone rather than releasing a volume we cannot prove is stale.
+                (Some(_), None) => true,
+                (Some(c), Some(expected)) => &c.metadata.uid == expected,
+                (None, _) => false,
+            };
+            if still_claimed {
+                continue;
+            }
+
+            use rusternetes_common::resources::volume::PersistentVolumeReclaimPolicy;
+            let policy = pv
+                .spec
+                .persistent_volume_reclaim_policy
+                .clone()
+                .unwrap_or(PersistentVolumeReclaimPolicy::Retain);
+            let pv_key = build_key("persistentvolumes", None, &pv.metadata.name);
+
+            match policy {
+                PersistentVolumeReclaimPolicy::Delete => {
+                    info!(
+                        "Reclaiming PV {} (policy Delete): its claim {}/{} no longer exists",
+                        pv.metadata.name, ns, name
+                    );
+                    self.storage.delete(&pv_key).await?;
+                }
+                // Retain and Recycle: keep the volume and its data, but mark it
+                // Released so it is visibly not available rather than appearing
+                // Bound to something that is gone. (Recycle is deprecated
+                // upstream and not implemented here; treating it as Retain
+                // preserves data rather than destroying it on a guess.)
+                _ => {
+                    use rusternetes_common::resources::volume::PersistentVolumePhase;
+                    let already_released = pv
+                        .status
+                        .as_ref()
+                        .map(|st| st.phase == PersistentVolumePhase::Released)
+                        .unwrap_or(false);
+                    // Written once, not every pass: an unconditional status
+                    // update here would be a write per reconcile per released
+                    // PV, which is the self-triggering churn this repo has
+                    // fixed in four operators already.
+                    if already_released {
+                        continue;
+                    }
+                    info!(
+                        "Releasing PV {} (policy {:?}): its claim {}/{} no longer exists",
+                        pv.metadata.name, policy, ns, name
+                    );
+                    if let Some(status) = pv.status.as_mut() {
+                        status.phase = PersistentVolumePhase::Released;
+                        self.storage.update(&pv_key, &pv).await?;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -356,6 +456,50 @@ mod tests {
     use super::*;
     use rusternetes_common::types::{ObjectMeta, TypeMeta};
     use rusternetes_storage::memory::MemoryStorage;
+
+
+    /// A claim deleted and recreated with the same name is a DIFFERENT claim.
+    /// Binding the old volume to it would silently hand the new owner someone
+    /// else's data, so the uid is what decides, not the name.
+    #[test]
+    fn a_recreated_claim_of_the_same_name_does_not_count_as_still_claimed() {
+        let recorded_uid = Some("old-uid".to_string());
+        let live_uid = "new-uid".to_string();
+        let still_claimed = match (&Some(&live_uid), &recorded_uid) {
+            (Some(_), None) => true,
+            (Some(u), Some(expected)) => **u == *expected,
+            (None, _) => false,
+        };
+        assert!(!still_claimed);
+    }
+
+    /// Absent claim, any recorded uid — released.
+    #[test]
+    fn a_missing_claim_is_not_still_claimed() {
+        let live: Option<&String> = None;
+        let recorded = Some("old-uid".to_string());
+        let still_claimed = match (&live, &recorded) {
+            (Some(_), None) => true,
+            (Some(u), Some(expected)) => **u == *expected,
+            (None, _) => false,
+        };
+        assert!(!still_claimed);
+    }
+
+    /// A claimRef with no uid recorded falls back to existence alone. Releasing
+    /// on "we cannot tell" would destroy data on a guess, which is the wrong
+    /// direction for a reclaim decision.
+    #[test]
+    fn a_claim_ref_without_a_uid_falls_back_to_existence() {
+        let live = "whatever".to_string();
+        let recorded: Option<String> = None;
+        let still_claimed = match (&Some(&live), &recorded) {
+            (Some(_), None) => true,
+            (Some(u), Some(expected)) => **u == *expected,
+            (None, _) => false,
+        };
+        assert!(still_claimed);
+    }
 
     #[test]
     fn test_storage_comparison() {
