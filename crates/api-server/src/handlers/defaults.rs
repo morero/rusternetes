@@ -36,6 +36,45 @@ fn is_unset(field: &Option<String>) -> bool {
     field.as_deref().map_or(true, str::is_empty)
 }
 
+/// Rejects a PodSpec whose enum-valued string fields hold something outside the
+/// API's permitted set.
+///
+/// Run *after* defaulting, so "unset" has already become the default and
+/// anything left is a value someone actually sent. Real Kubernetes rejects these
+/// with a 422 at admission; this server accepted them, and the cost was not
+/// abstract: a `restartPolicy` of `""` was stored verbatim, matched no arm in
+/// the kubelet's restart logic, and left a pod reporting `Running` with no
+/// containers for seventeen hours. The write is where that should have been
+/// caught — by the time a kubelet is comparing strings, the bad value is already
+/// persisted and the symptom is many layers away from the cause.
+pub fn validate_pod_spec_enums(spec: &PodSpec) -> Result<(), String> {
+    const RESTART_POLICIES: [&str; 3] = ["Always", "OnFailure", "Never"];
+    const DNS_POLICIES: [&str; 4] = [
+        "ClusterFirst",
+        "ClusterFirstWithHostNet",
+        "Default",
+        "None",
+    ];
+
+    if let Some(policy) = spec.restart_policy.as_deref() {
+        if !RESTART_POLICIES.contains(&policy) {
+            return Err(format!(
+                "spec.restartPolicy: Unsupported value: {policy:?}: supported values: \
+                 \"Always\", \"OnFailure\", \"Never\""
+            ));
+        }
+    }
+    if let Some(policy) = spec.dns_policy.as_deref() {
+        if !DNS_POLICIES.contains(&policy) {
+            return Err(format!(
+                "spec.dnsPolicy: Unsupported value: {policy:?}: supported values: \
+                 \"ClusterFirst\", \"ClusterFirstWithHostNet\", \"Default\", \"None\""
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Apply K8s defaults to a PodSpec.
 /// Matches SetDefaults_PodSpec from pkg/apis/core/v1/defaults.go
 pub fn apply_pod_spec_defaults(spec: &mut PodSpec) {
@@ -329,6 +368,78 @@ fn apply_job_defaults_to_spec(spec: &mut rusternetes_common::resources::JobSpec)
 mod tests {
     use super::*;
     use rusternetes_common::resources::{Container, PodSpec, PodTemplateSpec};
+
+    #[test]
+    /// The exact value that cost seventeen hours: `""` from a protobuf client's
+    /// undefaulted spec. It must never reach storage — and after defaulting it
+    /// cannot, because `is_unset` turns it into `Always` first. This asserts the
+    /// backstop for anything defaulting misses.
+    #[test]
+    fn an_empty_restart_policy_is_rejected() {
+        let mut spec = PodSpec::default();
+        spec.restart_policy = Some(String::new());
+        let err = super::validate_pod_spec_enums(&spec).unwrap_err();
+        assert!(err.contains("spec.restartPolicy"), "{err}");
+        assert!(err.contains("supported values"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_restart_policy_is_rejected() {
+        let mut spec = PodSpec::default();
+        spec.restart_policy = Some("Sometimes".to_string());
+        assert!(super::validate_pod_spec_enums(&spec).is_err());
+    }
+
+    #[test]
+    fn an_empty_or_unknown_dns_policy_is_rejected() {
+        let mut spec = PodSpec::default();
+        spec.dns_policy = Some(String::new());
+        assert!(super::validate_pod_spec_enums(&spec).is_err());
+        spec.dns_policy = Some("Whatever".to_string());
+        assert!(super::validate_pod_spec_enums(&spec).is_err());
+    }
+
+    /// Every legal value must pass. A validator that rejects something valid is
+    /// worse than none: it breaks working workloads rather than bad ones.
+    #[test]
+    fn all_legal_enum_values_are_accepted() {
+        for restart in ["Always", "OnFailure", "Never"] {
+            for dns in [
+                "ClusterFirst",
+                "ClusterFirstWithHostNet",
+                "Default",
+                "None",
+            ] {
+                let mut spec = PodSpec::default();
+                spec.restart_policy = Some(restart.to_string());
+                spec.dns_policy = Some(dns.to_string());
+                assert!(
+                    super::validate_pod_spec_enums(&spec).is_ok(),
+                    "{restart}/{dns} must be accepted"
+                );
+            }
+        }
+    }
+
+    /// Absent is not invalid — defaulting handles it, and validation runs after.
+    #[test]
+    fn absent_enum_fields_are_accepted() {
+        assert!(super::validate_pod_spec_enums(&PodSpec::default()).is_ok());
+    }
+
+    /// The whole pair, in the order the server runs it: an undefaulted `""`
+    /// becomes `Always` and then passes validation. This is the property that
+    /// makes the CNPG case impossible rather than merely detected.
+    #[test]
+    fn defaulting_then_validating_accepts_an_undefaulted_protobuf_spec() {
+        let mut spec = PodSpec::default();
+        spec.restart_policy = Some(String::new());
+        spec.dns_policy = Some(String::new());
+        super::apply_pod_spec_defaults(&mut spec);
+        assert_eq!(spec.restart_policy.as_deref(), Some("Always"));
+        assert_eq!(spec.dns_policy.as_deref(), Some("ClusterFirst"));
+        assert!(super::validate_pod_spec_enums(&spec).is_ok());
+    }
 
     #[test]
     fn test_apply_pod_spec_defaults() {

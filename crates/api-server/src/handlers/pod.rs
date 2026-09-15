@@ -348,6 +348,14 @@ pub async fn create(
         crate::handlers::defaults::apply_pod_spec_defaults(spec);
     }
 
+    // Validate enum-valued fields AFTER defaulting, so "unset" has already
+    // become the default and anything left is a value the client really sent.
+    if let Some(ref spec) = pod.spec {
+        if let Err(msg) = crate::handlers::defaults::validate_pod_spec_enums(spec) {
+            return Err(rusternetes_common::Error::InvalidResource(msg));
+        }
+    }
+
     // Inject service account token (built-in admission controller)
     if let Err(e) =
         crate::admission::inject_service_account_token(&state.storage, &namespace, &mut pod).await
@@ -696,6 +704,19 @@ pub async fn update(
     })?;
 
     info!("Updating pod: {}/{}", namespace, name);
+
+    // Update applied no defaults at all, so a spec that was correct on create
+    // could be replaced by an undefaulted one and stored verbatim — the same
+    // hole the create path had, reachable by a second write. Default first,
+    // then validate what is left, exactly as create does.
+    if let Some(ref mut spec) = pod.spec {
+        crate::handlers::defaults::apply_pod_spec_defaults(spec);
+    }
+    if let Some(ref spec) = pod.spec {
+        if let Err(msg) = crate::handlers::defaults::validate_pod_spec_enums(spec) {
+            return Err(rusternetes_common::Error::InvalidResource(msg));
+        }
+    }
 
     // Check if this is a dry-run request
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
