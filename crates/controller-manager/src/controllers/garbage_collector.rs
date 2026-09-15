@@ -192,8 +192,10 @@ impl<S: Storage + 'static> GarbageCollector<S> {
     async fn discover_custom_resource_types(
         &self,
     ) -> rusternetes_common::Result<Vec<(String, bool)>> {
-        let crds: Vec<CustomResourceDefinition> =
-            self.storage.list("/registry/customresourcedefinitions/").await?;
+        let crds: Vec<CustomResourceDefinition> = self
+            .storage
+            .list("/registry/customresourcedefinitions/")
+            .await?;
         Ok(crds
             .into_iter()
             .map(|crd| {
@@ -218,13 +220,31 @@ impl<S: Storage + 'static> GarbageCollector<S> {
     /// any CRD. Resolving the custom case needs the owner's **apiVersion**,
     /// not just its kind: the group is what distinguishes
     /// `Cluster.postgresql.cnpg.io` from any other `Cluster`.
+    /// Resolves an owner reference to `(storage plural, is the owner
+    /// cluster-scoped)`.
+    ///
+    /// The scope half is not decoration. The owner's storage key has a
+    /// namespace segment only for a *namespaced* owner, and the caller used to
+    /// infer that from the **dependent's** namespace — which is a different
+    /// question with the same answer most of the time. For a namespaced
+    /// dependent of a cluster-scoped owner the two disagree, the lookup is done
+    /// at a key that cannot exist, the owner is declared dangling, and a live
+    /// object's dependents are deleted.
+    ///
+    /// That is not hypothetical here: `Tenant` is cluster-scoped and
+    /// `tenant-operator` deliberately owns namespaced objects with it so that
+    /// teardown is structural. The CRD carries `spec.scope`, so the information
+    /// was always available — it was simply thrown away.
     async fn owner_storage_type(
         &self,
         owner_ref: &rusternetes_common::types::OwnerReference,
-    ) -> Option<String> {
+    ) -> Option<(String, bool)> {
         let plural = kind_to_plural(&owner_ref.kind);
         if !plural.is_empty() {
-            return Some(plural.to_string());
+            return Some((
+                plural.to_string(),
+                is_builtin_cluster_scoped(&owner_ref.kind),
+            ));
         }
         // `apiVersion` is either "group/version" or a bare "version" for
         // core types. A bare version has no group, so it cannot be a CRD.
@@ -240,10 +260,13 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         crds.into_iter()
             .find(|crd| crd.spec.group == group && crd.spec.names.kind == owner_ref.kind)
             .map(|crd| {
-                format!(
-                    "{}_{}",
-                    crd.spec.group.replace('.', "_"),
-                    crd.spec.names.plural
+                (
+                    format!(
+                        "{}_{}",
+                        crd.spec.group.replace('.', "_"),
+                        crd.spec.names.plural
+                    ),
+                    crd.spec.scope == ResourceScope::Cluster,
                 )
             })
     }
@@ -506,7 +529,8 @@ impl<S: Storage + 'static> GarbageCollector<S> {
             // registered custom kinds too. Before this, every custom owner
             // was unresolvable and the orphan was skipped, so ownerReference
             // cascade never fired for any CRD (ISSUES.md #15).
-            let Some(plural) = self.owner_storage_type(owner_ref).await else {
+            let Some((plural, owner_is_cluster_scoped)) = self.owner_storage_type(owner_ref).await
+            else {
                 // Genuinely unknown — be conservative, don't delete. This is
                 // now a real "we have never heard of this kind" rather than
                 // "this kind is custom".
@@ -517,10 +541,13 @@ impl<S: Storage + 'static> GarbageCollector<S> {
                 return Ok(false);
             };
             let plural = plural.as_str();
-            let owner_key = if let Some(ns) = namespace {
-                format!("/registry/{}/{}/{}", plural, ns, owner_ref.name)
-            } else {
-                format!("/registry/{}/{}", plural, owner_ref.name)
+            // Keyed on whether the OWNER is cluster-scoped, not on whether the
+            // dependent happens to live in a namespace. A cluster-scoped owner
+            // has no namespace segment in its key regardless of where its
+            // dependents live.
+            let owner_key = match (owner_is_cluster_scoped, namespace) {
+                (false, Some(ns)) => format!("/registry/{}/{}/{}", plural, ns, owner_ref.name),
+                _ => format!("/registry/{}/{}", plural, owner_ref.name),
             };
 
             // Try to read the owner from storage
@@ -1110,6 +1137,32 @@ impl Default for DeleteOptions {
 
 /// Map K8s Kind names to their plural storage resource names.
 /// K8s uses discovery API for this; we use a static mapping.
+/// Whether a built-in kind is cluster-scoped.
+///
+/// Custom kinds get this from their CRD's `spec.scope`; built-ins have no CRD to
+/// read, so the list is explicit. Kept beside [`kind_to_plural`] because the two
+/// are answering halves of the same question and would otherwise drift.
+fn is_builtin_cluster_scoped(kind: &str) -> bool {
+    matches!(
+        kind,
+        "Namespace"
+            | "Node"
+            | "PersistentVolume"
+            | "StorageClass"
+            | "ClusterRole"
+            | "ClusterRoleBinding"
+            | "CustomResourceDefinition"
+            | "MutatingWebhookConfiguration"
+            | "ValidatingWebhookConfiguration"
+            | "PriorityClass"
+            | "CSIDriver"
+            | "CSINode"
+            | "IngressClass"
+            | "RuntimeClass"
+            | "APIService"
+    )
+}
+
 fn kind_to_plural(kind: &str) -> &str {
     match kind {
         "Pod" => "pods",
@@ -1157,6 +1210,74 @@ fn kind_to_plural(kind: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use super::{is_builtin_cluster_scoped, kind_to_plural};
+
+    /// The owner key has a namespace segment only for a NAMESPACED owner.
+    /// Deriving that from the dependent's namespace instead is what made a live
+    /// cluster-scoped owner look dangling: `Tenant` is cluster-scoped and owns
+    /// namespaced objects on purpose, so the GC looked for it at
+    /// `/registry/..._tenants/<ns>/<name>`, found nothing, and deleted the
+    /// dependents of a tenant that was perfectly alive.
+    #[test]
+    fn a_cluster_scoped_owner_key_has_no_namespace_segment() {
+        let plural = "platform_ertia_io_tenants";
+        let owner_is_cluster_scoped = true;
+        let dependent_namespace = Some("tenant-acme");
+
+        let key = match (owner_is_cluster_scoped, dependent_namespace) {
+            (false, Some(ns)) => format!("/registry/{plural}/{ns}/acme"),
+            _ => format!("/registry/{plural}/acme"),
+        };
+        assert_eq!(key, "/registry/platform_ertia_io_tenants/acme");
+        assert!(
+            !key.contains("tenant-acme"),
+            "the dependent's namespace must not leak into a cluster-scoped owner's key"
+        );
+    }
+
+    /// The namespaced case must keep working exactly as before — this is the
+    /// common path and breaking it would orphan-delete far more than it saved.
+    #[test]
+    fn a_namespaced_owner_key_still_carries_the_namespace() {
+        let key = match (false, Some("default")) {
+            (false, Some(ns)) => format!("/registry/deployments/{ns}/web"),
+            _ => format!("/registry/deployments/web"),
+        };
+        assert_eq!(key, "/registry/deployments/default/web");
+    }
+
+    /// Built-ins have no CRD to read `spec.scope` from, so the list is explicit
+    /// and is the half most likely to rot. `Namespace` matters most: it owns
+    /// namespaced dependents all the time.
+    #[test]
+    fn builtin_cluster_scoped_kinds_are_recognised() {
+        for kind in [
+            "Namespace",
+            "Node",
+            "PersistentVolume",
+            "ClusterRole",
+            "ClusterRoleBinding",
+            "CustomResourceDefinition",
+        ] {
+            assert!(is_builtin_cluster_scoped(kind), "{kind}");
+            assert!(!kind_to_plural(kind).is_empty(), "{kind} has no plural");
+        }
+    }
+
+    #[test]
+    fn namespaced_builtins_are_not_reported_as_cluster_scoped() {
+        for kind in [
+            "Pod",
+            "Deployment",
+            "Service",
+            "ConfigMap",
+            "Secret",
+            "Role",
+        ] {
+            assert!(!is_builtin_cluster_scoped(kind), "{kind}");
+        }
+    }
+
     use super::*;
     use rusternetes_common::types::OwnerReference;
     use rusternetes_storage::memory::MemoryStorage;
