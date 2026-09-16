@@ -1715,13 +1715,17 @@ fn validate_custom_resource(
                 // Validate spec if present
                 if let Some(ref spec) = cr.spec {
                     if let Some(spec_schema) = properties.get("spec") {
-                        SchemaValidator::validate_no_unknown_check(spec_schema, spec)?;
+                        SchemaValidator::validate_no_unknown_check(spec_schema, spec, "spec")?;
                     }
                 }
                 // Validate status if present
                 if let Some(ref status) = cr.status {
                     if let Some(status_schema) = properties.get("status") {
-                        SchemaValidator::validate_no_unknown_check(status_schema, status)?;
+                        SchemaValidator::validate_no_unknown_check(
+                            status_schema,
+                            status,
+                            "status",
+                        )?;
                     }
                 }
                 // Validate extra top-level fields (e.g., cronies, hostPort)
@@ -1730,7 +1734,7 @@ fn validate_custom_resource(
                         continue;
                     }
                     if let Some(field_schema) = properties.get(key) {
-                        SchemaValidator::validate_no_unknown_check(field_schema, value)?;
+                        SchemaValidator::validate_no_unknown_check(field_schema, value, key)?;
                     }
                 }
             }

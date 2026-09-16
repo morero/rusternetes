@@ -197,6 +197,37 @@ fn extract_resource_details(msg: &str) -> Option<crate::types::StatusDetails> {
     })
 }
 
+/// The field path a `422 Invalid` message is about, if the message states one.
+///
+/// Every field validator in this codebase writes its message as
+/// `<path>: <what is wrong>` — `spec.deletionPolicy: Unsupported value: ...`,
+/// `spec.bars[0].name: Required value`. So the path is already in the message
+/// and only has to be lifted out.
+///
+/// It used to be hardcoded to `metadata.name`, which `kubectl` then printed in
+/// front of every validation failure: a rejected `spec.deletionPolicy` read as
+/// `metadata.name: Unsupported value: "Delete"`, sending the reader to a field
+/// that was perfectly fine (ISSUES.md #67).
+///
+/// Returns `None` when the message does not start with something shaped like a
+/// path. Naming no field is honest and costs the reader nothing — the message
+/// itself is still printed — whereas naming the wrong one costs them a detour.
+#[cfg(any(feature = "axum-support", test))]
+fn field_path_of_invalid(msg: &str) -> Option<String> {
+    let (candidate, _) = msg.split_once(": ")?;
+    if candidate.is_empty() || candidate.len() > 253 {
+        return None;
+    }
+    // A JSON path as Kubernetes writes it: dotted segments with optional array
+    // indices. Anything else — "failed to decode", "Invalid patch YAML" — is
+    // prose that happens to contain a colon, and is not a field.
+    let path_like = candidate
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '[' | ']'))
+        && candidate.starts_with(|c: char| c.is_ascii_alphabetic());
+    path_like.then(|| candidate.to_string())
+}
+
 /// Extract resource details for Invalid errors, including causes.
 #[cfg(feature = "axum-support")]
 fn extract_resource_details_for_invalid(msg: &str) -> Option<crate::types::StatusDetails> {
@@ -208,8 +239,52 @@ fn extract_resource_details_for_invalid(msg: &str) -> Option<crate::types::Statu
         causes: Some(vec![crate::types::StatusCause {
             reason: Some("FieldValueInvalid".to_string()),
             message: Some(msg.to_string()),
-            field: Some("metadata.name".to_string()),
+            field: field_path_of_invalid(msg),
         }]),
         retry_after_seconds: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::field_path_of_invalid as field_of;
+
+    /// The case from ISSUES.md #67: the reported field must be the one that is
+    /// actually wrong.
+    #[test]
+    fn an_enum_violation_names_the_enum_field() {
+        assert_eq!(
+            field_of(
+                "spec.deletionPolicy: Unsupported value: \"Delete\": supported values: \
+                 \"Protect\", \"Cascade\""
+            ),
+            Some("spec.deletionPolicy".to_string())
+        );
+    }
+
+    #[test]
+    fn indexed_paths_survive_intact() {
+        assert_eq!(
+            field_of("spec.bars[0].name: Required value"),
+            Some("spec.bars[0].name".to_string())
+        );
+    }
+
+    /// Prose that happens to contain a colon must not be mistaken for a path —
+    /// the whole point is to stop naming a field we have not established.
+    #[test]
+    fn prose_messages_name_no_field() {
+        for msg in [
+            "failed to decode: invalid character",
+            "Invalid patch YAML: mapping values are not allowed",
+            "Failed to apply patch: conflict",
+        ] {
+            assert_eq!(field_of(msg), None, "{msg}");
+        }
+    }
+
+    #[test]
+    fn a_message_with_no_colon_names_no_field() {
+        assert_eq!(field_of("something went wrong"), None);
+    }
 }

@@ -63,9 +63,18 @@ impl SchemaValidator {
     /// Validate a JSON value against a schema WITHOUT checking for unknown fields.
     /// Used for normal (non-strict) validation where unknown fields are pruned
     /// rather than rejected. Still validates types, required fields, enums, etc.
-    pub fn validate_no_unknown_check(schema: &JSONSchemaProps, value: &Value) -> Result<(), Error> {
+    ///
+    /// `base_path` is where `schema` sits in the object being validated (`spec`,
+    /// `status`, ...), and it is not cosmetic: the caller validates a *subschema*,
+    /// so without it every reported path is relative to that subschema and names
+    /// a field that does not exist at the top level (ISSUES.md #67).
+    pub fn validate_no_unknown_check(
+        schema: &JSONSchemaProps,
+        value: &Value,
+        base_path: &str,
+    ) -> Result<(), Error> {
         let mut dummy = Vec::new();
-        Self::validate_with_path_skip_unknown(schema, value, "", &mut dummy)
+        Self::validate_with_path_skip_unknown(schema, value, base_path, &mut dummy)
     }
 
     /// Validate with strict mode — returns unknown fields as K8s-formatted errors.
@@ -76,19 +85,17 @@ impl SchemaValidator {
         base_path: &str,
     ) -> Result<(), Error> {
         let mut unknown_fields = Vec::new();
-        Self::validate_with_path(schema, value, "", &mut unknown_fields)?;
+        // Start the walk *at* `base_path` rather than at the root of the
+        // subschema. Every path this produces — unknown fields, required fields,
+        // enum violations — is then a path in the object the user submitted,
+        // which is the only kind of path they can act on.
+        Self::validate_with_path(schema, value, base_path, &mut unknown_fields)?;
         if !unknown_fields.is_empty() {
             unknown_fields.sort();
             let msg = unknown_fields
                 .iter()
                 .map(|p| {
-                    // Convert ".foo" to "spec.foo" by prepending base_path
-                    let field = p.trim_start_matches('.');
-                    let full_path = if base_path.is_empty() {
-                        field.to_string()
-                    } else {
-                        format!("{}.{}", base_path, field)
-                    };
+                    let full_path = p.trim_start_matches('.');
                     format!("strict decoding error: unknown field \"{}\"", full_path)
                 })
                 .collect::<Vec<_>>()
@@ -134,18 +141,50 @@ impl SchemaValidator {
         // Validate enum
         if let Some(ref enum_values) = schema.enum_ {
             if !enum_values.contains(value) {
-                let val_str = match value {
-                    Value::String(s) => format!("\"{}\"", s),
-                    other => other.to_string(),
-                };
-                return Err(Error::InvalidResource(format!(
-                    "Unsupported value: {}",
-                    val_str
-                )));
+                return Err(Self::enum_error(path, value, enum_values));
             }
         }
 
         Ok(())
+    }
+
+    /// The error for a value outside a schema's `enum`.
+    ///
+    /// Two things belong in it and were both missing: **where** the offending
+    /// value is, and **what** would have been accepted. Without the path the
+    /// reader is sent to whatever field the transport happens to name — which
+    /// was `metadata.name` for every invalid request (ISSUES.md #67) — and
+    /// without the permitted values they have to go and read the CRD to find
+    /// out what to write instead.
+    ///
+    /// Matches upstream's shape:
+    /// `spec.deletionPolicy: Unsupported value: "Delete": supported values: "Protect", "Cascade"`.
+    fn enum_error(path: &str, value: &Value, enum_values: &[Value]) -> Error {
+        fn render(v: &Value) -> String {
+            match v {
+                Value::String(s) => format!("\"{}\"", s),
+                other => other.to_string(),
+            }
+        }
+        let supported = enum_values
+            .iter()
+            .map(render)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let body = if supported.is_empty() {
+            format!("Unsupported value: {}", render(value))
+        } else {
+            format!(
+                "Unsupported value: {}: supported values: {}",
+                render(value),
+                supported
+            )
+        };
+        Error::InvalidResource(if path.is_empty() {
+            body
+        } else {
+            format!("{}: {}", path, body)
+        })
     }
 
     /// Validate object properties without checking for unknown fields.
@@ -229,15 +268,7 @@ impl SchemaValidator {
         // Validate enum
         if let Some(ref enum_values) = schema.enum_ {
             if !enum_values.contains(value) {
-                // K8s format: Unsupported value: "NonExistentValue": supported values: "Great", "Down"
-                let val_str = match value {
-                    Value::String(s) => format!("\"{}\"", s),
-                    other => other.to_string(),
-                };
-                return Err(Error::InvalidResource(format!(
-                    "Unsupported value: {}",
-                    val_str
-                )));
+                return Err(Self::enum_error(path, value, enum_values));
             }
         }
 
@@ -968,13 +999,13 @@ mod tests {
         // Valid value: feeling = "Great"
         let valid_cr = json!({"bars": [{"name": "test-bar", "feeling": "Great"}]});
         assert!(
-            SchemaValidator::validate_no_unknown_check(&spec_schema, &valid_cr).is_ok(),
+            SchemaValidator::validate_no_unknown_check(&spec_schema, &valid_cr, "spec").is_ok(),
             "Valid enum value 'Great' should be accepted"
         );
 
         // Invalid value: feeling = "NonExistentValue"
         let invalid_cr = json!({"bars": [{"name": "test-bar", "feeling": "NonExistentValue"}]});
-        let result = SchemaValidator::validate_no_unknown_check(&spec_schema, &invalid_cr);
+        let result = SchemaValidator::validate_no_unknown_check(&spec_schema, &invalid_cr, "spec");
         assert!(
             result.is_err(),
             "Invalid enum value 'NonExistentValue' should be rejected"
@@ -985,6 +1016,79 @@ mod tests {
             "Error should mention unsupported value: {}",
             err_msg
         );
+    }
+
+    /// The message an operator actually reads, in full. Both halves were
+    /// missing: the path (so `kubectl` printed a hardcoded `metadata.name`) and
+    /// the permitted values (so the reader had to go and open the CRD).
+    /// ISSUES.md #67.
+    #[test]
+    fn an_enum_violation_reports_its_path_and_the_permitted_values() {
+        let mut properties = HashMap::new();
+        properties.insert(
+            "deletionPolicy".to_string(),
+            JSONSchemaProps {
+                type_: Some("string".to_string()),
+                enum_: Some(vec![json!("Protect"), json!("Cascade")]),
+                ..Default::default()
+            },
+        );
+        let spec_schema = JSONSchemaProps {
+            type_: Some("object".to_string()),
+            properties: Some(properties),
+            ..Default::default()
+        };
+
+        let err = SchemaValidator::validate_no_unknown_check(
+            &spec_schema,
+            &json!({"deletionPolicy": "Delete"}),
+            "spec",
+        )
+        .expect_err("Delete is not in the enum");
+
+        // `Display` adds the `Invalid resource: ` prefix; the wire message
+        // (what `Error::InvalidResource` carries, and what the field extractor
+        // in `error.rs` reads) is everything after it.
+        let Error::InvalidResource(message) = &err else {
+            panic!("expected InvalidResource, got {err:?}");
+        };
+        assert_eq!(
+            message,
+            "spec.deletionPolicy: Unsupported value: \"Delete\": supported values: \"Protect\", \
+             \"Cascade\""
+        );
+    }
+
+    /// A subschema validated on its own must still report paths in the object
+    /// the user submitted — `status.phase`, not a bare `phase` that appears
+    /// nowhere in what they wrote.
+    #[test]
+    fn paths_are_relative_to_the_whole_object_not_the_subschema() {
+        let mut properties = HashMap::new();
+        properties.insert(
+            "phase".to_string(),
+            JSONSchemaProps {
+                type_: Some("string".to_string()),
+                enum_: Some(vec![json!("Ready")]),
+                ..Default::default()
+            },
+        );
+        let status_schema = JSONSchemaProps {
+            type_: Some("object".to_string()),
+            properties: Some(properties),
+            ..Default::default()
+        };
+
+        let err = SchemaValidator::validate_no_unknown_check(
+            &status_schema,
+            &json!({"phase": "Nope"}),
+            "status",
+        )
+        .expect_err("Nope is not in the enum");
+        let Error::InvalidResource(message) = &err else {
+            panic!("expected InvalidResource, got {err:?}");
+        };
+        assert!(message.starts_with("status.phase: "), "{message}");
     }
 
     /// Test that x-kubernetes-preserve-unknown-fields allows arbitrary fields
