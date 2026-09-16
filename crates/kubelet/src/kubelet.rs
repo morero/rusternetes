@@ -200,7 +200,8 @@ fn is_transient_volume_wait_error(err_msg: &str) -> bool {
 /// than abandoning one that meant `Always`, which is not.
 ///
 /// This exists because the raw value was compared against string literals at
-/// **seven** separate sites, and an empty string matched no arm at most of them —
+/// **eleven** separate sites across two files, and an empty string matched no
+/// arm at most of them —
 /// falling into a silent `_ => {}`. The first version of this fix converted two
 /// of them and claimed that was all; it was not, and the liveness-probe restart
 /// site in particular still dropped an empty policy on the floor without so much
@@ -4501,14 +4502,26 @@ mod tests {
     /// loudly on a new raw read rather than waiting for a pod to sit dead.
     #[test]
     fn no_call_site_reads_the_restart_policy_without_normalising_it() {
-        let source = include_str!("kubelet.rs");
+        // Both files, because the first version of this guard scanned only
+        // `kubelet.rs` and four raw reads survived in `runtime.rs` — including
+        // one that costs an empty-policy pod its init-container retries. A
+        // guard that stops at a file boundary gives exactly the false assurance
+        // this test exists to withdraw.
+        let sources = [
+            ("kubelet.rs", include_str!("kubelet.rs")),
+            ("runtime.rs", include_str!("runtime.rs")),
+        ];
         // Assembled rather than written out, so this test does not match itself.
         let needle = format!("unwrap_or({:?})", "Always");
-        let offenders: Vec<_> = source
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| line.contains(&needle))
-            .map(|(n, line)| format!("line {}: {}", n + 1, line.trim()))
+        let offenders: Vec<_> = sources
+            .iter()
+            .flat_map(|(file, source)| {
+                source
+                    .lines()
+                    .enumerate()
+                    .filter(|(_, line)| line.contains(&needle))
+                    .map(move |(n, line)| format!("{file}:{}: {}", n + 1, line.trim()))
+            })
             .collect();
         assert!(
             offenders.is_empty(),

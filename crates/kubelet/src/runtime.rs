@@ -1,3 +1,4 @@
+use crate::kubelet::effective_restart_policy;
 use anyhow::{Context, Result};
 use bollard::container::{
     Config, CreateContainerOptions, InspectContainerOptions, ListContainersOptions,
@@ -1438,12 +1439,9 @@ impl ContainerRuntime {
 
                     // For restartPolicy=Always pods, retry failed init containers
                     // with exponential backoff (matching Kubernetes CrashLoopBackOff)
-                    let restart_always = pod
-                        .spec
-                        .as_ref()
-                        .and_then(|s| s.restart_policy.as_deref())
-                        .unwrap_or("Always")
-                        == "Always";
+                    let restart_always = effective_restart_policy(
+                        pod.spec.as_ref().and_then(|s| s.restart_policy.as_deref()),
+                    ) == "Always";
                     // For restartPolicy=Always, retry init containers up to 3 times
                     // in start_pod. Further retries happen via the kubelet sync loop
                     // which shows CrashLoopBackOff status.
@@ -1627,11 +1625,8 @@ impl ContainerRuntime {
         // Without this, the kubelet sync loop (3s interval) misses fast-exiting
         // containers that have already been removed by Docker.
         // K8s ref: pkg/kubelet/kubelet_pods.go:1639 — getPhase
-        let restart_policy = pod
-            .spec
-            .as_ref()
-            .and_then(|s| s.restart_policy.as_deref())
-            .unwrap_or("Always");
+        let restart_policy =
+            effective_restart_policy(pod.spec.as_ref().and_then(|s| s.restart_policy.as_deref()));
         if restart_policy == "Never" {
             // Brief delay for containers to exit
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -6238,12 +6233,9 @@ impl ContainerRuntime {
                                 } else {
                                     // Previously terminated with error — container was
                                     // removed for restart. Show CrashLoopBackOff.
-                                    let restart_always = pod
-                                        .spec
-                                        .as_ref()
-                                        .and_then(|s| s.restart_policy.as_deref())
-                                        .unwrap_or("Always")
-                                        == "Always";
+                                    let restart_always = effective_restart_policy(
+                                        pod.spec.as_ref().and_then(|s| s.restart_policy.as_deref()),
+                                    ) == "Always";
                                     if restart_always {
                                         (
                                             ContainerState::Waiting {
@@ -6470,12 +6462,9 @@ impl ContainerRuntime {
         };
 
         let pod_name = &pod.metadata.name;
-        let restart_on_failure = pod
-            .spec
-            .as_ref()
-            .and_then(|s| s.restart_policy.as_deref())
-            .unwrap_or("Always")
-            != "Never";
+        let restart_on_failure =
+            effective_restart_policy(pod.spec.as_ref().and_then(|s| s.restart_policy.as_deref()))
+                != "Never";
 
         // Check each init container in order
         for (i, ic) in init_containers.iter().enumerate() {
