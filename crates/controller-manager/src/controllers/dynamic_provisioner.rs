@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use rusternetes_common::resources::volume::{
     HostPathType, HostPathVolumeSource, PersistentVolumePhase, PersistentVolumeReclaimPolicy,
 };
+use rusternetes_common::resources::{EventType, ObjectReference};
 use rusternetes_common::resources::{
     PersistentVolume, PersistentVolumeClaim, PersistentVolumeStatus, StorageClass, VolumeSnapshot,
     VolumeSnapshotContent,
@@ -225,6 +226,14 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
                          cannot dynamically provision",
                         namespace, pvc_name
                     );
+                    self.report_blocked(
+                        pvc,
+                        "ProvisioningFailed",
+                        "no storageClassName is set on this claim and no StorageClass is \
+                         annotated storageclass.kubernetes.io/is-default-class=true, so no \
+                         volume can be provisioned for it",
+                    )
+                    .await;
                     return Ok(());
                 }
             },
@@ -255,6 +264,15 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
                 "Provisioner {} is not supported. Skipping PVC {}/{}",
                 storage_class.provisioner, namespace, pvc_name
             );
+            self.report_blocked(
+                pvc,
+                "ProvisioningFailed",
+                &format!(
+                    "StorageClass {} uses provisioner {}, which this cluster does not implement",
+                    storage_class_name, storage_class.provisioner
+                ),
+            )
+            .await;
             return Ok(());
         }
 
@@ -262,11 +280,39 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
         let pv_name = format!("pvc-{}-{}", namespace, pvc_name);
         let pv_key = build_key("persistentvolumes", None, &pv_name);
 
-        if let Ok(_existing_pv) = self.storage.get::<PersistentVolume>(&pv_key).await {
-            debug!(
-                "PV {} already exists for PVC {}/{}",
-                pv_name, namespace, pvc_name
-            );
+        if let Ok(existing_pv) = self.storage.get::<PersistentVolume>(&pv_key).await {
+            // Existing and *ours* is the ordinary retry case. Existing and
+            // claimed by someone else is the one from ISSUES.md #70: PV names
+            // are derived from the claim, so a leftover volume under this name
+            // makes the claim unprovisionable — and until now said nothing at
+            // all, leaving a `Pending` PVC with no explanation anywhere.
+            let held_by_another = existing_pv.spec.claim_ref.as_ref().filter(|claim_ref| {
+                claim_ref
+                    .uid
+                    .as_deref()
+                    .is_none_or(|uid| uid != pvc.metadata.uid)
+            });
+            if let Some(claim_ref) = held_by_another {
+                self.report_blocked(
+                    pvc,
+                    "ProvisioningFailed",
+                    &format!(
+                        "PersistentVolume {} already exists and is claimed by {}/{} (uid {}). \
+                         Volume names are derived from the claim, so this claim cannot be \
+                         provisioned while that volume exists.",
+                        pv_name,
+                        claim_ref.namespace.as_deref().unwrap_or("<none>"),
+                        claim_ref.name.as_deref().unwrap_or("<none>"),
+                        claim_ref.uid.as_deref().unwrap_or("<unset>"),
+                    ),
+                )
+                .await;
+            } else {
+                debug!(
+                    "PV {} already exists for PVC {}/{}",
+                    pv_name, namespace, pvc_name
+                );
+            }
             return Ok(());
         }
 
@@ -287,6 +333,35 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
         );
 
         Ok(())
+    }
+
+    /// Say, on the claim itself, why it is not getting a volume.
+    ///
+    /// Every early return in `provision_volume` used to be a `debug!` or a
+    /// `warn!` in the controller's log — which is the wrong audience. The
+    /// person waiting is looking at `kubectl describe pvc`, and a `Pending`
+    /// claim with an empty Events section tells them nothing about whether
+    /// anything is even trying (ISSUES.md #70).
+    async fn report_blocked(&self, pvc: &PersistentVolumeClaim, reason: &str, message: &str) {
+        let namespace = pvc.metadata.namespace.as_deref().unwrap_or("default");
+        super::events::record_event_once(
+            self.storage.as_ref(),
+            namespace,
+            ObjectReference {
+                kind: Some("PersistentVolumeClaim".to_string()),
+                namespace: Some(namespace.to_string()),
+                name: Some(pvc.metadata.name.clone()),
+                uid: Some(pvc.metadata.uid.clone()),
+                api_version: Some("v1".to_string()),
+                resource_version: None,
+                field_path: None,
+            },
+            reason,
+            message,
+            EventType::Warning,
+            "persistentvolume-controller",
+        )
+        .await;
     }
 
     /// The name of the `StorageClass` annotated
@@ -650,8 +725,123 @@ mod tests {
         controller.provision_volume(&pvc).await.unwrap();
 
         let pv_key = build_key("persistentvolumes", None, "pvc-default-no-class-pvc");
-        let pv: PersistentVolume = storage.get(&pv_key).await.expect("PV should be provisioned");
+        let pv: PersistentVolume = storage
+            .get(&pv_key)
+            .await
+            .expect("PV should be provisioned");
         assert_eq!(pv.spec.storage_class_name, Some("standard".to_string()));
+    }
+
+    /// Every event this controller records, for one claim.
+    async fn events_for(
+        storage: &rusternetes_storage::memory::MemoryStorage,
+        pvc: &str,
+    ) -> Vec<rusternetes_common::resources::Event> {
+        let all: Vec<rusternetes_common::resources::Event> =
+            storage.list("/registry/events/").await.unwrap();
+        all.into_iter()
+            .filter(|e| e.involved_object.name.as_deref() == Some(pvc))
+            .collect()
+    }
+
+    /// ISSUES.md #70, second half. PV names are derived from the claim, so a
+    /// leftover volume under that name makes the claim unprovisionable — and
+    /// said nothing at all, which is how it cost an hour. The event has to name
+    /// the volume and who holds it, or the operator is no better off.
+    #[tokio::test]
+    async fn a_volume_name_held_by_another_claim_is_reported_on_the_claim() {
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .create(
+                &build_key("storageclasses", None, "standard"),
+                &storage_class("standard", true),
+            )
+            .await
+            .unwrap();
+
+        let pvc = pvc_without_storage_class("held-name-pvc");
+        let pv_name = "pvc-default-held-name-pvc";
+
+        // A volume already under the deterministic name, claimed by a
+        // *different* incarnation of this claim — exactly the state left behind
+        // by a delete-and-recreate.
+        let controller = DynamicProvisionerController::new(storage.clone());
+        let mut orphan = controller
+            .create_pv_for_pvc(&storage_class("standard", true), &pvc, pv_name)
+            .await
+            .unwrap();
+        orphan.spec.claim_ref = Some(ObjectReference {
+            kind: Some("PersistentVolumeClaim".to_string()),
+            namespace: Some("default".to_string()),
+            name: Some("held-name-pvc".to_string()),
+            uid: Some("a-previous-incarnation".to_string()),
+            api_version: Some("v1".to_string()),
+            resource_version: None,
+            field_path: None,
+        });
+        storage
+            .create(&build_key("persistentvolumes", None, pv_name), &orphan)
+            .await
+            .unwrap();
+
+        controller.provision_volume(&pvc).await.unwrap();
+
+        let events = events_for(&storage, "held-name-pvc").await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].reason, "ProvisioningFailed");
+        assert_eq!(events[0].event_type, EventType::Warning);
+        assert!(events[0].message.contains(pv_name), "{}", events[0].message);
+        assert!(
+            events[0].message.contains("a-previous-incarnation"),
+            "the event must name who holds the volume, not just that it is held: {}",
+            events[0].message
+        );
+    }
+
+    /// The ordinary retry: the volume under this name is *this* claim's. Saying
+    /// something here would train the reader to ignore the message that matters.
+    #[tokio::test]
+    async fn our_own_existing_volume_is_not_reported_as_a_conflict() {
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .create(
+                &build_key("storageclasses", None, "standard"),
+                &storage_class("standard", true),
+            )
+            .await
+            .unwrap();
+
+        let pvc = pvc_without_storage_class("our-own-pvc");
+        let controller = DynamicProvisionerController::new(storage.clone());
+
+        // First pass provisions; second pass finds it already there.
+        controller.provision_volume(&pvc).await.unwrap();
+        controller.provision_volume(&pvc).await.unwrap();
+
+        assert!(
+            events_for(&storage, "our-own-pvc").await.is_empty(),
+            "an unclaimed volume we provisioned ourselves is not a conflict"
+        );
+    }
+
+    /// A claim nothing will ever provision must say so. `Pending` with an empty
+    /// Events section is the state that gave the operator nothing to go on.
+    #[tokio::test]
+    async fn a_claim_with_no_storage_class_at_all_says_why() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = DynamicProvisionerController::new(storage.clone());
+        let pvc = pvc_without_storage_class("no-class-at-all-pvc");
+
+        controller.provision_volume(&pvc).await.unwrap();
+
+        let events = events_for(&storage, "no-class-at-all-pvc").await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].reason, "ProvisioningFailed");
+        assert!(
+            events[0].message.contains("is-default-class"),
+            "the message has to say what would fix it: {}",
+            events[0].message
+        );
     }
 
     /// The other half of the same fix: when no `StorageClass` is marked
@@ -692,12 +882,20 @@ mod tests {
         let mut pvc = pvc_without_storage_class("empty-volume-name-pvc");
         pvc.spec.storage_class_name = Some("standard".to_string());
         pvc.spec.volume_name = Some(String::new());
-        let pvc_key = build_key("persistentvolumeclaims", Some("default"), "empty-volume-name-pvc");
+        let pvc_key = build_key(
+            "persistentvolumeclaims",
+            Some("default"),
+            "empty-volume-name-pvc",
+        );
         storage.create(&pvc_key, &pvc).await.unwrap();
 
         controller.reconcile_all().await.unwrap();
 
-        let pv_key = build_key("persistentvolumes", None, "pvc-default-empty-volume-name-pvc");
+        let pv_key = build_key(
+            "persistentvolumes",
+            None,
+            "pvc-default-empty-volume-name-pvc",
+        );
         assert!(
             storage.get::<PersistentVolume>(&pv_key).await.is_ok(),
             "a PVC with an explicit empty volumeName must still be provisioned, matching real k8s semantics where empty == unset"

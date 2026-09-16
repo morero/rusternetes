@@ -5,6 +5,62 @@ use rusternetes_storage::{build_prefix, Storage, WorkQueue, RECONCILE_ALL_SENTIN
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
+/// Record a `Warning`/`Normal` event against an object, once.
+///
+/// A free function rather than another method, because the controllers that
+/// most need to say something are not the events controller: a claim that
+/// cannot be provisioned sits `Pending` with **no event at all**, and the
+/// operator has nothing to go on — which is exactly how an orphaned
+/// `PersistentVolume` holding a deterministic name cost an hour before anyone
+/// found it (ISSUES.md #70).
+///
+/// Deduplicated by `(object, reason, uid)`, matching
+/// `EventsController::create_event_if_new`: the same complaint on every
+/// reconcile would rewrite storage once a second for as long as the condition
+/// lasts. A *different* reason produces a different name and so is still
+/// reported.
+pub async fn record_event_once<S: Storage>(
+    storage: &S,
+    namespace: &str,
+    involved_object: ObjectReference,
+    reason: &str,
+    message: &str,
+    event_type: EventType,
+    component: &str,
+) {
+    let event_name = Event::generate_name(&involved_object, reason);
+    let key = format!("/registry/events/{}/{}", namespace, event_name);
+    if storage.get::<Event>(&key).await.is_ok() {
+        return;
+    }
+
+    let mut event = Event::new(
+        event_name,
+        namespace.to_string(),
+        involved_object,
+        reason.to_string(),
+        message.to_string(),
+        event_type,
+    );
+    event.source = EventSource {
+        component: component.to_string(),
+        host: None,
+    };
+
+    if let Err(e) = storage.create(&key, &event).await {
+        // Failing to record why something is stuck must not make the caller
+        // fail too — it would replace a silent stall with a noisy one and fix
+        // neither.
+        tracing::warn!(
+            "Could not record {} event for {}/{}: {}",
+            reason,
+            namespace,
+            event.involved_object.name.as_deref().unwrap_or("unknown"),
+            e
+        );
+    }
+}
+
 /// EventsController creates events for pod lifecycle changes
 pub struct EventsController<S: Storage> {
     storage: Arc<S>,
