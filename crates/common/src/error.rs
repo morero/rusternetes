@@ -236,10 +236,27 @@ fn extract_resource_details_for_invalid(msg: &str) -> Option<crate::types::Statu
         group: None,
         kind: None,
         uid: None,
-        causes: Some(vec![crate::types::StatusCause {
-            reason: Some("FieldValueInvalid".to_string()),
-            message: Some(msg.to_string()),
-            field: field_path_of_invalid(msg),
+        causes: Some(vec![match field_path_of_invalid(msg) {
+            // `kubectl` renders a cause as `<field>: <message>`, so a message
+            // that repeats its own path prints it twice — `spec.isolation:
+            // spec.isolation: Unsupported value: ...`, seen live. Upstream
+            // splits them: the *top-level* Status message carries the full
+            // text, and the cause carries the path and the remainder
+            // separately. Do the same.
+            Some(field) => crate::types::StatusCause {
+                reason: Some("FieldValueInvalid".to_string()),
+                message: Some(
+                    msg.strip_prefix(&format!("{field}: "))
+                        .unwrap_or(msg)
+                        .to_string(),
+                ),
+                field: Some(field),
+            },
+            None => crate::types::StatusCause {
+                reason: Some("FieldValueInvalid".to_string()),
+                message: Some(msg.to_string()),
+                field: None,
+            },
         }]),
         retry_after_seconds: None,
     })
@@ -247,6 +264,8 @@ fn extract_resource_details_for_invalid(msg: &str) -> Option<crate::types::Statu
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "axum-support")]
+    use super::extract_resource_details_for_invalid;
     use super::field_path_of_invalid as field_of;
 
     /// The case from ISSUES.md #67: the reported field must be the one that is
@@ -286,5 +305,40 @@ mod tests {
     #[test]
     fn a_message_with_no_colon_names_no_field() {
         assert_eq!(field_of("something went wrong"), None);
+    }
+
+    /// `kubectl` prints a cause as `<field>: <message>`. A cause whose message
+    /// repeats the path therefore renders it twice — observed live as
+    /// `spec.isolation: spec.isolation: Unsupported value: "shared"`.
+    #[cfg(feature = "axum-support")]
+    #[test]
+    fn the_cause_message_does_not_repeat_the_field_path() {
+        let cause = extract_resource_details_for_invalid(
+            "spec.isolation: Unsupported value: \"shared\": supported values: \"Shared\"",
+        )
+        .and_then(|d| d.causes)
+        .and_then(|c| c.into_iter().next())
+        .unwrap();
+        assert_eq!(cause.field.as_deref(), Some("spec.isolation"));
+        assert_eq!(
+            cause.message.as_deref(),
+            Some("Unsupported value: \"shared\": supported values: \"Shared\"")
+        );
+    }
+
+    /// When no field is named the message must survive whole, or the reader
+    /// loses the only information there was.
+    #[cfg(feature = "axum-support")]
+    #[test]
+    fn a_prose_message_is_carried_through_intact() {
+        let cause = extract_resource_details_for_invalid("failed to decode: bad input")
+            .and_then(|d| d.causes)
+            .and_then(|c| c.into_iter().next())
+            .unwrap();
+        assert_eq!(cause.field, None);
+        assert_eq!(
+            cause.message.as_deref(),
+            Some("failed to decode: bad input")
+        );
     }
 }
