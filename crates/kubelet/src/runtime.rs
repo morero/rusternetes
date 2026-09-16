@@ -1810,6 +1810,95 @@ impl ContainerRuntime {
         Ok(Some(hosts_path))
     }
 
+    /// Remove this pod's containers that are attached to a network namespace
+    /// other than the pause container's.
+    ///
+    /// `--network container:<name>` is resolved once, at creation, and Docker
+    /// reports it as `container:<id>` from then on. A container therefore keeps
+    /// pointing at the exact sandbox it joined — including after that sandbox
+    /// has been destroyed and replaced. There is no way to re-attach it, so the
+    /// only repair is to remove it and let it be recreated.
+    ///
+    /// Only `container:` network modes are considered. `ns:<path>` (CNI), `host`
+    /// and named networks belong to other arrangements and are left alone.
+    async fn remove_stranded_dependents(&self, pod_name: &str, pause_id: Option<&str>) {
+        let pause_name = format!("{}_pause", pod_name);
+        let current_by_name = format!("container:{}", pause_name);
+        let current_by_id = pause_id.map(|id| format!("container:{}", id));
+
+        let mut filters = HashMap::new();
+        filters.insert("name".to_string(), vec![format!("{}_", pod_name)]);
+        let containers = match self
+            .docker
+            .list_containers(Some(ListContainersOptions {
+                all: true,
+                filters,
+                ..Default::default()
+            }))
+            .await
+        {
+            Ok(containers) => containers,
+            Err(e) => {
+                warn!(
+                    "Could not list containers for pod {} to check sandbox attachment: {}",
+                    pod_name, e
+                );
+                return;
+            }
+        };
+
+        for c in &containers {
+            let is_pause = c
+                .names
+                .as_ref()
+                .map(|names| names.iter().any(|n| n.contains(&pause_name)))
+                .unwrap_or(false);
+            if is_pause {
+                continue;
+            }
+            let Some(network_mode) = c
+                .host_config
+                .as_ref()
+                .and_then(|hc| hc.network_mode.as_deref())
+            else {
+                continue;
+            };
+            if !network_mode.starts_with("container:") {
+                continue;
+            }
+            if network_mode == current_by_name || current_by_id.as_deref() == Some(network_mode) {
+                continue;
+            }
+            let Some(id) = &c.id else { continue };
+            warn!(
+                "Container {} of pod {} is attached to {}, not to the pod's current sandbox {}. \
+                 Removing it so it is recreated in the live namespace — it has no network where \
+                 it is (ISSUES.md #65).",
+                c.names
+                    .as_ref()
+                    .and_then(|n| n.first().cloned())
+                    .unwrap_or_else(|| id.clone()),
+                pod_name,
+                network_mode,
+                current_by_id.as_deref().unwrap_or(&current_by_name)
+            );
+            let _ = self
+                .docker
+                .stop_container(id, Some(bollard::container::StopContainerOptions { t: 0 }))
+                .await;
+            let _ = self
+                .docker
+                .remove_container(
+                    id,
+                    Some(bollard::container::RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+        }
+    }
+
     /// Start a pause (infra) container for a pod in non-CNI mode.
     ///
     /// The pause container holds the pod's network namespace. All real containers
@@ -1830,8 +1919,28 @@ impl ContainerRuntime {
         {
             let state = inspect.state.as_ref();
             let is_running = state.and_then(|s| s.running).unwrap_or(false);
+            // Captured before the pause container is removed: dependents record
+            // the namespace they joined by **id**, so this is what identifies
+            // them afterwards.
+            let existing_pause_id = inspect.id.clone();
 
             if is_running {
+                // A running pause container is not by itself proof that the pod
+                // is intact: a workload container can be attached to a *previous*
+                // sandbox that no longer exists. That happens whenever the pause
+                // container is rebuilt by something that did not take the
+                // dependents with it — an older kubelet, or a crash between the
+                // two steps — and it survives a kubelet restart, because from
+                // then on every check sees a running pause and a running
+                // workload and concludes the pod is fine.
+                //
+                // Clearing the stranded container here is what makes the pod
+                // self-healing rather than only correctly-rebuilt: the normal
+                // container-start path then recreates it in the sandbox that
+                // actually exists (ISSUES.md #65).
+                self.remove_stranded_dependents(pod_name, existing_pause_id.as_deref())
+                    .await;
+
                 // Pause container is already running — return its IP
                 if let Some(network_settings) = inspect.network_settings {
                     if let Some(networks) = network_settings.networks {
@@ -1860,13 +1969,34 @@ impl ContainerRuntime {
                 }))
                 .await
             {
-                let network_mode_key = format!("container:{}", pause_name);
+                // Match on the pause container's **id** as well as its name.
+                //
+                // A container is created with `--network container:<name>`, but
+                // Docker resolves that to an id and reports `NetworkMode` as
+                // `container:<id>` forever after. Comparing only against the
+                // name therefore never matched, so dependents were never
+                // removed — and that is not a tidiness problem: a workload
+                // container is bound to a specific network namespace at
+                // creation, so leaving it in place while the pause container is
+                // rebuilt leaves it attached to the **dead** namespace. The pod
+                // then reports the new sandbox's IP while nothing listens on it.
+                //
+                // Observed exactly that after the sandbox-liveness fix began
+                // rebuilding pause containers: podinfo's pod reported
+                // 172.19.0.5 (the new pause's address) and connections to it
+                // were refused, because the workload was still in the old one
+                // (ISSUES.md #65).
+                let old_pause_id = existing_pause_id.as_deref();
+                let network_mode_by_name = format!("container:{}", pause_name);
                 for c in &containers {
                     let is_dependent = c
                         .host_config
                         .as_ref()
                         .and_then(|hc| hc.network_mode.as_deref())
-                        .map(|nm| nm == network_mode_key)
+                        .map(|nm| {
+                            nm == network_mode_by_name
+                                || old_pause_id.is_some_and(|id| nm == format!("container:{id}"))
+                        })
                         .unwrap_or(false);
                     if is_dependent {
                         if let Some(id) = &c.id {
@@ -5875,7 +6005,78 @@ impl ContainerRuntime {
                 .map(|names| names.iter().any(|n| !n.contains(&pause_suffix)))
                 .unwrap_or(false)
         });
-        Ok(has_app_container)
+
+        // ...and that the sandbox is running too.
+        //
+        // The check above is one-directional: it was written for "pause up, app
+        // down" and correctly calls that not-running. The inverse — **app up,
+        // pause down** — was never considered, and it is worse, because the app
+        // container shares the pause container's network namespace. When the
+        // pause container dies the workload keeps running with **no network at
+        // all**, and the pod reports `Running` and `Ready` while nothing can
+        // reach it.
+        //
+        // Nothing recovered it. `start_pod` -> `start_pause_container` already
+        // removes a non-running pause container and rebuilds the sandbox
+        // correctly; it was simply never called, because this function said the
+        // pod was fine. Reproduced deterministically by killing a pause
+        // container: two minutes later the workload was still "Up" against a
+        // dead namespace and the pod still read `Running`/`Ready` (ISSUES.md
+        // #65).
+        //
+        // Under CNI there is no pause container to check — the network is the
+        // plugin's, not a shared namespace — so the sandbox condition only
+        // applies to the Podman-networking path that creates one.
+        let running_pause = containers.iter().find(|c| {
+            c.names
+                .as_ref()
+                .map(|names| names.iter().any(|n| n.contains(&pause_suffix)))
+                .unwrap_or(false)
+        });
+        let sandbox_running = self.use_cni || running_pause.is_some();
+
+        // ...and that the app containers are in *that* sandbox.
+        //
+        // "A pause is running" and "the workload is in the pause's namespace"
+        // are different facts, and the gap between them is not hypothetical:
+        // a container records the namespace it joined by id at creation and can
+        // never be re-attached, so a workload left over from a previous sandbox
+        // keeps running with no network while both containers report Up. That
+        // state survives a kubelet restart, and every check that looks only at
+        // liveness calls it healthy forever.
+        //
+        // Saying not-running here is what routes the pod to
+        // `remove_stranded_dependents`, which removes the stranded container so
+        // the normal start path recreates it in the live namespace.
+        let app_containers_in_sandbox = running_pause.is_none_or(|pause| {
+            let by_name = format!("container:{}", pause_suffix);
+            let by_id = pause.id.as_deref().map(|id| format!("container:{}", id));
+            containers
+                .iter()
+                .filter(|c| {
+                    c.names
+                        .as_ref()
+                        .map(|names| !names.iter().any(|n| n.contains(&pause_suffix)))
+                        .unwrap_or(false)
+                })
+                .all(|c| {
+                    match c
+                        .host_config
+                        .as_ref()
+                        .and_then(|hc| hc.network_mode.as_deref())
+                    {
+                        // Only the shared-namespace arrangement is checkable
+                        // here; `ns:<path>`, `host` and named networks are other
+                        // arrangements and are not this function's business.
+                        Some(nm) if nm.starts_with("container:") => {
+                            nm == by_name || by_id.as_deref() == Some(nm)
+                        }
+                        _ => true,
+                    }
+                })
+        });
+
+        Ok(has_app_container && sandbox_running && app_containers_in_sandbox)
     }
 
     /// Check if any app (non-init, non-pause) container has been created for a pod.
