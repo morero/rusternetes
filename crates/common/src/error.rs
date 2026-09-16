@@ -236,14 +236,19 @@ fn extract_resource_details_for_invalid(msg: &str) -> Option<crate::types::Statu
         group: None,
         kind: None,
         uid: None,
-        causes: Some(vec![match field_path_of_invalid(msg) {
+        // No identifiable field means no cause. `kubectl` prints a cause as
+        // `<field>: <message>`, so an empty field renders a stray leading colon
+        // — `The request is invalid: : strict decoding error: ...`, seen live.
+        // Upstream omits the cause entirely when it has nothing to point at,
+        // and the top-level message still carries the full text.
+        causes: field_path_of_invalid(msg).map(|field| {
             // `kubectl` renders a cause as `<field>: <message>`, so a message
             // that repeats its own path prints it twice — `spec.isolation:
             // spec.isolation: Unsupported value: ...`, seen live. Upstream
             // splits them: the *top-level* Status message carries the full
             // text, and the cause carries the path and the remainder
             // separately. Do the same.
-            Some(field) => crate::types::StatusCause {
+            vec![crate::types::StatusCause {
                 reason: Some("FieldValueInvalid".to_string()),
                 message: Some(
                     msg.strip_prefix(&format!("{field}: "))
@@ -251,13 +256,8 @@ fn extract_resource_details_for_invalid(msg: &str) -> Option<crate::types::Statu
                         .to_string(),
                 ),
                 field: Some(field),
-            },
-            None => crate::types::StatusCause {
-                reason: Some("FieldValueInvalid".to_string()),
-                message: Some(msg.to_string()),
-                field: None,
-            },
-        }]),
+            }]
+        }),
         retry_after_seconds: None,
     })
 }
@@ -326,19 +326,16 @@ mod tests {
         );
     }
 
-    /// When no field is named the message must survive whole, or the reader
-    /// loses the only information there was.
+    /// A cause that points at nothing is worse than no cause: kubectl renders
+    /// it as a bare `: message`. The top-level message still carries the text.
     #[cfg(feature = "axum-support")]
     #[test]
-    fn a_prose_message_is_carried_through_intact() {
-        let cause = extract_resource_details_for_invalid("failed to decode: bad input")
-            .and_then(|d| d.causes)
-            .and_then(|c| c.into_iter().next())
-            .unwrap();
-        assert_eq!(cause.field, None);
+    fn a_message_with_no_field_path_emits_no_cause() {
+        let causes = extract_resource_details_for_invalid("failed to decode: bad input")
+            .and_then(|d| d.causes);
         assert_eq!(
-            cause.message.as_deref(),
-            Some("failed to decode: bad input")
+            causes, None,
+            "a cause with no field renders in kubectl as a bare leading colon"
         );
     }
 }
