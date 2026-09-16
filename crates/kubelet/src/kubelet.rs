@@ -199,9 +199,12 @@ fn is_transient_volume_wait_error(err_msg: &str) -> bool {
 /// worst case is restarting a pod that meant `Never`, which is visible, rather
 /// than abandoning one that meant `Always`, which is not.
 ///
-/// This exists because the raw value was compared against string literals at two
-/// separate sites, and an empty string matched no arm at either — falling into a
-/// silent `_ => {}`. A protobuf client's undefaulted PodSpec sends `""` for unset
+/// This exists because the raw value was compared against string literals at
+/// **seven** separate sites, and an empty string matched no arm at most of them —
+/// falling into a silent `_ => {}`. The first version of this fix converted two
+/// of them and claimed that was all; it was not, and the liveness-probe restart
+/// site in particular still dropped an empty policy on the floor without so much
+/// as a log line. A protobuf client's undefaulted PodSpec sends `""` for unset
 /// value-type fields (see the api-server's `is_unset`), so `platform-db-cluster-1`
 /// sat at `phase: Running` with both containers `Exited (0)` for sixteen hours:
 /// no restart, no status update, no log line. Normalising once means a new
@@ -1479,11 +1482,8 @@ impl Kubelet {
             .and_then(|s| s.phase.as_ref())
             .map(|p| matches!(p, Phase::Succeeded | Phase::Failed))
             .unwrap_or(false);
-        let restart_policy = pod
-            .spec
-            .as_ref()
-            .and_then(|s| s.restart_policy.as_deref())
-            .unwrap_or("Always");
+        let restart_policy =
+            effective_restart_policy(pod.spec.as_ref().and_then(|s| s.restart_policy.as_deref()));
         let terminal_and_done = is_terminal_phase && restart_policy != "Always";
         let needs_terminating = (pod.metadata.deletion_timestamp.is_some() || terminal_and_done)
             && matches!(current_state, PodWorkerState::SyncPod);
@@ -2327,11 +2327,12 @@ impl Kubelet {
                                 //   K8s kubelet marks unrecoverable pods as Failed via TerminatePod
                                 //   K8s ref: pkg/kubelet/status/status_manager.go:629
                                 // - Transient failures with RestartAlways: pod stays Pending
-                                let restart_policy = new_pod
-                                    .spec
-                                    .as_ref()
-                                    .and_then(|s| s.restart_policy.as_deref())
-                                    .unwrap_or("Always");
+                                let restart_policy = effective_restart_policy(
+                                    new_pod
+                                        .spec
+                                        .as_ref()
+                                        .and_then(|s| s.restart_policy.as_deref()),
+                                );
                                 // K8s does NOT transition to TerminatingPod for container
                                 // creation errors. It retries in SyncPod state. The pod stays
                                 // Pending and the controller (StatefulSet, etc.) handles it.
@@ -2770,10 +2771,9 @@ impl Kubelet {
                 // Check if all spec containers have terminated (pause container may still be running).
                 // This must happen before liveness probes, which may error on exited containers.
                 {
-                    let restart_policy =
-                        effective_restart_policy(pod.spec.as_ref().and_then(|s| {
-                            s.restart_policy.as_deref()
-                        }));
+                    let restart_policy = effective_restart_policy(
+                        pod.spec.as_ref().and_then(|s| s.restart_policy.as_deref()),
+                    );
 
                     if restart_policy == "Never" || restart_policy == "OnFailure" {
                         if let Ok(container_statuses) =
@@ -2879,11 +2879,9 @@ impl Kubelet {
                 // machine to advance twice, which can make intermittent probe results flip
                 // the ready state from true to false within a single sync cycle.
                 {
-                    let restart_policy = pod
-                        .spec
-                        .as_ref()
-                        .and_then(|s| s.restart_policy.as_deref())
-                        .unwrap_or("Always");
+                    let restart_policy = effective_restart_policy(
+                        pod.spec.as_ref().and_then(|s| s.restart_policy.as_deref()),
+                    );
 
                     // K8s restarts containers for:
                     // - Always: restart all terminated containers
@@ -3191,11 +3189,9 @@ impl Kubelet {
                 let needs_restart = self.runtime.check_liveness(pod).await.unwrap_or(false);
                 {
                     if needs_restart {
-                        let restart_policy = pod
-                            .spec
-                            .as_ref()
-                            .and_then(|s| s.restart_policy.as_deref())
-                            .unwrap_or("Always");
+                        let restart_policy = effective_restart_policy(
+                            pod.spec.as_ref().and_then(|s| s.restart_policy.as_deref()),
+                        );
 
                         match restart_policy {
                             "Always" | "OnFailure" => {
@@ -3355,11 +3351,9 @@ impl Kubelet {
                             let all_ready = container_statuses.iter().all(|s| s.ready);
 
                             // Check if all containers have terminated (for Never/OnFailure restart policies)
-                            let restart_policy = pod
-                                .spec
-                                .as_ref()
-                                .and_then(|s| s.restart_policy.as_deref())
-                                .unwrap_or("Always");
+                            let restart_policy = effective_restart_policy(
+                                pod.spec.as_ref().and_then(|s| s.restart_policy.as_deref()),
+                            );
 
                             let all_terminated = !container_statuses.is_empty()
                                 && container_statuses.iter().all(|cs| {
@@ -3569,10 +3563,9 @@ impl Kubelet {
             }
             Phase::Running if !is_running => {
                 // Containers have stopped — decide based on restart policy
-                let restart_policy =
-                    effective_restart_policy(pod.spec.as_ref().and_then(|s| {
-                        s.restart_policy.as_deref()
-                    }));
+                let restart_policy = effective_restart_policy(
+                    pod.spec.as_ref().and_then(|s| s.restart_policy.as_deref()),
+                );
 
                 let container_statuses = self.runtime.get_container_statuses(pod).await.ok();
                 let any_failed = container_statuses
@@ -4489,8 +4482,40 @@ mod tests {
     #[test]
     fn the_three_legal_restart_policies_are_preserved() {
         assert_eq!(super::effective_restart_policy(Some("Never")), "Never");
-        assert_eq!(super::effective_restart_policy(Some("OnFailure")), "OnFailure");
+        assert_eq!(
+            super::effective_restart_policy(Some("OnFailure")),
+            "OnFailure"
+        );
         assert_eq!(super::effective_restart_policy(Some("Always")), "Always");
+    }
+
+    /// The guard the first version of this fix needed and did not have.
+    ///
+    /// It converted two comparison sites and asserted in its own doc comment
+    /// that no third could reintroduce the gap. There were five more, and one
+    /// of them — the liveness-probe restart — silently dropped an empty policy
+    /// through a `_ => {}` arm for as long as that claim stood unchecked.
+    ///
+    /// A prose claim about every call site can only be enforced by checking
+    /// every call site, so this reads the source and does exactly that. It fails
+    /// loudly on a new raw read rather than waiting for a pod to sit dead.
+    #[test]
+    fn no_call_site_reads_the_restart_policy_without_normalising_it() {
+        let source = include_str!("kubelet.rs");
+        // Assembled rather than written out, so this test does not match itself.
+        let needle = format!("unwrap_or({:?})", "Always");
+        let offenders: Vec<_> = source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains(&needle))
+            .map(|(n, line)| format!("line {}: {}", n + 1, line.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "a raw restart-policy read defaults `Some(\"\")` to itself, not to Always, and then \
+             matches no arm. Use effective_restart_policy() instead:\n{}",
+            offenders.join("\n")
+        );
     }
 
     #[test]
