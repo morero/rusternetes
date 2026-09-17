@@ -18,7 +18,7 @@ use rusternetes_common::{authz::AuthzStorage, Error, Result};
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Storage implementation backed by a rhino backend.
 ///
@@ -104,6 +104,16 @@ impl<B: Backend> RhinoStorage<B> {
             json.to_string()
         }
     }
+}
+
+/// How many times a CAS rejected with an unchanged revision is retried
+/// before it is reported as a conflict. See `update`.
+const CAS_RETRIES: u32 = 4;
+
+/// 20ms, 40ms, 80ms, 160ms — long enough for the SQLite backend's second
+/// statement to land, short enough that a request never visibly stalls.
+fn cas_retry_backoff(attempt: u32) -> Duration {
+    Duration::from_millis(20 << attempt.min(3))
 }
 
 #[async_trait]
@@ -214,11 +224,40 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
                 }
             }
 
-            let (rev, prev_kv, succeeded) = self
-                .backend
-                .update(key, json.as_bytes(), expected_mod_revision, 0)
-                .await
-                .map_err(|e| Error::Storage(format!("Failed to update resource: {}", e)))?;
+            // A rejected CAS whose "current" revision equals the one we asked
+            // for is not a conflict — nothing moved. It means the backend's
+            // write failed for its own reasons and reported it as a mismatch.
+            // In the SQLite backend the write is two statements (the row, then
+            // the pointer to it in `kine_current`) outside a transaction, so a
+            // writer can see the pointer before it is updated, lose the unique
+            // index on (name, prev_revision), and be told the revision is
+            // unchanged. Retrying a moment later is what that race needs, and
+            // it is safe: the CAS itself still guards every attempt, so a real
+            // concurrent change is still rejected. See ISSUES #79.
+            let mut attempt = 0;
+            let (rev, prev_kv, succeeded) = loop {
+                let (rev, prev_kv, succeeded) = self
+                    .backend
+                    .update(key, json.as_bytes(), expected_mod_revision, 0)
+                    .await
+                    .map_err(|e| Error::Storage(format!("Failed to update resource: {}", e)))?;
+
+                let unmoved = prev_kv
+                    .as_ref()
+                    .is_some_and(|kv| kv.mod_revision == expected_mod_revision);
+                if succeeded || !unmoved || attempt >= CAS_RETRIES {
+                    if !succeeded && unmoved {
+                        warn!(
+                            "Update of {} rejected {} times with an unchanged revision ({}) — \
+                             the backend is failing the write, not detecting a conflict",
+                            key, attempt, incoming_rv
+                        );
+                    }
+                    break (rev, prev_kv, succeeded);
+                }
+                tokio::time::sleep(cas_retry_backoff(attempt)).await;
+                attempt += 1;
+            };
 
             if !succeeded {
                 let current_rv = prev_kv
@@ -526,5 +565,24 @@ impl<B: Backend + Send + Sync + 'static> AuthzStorage for RhinoStorage<B> {
         };
 
         Storage::list(self, &prefix).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cas_retry_backoff, CAS_RETRIES};
+
+    #[test]
+    fn cas_retry_backoff_grows_and_stays_bounded() {
+        assert_eq!(cas_retry_backoff(0).as_millis(), 20);
+        assert_eq!(cas_retry_backoff(1).as_millis(), 40);
+        assert_eq!(cas_retry_backoff(3).as_millis(), 160);
+        // The shift is capped, so no attempt count can overflow it.
+        assert_eq!(cas_retry_backoff(99), cas_retry_backoff(3));
+        // The whole budget stays well under a request timeout.
+        let total: u128 = (0..CAS_RETRIES)
+            .map(|a| cas_retry_backoff(a).as_millis())
+            .sum();
+        assert!(total < 500, "retry budget too long: {total}ms");
     }
 }
