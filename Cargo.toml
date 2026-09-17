@@ -21,6 +21,10 @@ license = "Apache-2.0"
 repository = "https://github.com/rusternetes/rusternetes"
 
 [workspace.dependencies]
+# `zlib-rs`, not the default miniz_oxide backend: `set_dictionary` is only
+# available with a real zlib, and SPDY header blocks cannot be inflated without
+# it. zlib-rs keeps that pure Rust rather than pulling in libz-sys.
+flate2 = { version = "1", features = ["zlib-rs"] }
 tokio = { version = "1.40", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
