@@ -286,6 +286,9 @@ impl<S: Storage + 'static> TTLController<S> {
             // Check if this Pod is owned by the Job
             if let Some(owner_refs) = &pod.metadata.owner_references {
                 if owner_refs.iter().any(|o| o.uid == job_uid) {
+                    // Raw, deliberately: see `pod_deletion`'s rule. These are
+                    // the pods of a *finished* Job, so their containers have
+                    // already exited and there is no kubelet work to wait for.
                     let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
                     if let Err(e) = self.storage.delete(&pod_key).await {
                         warn!("Failed to delete pod {}: {}", pod.metadata.name, e);

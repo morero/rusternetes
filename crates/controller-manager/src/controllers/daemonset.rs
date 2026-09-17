@@ -477,6 +477,13 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                     // so it will be treated as needing a new pod).
                     // K8s ref: pkg/controller/daemon/daemon_controller.go — podsShouldBeOnNode
                     let pod_name = &pod.metadata.name;
+                    // A raw delete, deliberately. The rule applied elsewhere in
+                    // this file is "mark it and let the kubelet stop the
+                    // containers" (ISSUES.md #76) — but this pod is *terminal*,
+                    // so its containers have already exited and there is nothing
+                    // for a kubelet to stop. Marking it would only delay the
+                    // replacement the comment above depends on being created in
+                    // the same sync cycle.
                     let pod_key = format!("/registry/pods/{}/{}", namespace, pod_name);
                     if let Err(e) = self.storage.delete(&pod_key).await {
                         warn!(
@@ -676,8 +683,13 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                     break;
                 }
                 let pod_name = &pod.metadata.name;
-                let pod_key = format!("/registry/pods/{}/{}", namespace, pod_name);
-                if let Ok(()) = self.storage.delete(&pod_key).await {
+                if let Ok(()) = super::pod_deletion::delete_pod_gracefully(
+                    self.storage.as_ref(),
+                    namespace,
+                    pod_name,
+                )
+                .await
+                {
                     info!(
                         "Rolling update: deleted unavailable old pod {} on node {} (budget {}/{})",
                         pod_name,
@@ -695,8 +707,13 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                     break;
                 }
                 let pod_name = &pod.metadata.name;
-                let pod_key = format!("/registry/pods/{}/{}", namespace, pod_name);
-                if let Ok(()) = self.storage.delete(&pod_key).await {
+                if let Ok(()) = super::pod_deletion::delete_pod_gracefully(
+                    self.storage.as_ref(),
+                    namespace,
+                    pod_name,
+                )
+                .await
+                {
                     info!(
                         "Rolling update: deleted old pod {} on node {} (hash != {}, budget {}/{})",
                         pod_name,
@@ -719,10 +736,19 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         for (node_name, pod) in pods_by_node.iter() {
             if !eligible_node_names.contains(node_name.as_str()) {
                 let pod_name = &pod.metadata.name;
-                let pod_key = format!("/registry/pods/{}/{}", namespace, pod_name);
-                self.storage.delete(&pod_key).await?;
+                // A node leaves this set for two different reasons — it was
+                // removed, or it simply stopped matching — and they need
+                // opposite mechanisms. `delete_pod_respecting_node` decides from
+                // whether the node is still there.
+                super::pod_deletion::delete_pod_respecting_node(
+                    self.storage.as_ref(),
+                    namespace,
+                    pod_name,
+                    node_name,
+                )
+                .await?;
                 info!(
-                    "Deleted DaemonSet pod {} from ineligible node {}",
+                    "Removed DaemonSet pod {} from ineligible node {}",
                     pod_name, node_name
                 );
             }

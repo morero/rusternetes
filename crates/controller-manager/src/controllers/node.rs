@@ -510,6 +510,15 @@ impl<S: Storage + 'static> NodeController<S> {
                 .ok_or_else(|| anyhow::anyhow!("Pod has no namespace"))?;
             let pod_name = &pod.metadata.name;
 
+            // A raw delete, deliberately, and the one place it is right.
+            //
+            // Every other controller that removes a Pod now marks it and lets
+            // the kubelet stop the containers and clear the object (ISSUES.md
+            // #76, `pod_deletion::delete_pod_gracefully`). That cannot work
+            // here: this node has *failed*, so there is no kubelet left to
+            // confirm anything, and a Pod marked for deletion would sit
+            // Terminating forever. Real Kubernetes force-deletes in exactly
+            // this case, for exactly this reason.
             let pod_key = build_key("pods", Some(namespace), pod_name);
 
             match self.storage.delete(&pod_key).await {

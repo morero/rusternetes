@@ -17,6 +17,7 @@ pub mod loadbalancer;
 pub mod namespace;
 pub mod network_policy;
 pub mod node;
+pub mod pod_deletion;
 pub mod pod_disruption_budget;
 pub mod pv_binder;
 pub mod replicaset;

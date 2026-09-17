@@ -712,12 +712,15 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
         Ok(())
     }
 
+    /// Marks the Pod for deletion; the kubelet stops its containers and then
+    /// removes the object.
+    ///
+    /// This used to call `storage.delete` directly, which took the object out
+    /// from under the kubelet and left the containers running for 45-75 seconds
+    /// with nothing in the API to say so (ISSUES.md #76).
     async fn delete_pod(&self, name: &str, namespace: &str) -> rusternetes_common::Result<()> {
-        let key = build_key("pods", Some(namespace), name);
-        self.storage.delete(&key).await?;
-
-        info!("Deleted pod {}/{}", namespace, name);
-
+        super::pod_deletion::delete_pod_gracefully(self.storage.as_ref(), namespace, name).await?;
+        info!("Marked pod {}/{} for deletion", namespace, name);
         Ok(())
     }
 }

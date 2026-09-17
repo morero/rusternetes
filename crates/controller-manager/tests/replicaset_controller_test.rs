@@ -192,9 +192,32 @@ async fn test_replicaset_scales_down() {
     // Run controller again
     controller.reconcile_all().await.unwrap();
 
-    // Verify 2 pods remain
+    // Verify 2 pods remain *live*, and the other 3 are marked for the kubelet
+    // to terminate.
+    //
+    // This assertion used to be `pods.len() == 2` — it encoded the defect in
+    // ISSUES.md #76, where scaling down removed the Pod objects outright and
+    // left their containers running with nothing in the API to say so. The
+    // objects now survive until the kubelet has actually stopped the
+    // containers, so counting rows is no longer the same question as counting
+    // running workloads. That distinction is the whole point of the fix, and
+    // this test is where it is pinned.
     let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
-    assert_eq!(pods.len(), 2, "Should scale down to 2 pods");
+    let (terminating, live): (Vec<_>, Vec<_>) = pods
+        .iter()
+        .partition(|p| p.metadata.deletion_timestamp.is_some());
+    assert_eq!(live.len(), 2, "Should scale down to 2 live pods");
+    assert_eq!(
+        terminating.len(),
+        3,
+        "the other 3 are marked for deletion, not erased"
+    );
+    assert!(
+        terminating
+            .iter()
+            .all(|p| p.metadata.deletion_grace_period_seconds.is_some()),
+        "a marked pod carries the grace period the kubelet honours"
+    );
 }
 
 #[tokio::test]
