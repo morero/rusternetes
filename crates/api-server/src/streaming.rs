@@ -191,6 +191,7 @@ pub async fn handle_ws_exec(
     // channel byte) which we honor by dropping the writer half for stdin.
     let client_closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let client_closed2 = client_closed.clone();
+    let exec_id = exec.id.clone();
     tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
         let mut exec_input = exec_input;
@@ -219,10 +220,16 @@ pub async fn handle_ws_exec(
                             }
                         }
                     }
-                    // Channels 1-3 are server→client only; channel 4
-                    // (resize) is accepted but not acted on since bollard
-                    // doesn't expose resize_exec here; anything else (or a
-                    // close-stream for a channel other than stdin) needs no
+                    ClientFrame::Data(4, payload) if tty => {
+                        crate::remotecommand_session::resize_tty(
+                            docker,
+                            crate::remotecommand_session::TtyOwner::Exec(&exec_id),
+                            payload,
+                        )
+                        .await;
+                    }
+                    // Channels 1-3 are server→client only; anything else (or
+                    // a close-stream for a channel other than stdin) needs no
                     // action from this loop.
                     _ => {}
                 },
@@ -400,6 +407,7 @@ pub async fn handle_ws_attach(
     // channel 0) must not kill the container, so this only stops writing; any
     // stdinOnce semantics are the runtime's, as they are for real Kubernetes.
     let (client_gone_tx, mut client_gone_rx) = tokio::sync::oneshot::channel::<()>();
+    let tty_container = container_id.clone();
     tokio::spawn(async move {
         while let Some(msg) = ws_receiver.next().await {
             match msg {
@@ -417,7 +425,14 @@ pub async fn handle_ws_attach(
                             }
                         }
                     }
-                    // Resize (channel 4) is accepted and ignored, as for exec.
+                    ClientFrame::Data(4, payload) if tty => {
+                        crate::remotecommand_session::resize_tty(
+                            docker,
+                            crate::remotecommand_session::TtyOwner::Container(&tty_container),
+                            payload,
+                        )
+                        .await;
+                    }
                     _ => {}
                 },
                 _ => {}

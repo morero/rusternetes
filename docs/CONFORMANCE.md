@@ -210,7 +210,7 @@ Beyond basic CRUD, these API-level features are implemented:
 - **Table format** — Responses formatted for kubectl's tabular output
 - **Admission control** — Mutating and validating webhooks, ValidatingAdmissionPolicy with CEL
 - **CRD features** — Schema validation, status subresource, scale subresource, categories
-- **Pod operations** — Exec via WebSocket (`v4`/`v5.channel.k8s.io`), which is kubectl's default. Port-forward via SPDY/3.1, both tunnelled over WebSocket (`SPDY/3.1+portforward.k8s.io`) and as a raw `SPDY/3.1` upgrade. **Not implemented:** attach on either transport (both handlers are stubs, so `kubectl attach` fails), and exec over raw SPDY (the handler has no upgrade path and returns command output as a plain body). The `spdy` module is Kubernetes' channel framing, not SPDY.
+- **Pod operations** — Exec and attach on both transports kubectl uses: WebSocket (`v5`/`v4.channel.k8s.io`, kubectl's default) and raw SPDY/3.1 (`v4.channel.k8s.io` down to `channel.k8s.io`, used with `KUBECTL_REMOTE_COMMAND_WEBSOCKETS=false` and by older clients). Both carry stdin, stdout, stderr, the exit code (`exit 3` gives kubectl exit code 3) and terminal resize. Port-forward via SPDY/3.1, both tunnelled over WebSocket (`SPDY/3.1+portforward.k8s.io`) and as a raw `SPDY/3.1` upgrade. The `spdy` module is Kubernetes' channel framing; the SPDY/3.1 wire protocol is in `spdy3`.
 - **Dry-run** — Server-side dry-run for create, update, and patch
 - **Selectors** — Field selectors and label selectors on list and watch
 - **Pagination** — Limit/continue token support for large collections

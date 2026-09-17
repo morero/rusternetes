@@ -451,6 +451,29 @@ async fn apply_resize(
     exec_id: Option<&str>,
     line: &[u8],
 ) {
+    match target {
+        Target::Exec { .. } => {
+            if let Some(id) = exec_id {
+                resize_tty(docker, TtyOwner::Exec(id), line).await;
+            }
+        }
+        Target::Attach { container_id } => {
+            resize_tty(docker, TtyOwner::Container(container_id), line).await;
+        }
+    }
+}
+
+/// Whose terminal a resize applies to: an exec session's, or the container's
+/// own (attach).
+pub(crate) enum TtyOwner<'a> {
+    Exec(&'a str),
+    Container(&'a str),
+}
+
+/// Applies one client-go `TerminalSize` (`{"Width":..,"Height":..}`, as sent
+/// on the SPDY resize stream and on WebSocket channel 4). Malformed input and
+/// runtime errors are ignored: a missed resize is cosmetic, not fatal.
+pub(crate) async fn resize_tty(docker: &bollard::Docker, owner: TtyOwner<'_>, json: &[u8]) {
     #[derive(serde::Deserialize)]
     struct Size {
         #[serde(rename = "Width")]
@@ -458,11 +481,11 @@ async fn apply_resize(
         #[serde(rename = "Height")]
         height: u16,
     }
-    let Ok(size) = serde_json::from_slice::<Size>(line) else {
+    let Ok(size) = serde_json::from_slice::<Size>(json) else {
         return;
     };
-    let result = match (target, exec_id) {
-        (Target::Exec { .. }, Some(id)) => docker
+    let result = match owner {
+        TtyOwner::Exec(id) => docker
             .resize_exec(
                 id,
                 bollard::exec::ResizeExecOptions {
@@ -472,9 +495,9 @@ async fn apply_resize(
             )
             .await
             .map(|_| ()),
-        (Target::Attach { container_id }, _) => docker
+        TtyOwner::Container(id) => docker
             .resize_container_tty(
-                container_id,
+                id,
                 bollard::container::ResizeContainerTtyOptions {
                     height: size.height,
                     width: size.width,
@@ -482,7 +505,6 @@ async fn apply_resize(
             )
             .await
             .map(|_| ()),
-        _ => Ok(()),
     };
     if let Err(e) = result {
         debug!("remotecommand: resize ignored: {e}");
