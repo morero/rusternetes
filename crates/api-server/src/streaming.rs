@@ -328,24 +328,148 @@ pub async fn handle_ws_exec(
 
 /// Handle WebSocket attach
 pub async fn handle_ws_attach(
-    mut socket: WebSocket,
+    socket: WebSocket,
     pod: Pod,
     container_name: String,
-    _stdin: bool,
-    _stdout: bool,
-    _stderr: bool,
-    _tty: bool,
+    stdin: bool,
+    stdout: bool,
+    stderr: bool,
+    tty: bool,
 ) {
+    use bollard::container::AttachContainerOptions;
+    use bollard::Docker;
+    use tokio::io::AsyncWriteExt;
+
+    // This was a stub that sent "Attach not fully implemented in proxy mode"
+    // and closed, so `kubectl attach` failed on every transport (ISSUES.md #78).
+    // Like WebSocket exec, it talks to the container runtime directly.
+    let container_id = format!("{}_{}", pod.metadata.name, container_name);
     info!(
-        "WS attach: pod={}, container={}",
-        pod.metadata.name, container_name
+        "WS attach: container={} stdin={} stdout={} stderr={} tty={}",
+        container_id, stdin, stdout, stderr, tty
     );
-    let _ = socket
-        .send(Message::Text(
-            "Attach not fully implemented in proxy mode".into(),
-        ))
+
+    static DOCKER_CLIENT: std::sync::OnceLock<Docker> = std::sync::OnceLock::new();
+    let docker = DOCKER_CLIENT.get_or_init(|| {
+        Docker::connect_with_local_defaults().expect("Failed to connect to container runtime")
+    });
+
+    let (mut ws_sender, mut ws_receiver) = socket.split();
+
+    let attached = match docker
+        .attach_container::<String>(
+            &container_id,
+            Some(AttachContainerOptions {
+                stdin: Some(stdin),
+                stdout: Some(stdout),
+                stderr: Some(stderr),
+                stream: Some(true),
+                // Attach shows what happens from now on; replaying the log is
+                // what `kubectl logs` is for.
+                logs: Some(false),
+                detach_keys: None,
+            }),
+        )
+        .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            let mut frame = vec![3u8];
+            frame.extend_from_slice(
+                format!(
+                    r#"{{"status":"Failure","message":"unable to attach to container {}: {}"}}"#,
+                    container_name,
+                    e.to_string().replace('"', "'")
+                )
+                .as_bytes(),
+            );
+            let _ = ws_sender.send(Message::Binary(frame)).await;
+            let _ = ws_sender
+                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                    code: 1000,
+                    reason: "".into(),
+                })))
+                .await;
+            return;
+        }
+    };
+    let mut output = attached.output;
+    let mut input = Some(attached.input);
+
+    // Client -> container stdin. Detaching (close, or a v5 close-stream on
+    // channel 0) must not kill the container, so this only stops writing; any
+    // stdinOnce semantics are the runtime's, as they are for real Kubernetes.
+    let (client_gone_tx, mut client_gone_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        while let Some(msg) = ws_receiver.next().await {
+            match msg {
+                Ok(Message::Close(_)) | Err(_) => break,
+                Ok(Message::Binary(data)) => match parse_client_frame(&data) {
+                    ClientFrame::CloseStream(0) => {
+                        if let Some(mut w) = input.take() {
+                            let _ = w.shutdown().await;
+                        }
+                    }
+                    ClientFrame::Data(0, payload) if stdin => {
+                        if let Some(w) = input.as_mut() {
+                            if w.write_all(payload).await.is_err() || w.flush().await.is_err() {
+                                input = None;
+                            }
+                        }
+                    }
+                    // Resize (channel 4) is accepted and ignored, as for exec.
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        let _ = client_gone_tx.send(());
+    });
+
+    // Same first frame as exec: client-go expects stdout before status.
+    let _ = ws_sender.send(Message::Binary(vec![1u8])).await;
+
+    loop {
+        tokio::select! {
+            item = output.next() => match item {
+                Some(Ok(log)) => {
+                    let (channel, message) = match log {
+                        bollard::container::LogOutput::StdErr { message } => (2u8, message),
+                        bollard::container::LogOutput::StdOut { message }
+                        | bollard::container::LogOutput::Console { message } => (1u8, message),
+                        _ => continue,
+                    };
+                    let mut frame = Vec::with_capacity(message.len() + 1);
+                    frame.push(channel);
+                    frame.extend_from_slice(&message);
+                    if ws_sender.send(Message::Binary(frame)).await.is_err() {
+                        break;
+                    }
+                }
+                // The container's streams ended — its process exited.
+                Some(Err(_)) | None => break,
+            },
+            // The user detached. Nothing to report; just stop.
+            _ = &mut client_gone_rx => {
+                debug!("WS attach: client detached from {}", container_id);
+                return;
+            }
+        }
+    }
+
+    // Attach does not carry an exit code in Kubernetes; the stream ending is
+    // the whole result.
+    let mut status = vec![3u8];
+    status.extend_from_slice(br#"{"status":"Success"}"#);
+    let _ = ws_sender.send(Message::Binary(status)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let _ = ws_sender
+        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+            code: 1000,
+            reason: "".into(),
+        })))
         .await;
-    let _ = socket.close().await;
+    debug!("WS attach completed for {}", container_id);
 }
 
 /// Simple URL encoding

@@ -408,6 +408,110 @@ fn serialise_name_value_block(headers: &[(String, String)]) -> Vec<u8> {
     out
 }
 
+/// A frame waiting to be written by [`spawn_frame_writer`].
+pub enum OutFrame {
+    SynReply {
+        stream_id: u32,
+    },
+    Data {
+        stream_id: u32,
+        fin: bool,
+        data: Vec<u8>,
+    },
+    RstStream {
+        stream_id: u32,
+        status: u32,
+    },
+    Ping(Vec<u8>),
+}
+
+/// Starts the one task allowed to write frames for a connection, returning the
+/// sender that queues them.
+///
+/// There must be exactly one, because header compression state is shared
+/// across the connection: two writers could compress `SYN_REPLY` blocks in one
+/// order and put them on the wire in another, and the client would inflate
+/// garbage. Every SPDY session in this crate writes through this.
+pub fn spawn_frame_writer(
+    outgoing: tokio::sync::mpsc::Sender<Vec<u8>>,
+) -> (
+    tokio::sync::mpsc::Sender<OutFrame>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<OutFrame>(256);
+    let handle = tokio::spawn(async move {
+        let mut codec = HeaderCodec::new();
+        while let Some(frame) = rx.recv().await {
+            let bytes = match frame {
+                OutFrame::SynReply { stream_id } => match codec.encode_headers(&[]) {
+                    Ok(block) => {
+                        let mut payload = stream_id.to_be_bytes().to_vec();
+                        payload.extend_from_slice(&block);
+                        encode_control(ControlType::SynReply, 0, &payload)
+                    }
+                    Err(e) => {
+                        tracing::warn!("SPDY: could not encode SYN_REPLY: {e}");
+                        break;
+                    }
+                },
+                OutFrame::Data {
+                    stream_id,
+                    fin,
+                    data,
+                } => encode_data(stream_id, if fin { FLAG_FIN } else { 0 }, &data),
+                OutFrame::RstStream { stream_id, status } => {
+                    let mut payload = stream_id.to_be_bytes().to_vec();
+                    payload.extend_from_slice(&status.to_be_bytes());
+                    encode_control(ControlType::RstStream, 0, &payload)
+                }
+                OutFrame::Ping(payload) => encode_control(ControlType::Ping, 0, &payload),
+            };
+            if outgoing.send(bytes).await.is_err() {
+                break;
+            }
+        }
+    });
+    (tx, handle)
+}
+
+/// Bridges an upgraded HTTP connection to a pair of byte channels, so a session
+/// can be written against channels and served over any transport.
+pub fn bridge_upgraded(
+    upgraded: hyper::upgrade::Upgraded,
+) -> (
+    tokio::sync::mpsc::Receiver<Vec<u8>>,
+    tokio::sync::mpsc::Sender<Vec<u8>>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let io = hyper_util::rt::TokioIo::new(upgraded);
+    let (mut reader, mut writer) = tokio::io::split(io);
+    let (in_tx, in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if in_tx.send(buf[..n].to_vec()).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    tokio::spawn(async move {
+        while let Some(bytes) = out_rx.recv().await {
+            if writer.write_all(&bytes).await.is_err() {
+                break;
+            }
+        }
+        let _ = writer.shutdown().await;
+    });
+    (in_rx, out_tx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,13 +523,12 @@ mod tests {
     #[test]
     fn the_dictionary_is_the_one_spdy3_specifies() {
         assert_eq!(HEADER_DICTIONARY.len(), 1423);
-        let mut adler: u32 = 1;
         let (mut a, mut b) = (1u32, 0u32);
         for &byte in HEADER_DICTIONARY {
             a = (a + byte as u32) % 65521;
             b = (b + a) % 65521;
         }
-        adler = (b << 16) | a;
+        let adler = (b << 16) | a;
         assert_eq!(adler, 0xe3c6_a7c2, "SPDY/3 dictionary checksum");
     }
 

@@ -18,10 +18,10 @@ pub mod response;
 pub mod router;
 #[allow(dead_code)]
 pub mod portforward_session;
+pub mod remotecommand_session;
 pub mod spdy;
 #[allow(dead_code)]
 pub mod spdy3;
-pub mod spdy_handlers;
 pub mod state;
 #[allow(dead_code)]
 pub mod streaming;

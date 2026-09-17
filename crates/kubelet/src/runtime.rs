@@ -5138,6 +5138,19 @@ impl ContainerRuntime {
             labels: Some(self.ownership_labels(pod_name)),
             env,
             working_dir: container.working_dir.clone(),
+            // A container's `stdin`, `stdinOnce` and `tty` were never passed to
+            // the runtime, so every container started with stdin closed and no
+            // terminal. A process that reads stdin saw EOF at once and exited —
+            // a `while read` loop with `stdin: true` crash-looped with exit 0 —
+            // and `kubectl attach -i` had nothing to write into (ISSUES.md #78).
+            //
+            // `attach_stdin` is what makes Docker keep the stream available to
+            // a later attach; without it `open_stdin` alone leaves nothing to
+            // connect to.
+            open_stdin: container.stdin,
+            stdin_once: container.stdin_once,
+            attach_stdin: container.stdin,
+            tty: container.tty,
             user: run_as_user,
             hostname: pod_hostname,
             exposed_ports: if exposed_ports.is_empty() {

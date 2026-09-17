@@ -17,11 +17,10 @@ pub mod protobuf;
 mod response;
 mod router;
 mod portforward_session;
+mod remotecommand_session;
 #[allow(dead_code)]
 mod spdy;
 mod spdy3;
-#[allow(dead_code)]
-mod spdy_handlers;
 mod state;
 #[allow(dead_code)]
 mod streaming;

@@ -7,8 +7,8 @@
 //! - /portforward - Forward ports to pods (SPDY and WebSocket)
 
 use crate::{
-    middleware::AuthContext, portforward_session, spdy, spdy_handlers, state::ApiServerState,
-    streaming,
+    middleware::AuthContext, portforward_session, remotecommand_session, spdy,
+    state::ApiServerState, streaming,
 };
 use axum::{
     body::Body,
@@ -82,6 +82,52 @@ pub struct LogsQuery {
     /// RFC3339 timestamp from which to show logs
     #[serde(rename = "sinceTime")]
     pub since_time: Option<String>,
+}
+
+/// Upgrades a request to a SPDY remotecommand session (exec or attach).
+///
+/// Shared by both handlers so the negotiation cannot drift between them — the
+/// WebSocket side of attach already showed what that costs: it never negotiated
+/// a subprotocol while exec did, and client-go rejected every attach handshake.
+fn upgrade_to_remotecommand(
+    req: Request,
+    target: remotecommand_session::Target,
+    streams: remotecommand_session::Streams,
+) -> Result<Response> {
+    let offered: Vec<String> = req
+        .headers()
+        .get_all("x-stream-protocol-version")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .map(String::from)
+        .collect();
+    let Some(protocol) = remotecommand_session::negotiate(offered.iter().map(String::as_str))
+    else {
+        return Err(Error::InvalidResource(format!(
+            "none of the offered stream protocols {offered:?} are supported; this server speaks {:?}",
+            remotecommand_session::SUPPORTED_PROTOCOLS
+        )));
+    };
+
+    let response = Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "SPDY/3.1")
+        // client-go refuses a 101 that does not name one of the versions it
+        // offered.
+        .header("X-Stream-Protocol-Version", protocol)
+        .body(Body::empty())
+        .map_err(|e| Error::Internal(format!("building SPDY upgrade response: {e}")))?;
+
+    tokio::spawn(async move {
+        match hyper::upgrade::on(req).await {
+            Ok(upgraded) => {
+                remotecommand_session::serve_upgraded(upgraded, target, streams, protocol).await
+            }
+            Err(e) => tracing::error!("remotecommand SPDY upgrade failed: {e}"),
+        }
+    });
+    Ok(response)
 }
 
 #[derive(Debug, Deserialize)]
@@ -361,25 +407,38 @@ fn logs_unavailable_error(
     container_name: &str,
     underlying: &anyhow::Error,
 ) -> Error {
-    let diagnostics = match find_container_status(pod, container_name).and_then(|cs| cs.state.as_ref()) {
-        Some(ContainerState::Terminated {
-            exit_code,
-            reason,
-            message,
-            ..
-        }) => format!(
-            "; container terminated: exitCode={}{}{}",
-            exit_code,
-            reason.as_deref().map(|r| format!(", reason={r}")).unwrap_or_default(),
-            message.as_deref().map(|m| format!(", message={m}")).unwrap_or_default(),
-        ),
-        Some(ContainerState::Waiting { reason, message }) => format!(
-            "; container waiting{}{}",
-            reason.as_deref().map(|r| format!(": reason={r}")).unwrap_or_default(),
-            message.as_deref().map(|m| format!(", message={m}")).unwrap_or_default(),
-        ),
-        Some(ContainerState::Running { .. }) | None => String::new(),
-    };
+    let diagnostics =
+        match find_container_status(pod, container_name).and_then(|cs| cs.state.as_ref()) {
+            Some(ContainerState::Terminated {
+                exit_code,
+                reason,
+                message,
+                ..
+            }) => format!(
+                "; container terminated: exitCode={}{}{}",
+                exit_code,
+                reason
+                    .as_deref()
+                    .map(|r| format!(", reason={r}"))
+                    .unwrap_or_default(),
+                message
+                    .as_deref()
+                    .map(|m| format!(", message={m}"))
+                    .unwrap_or_default(),
+            ),
+            Some(ContainerState::Waiting { reason, message }) => format!(
+                "; container waiting{}{}",
+                reason
+                    .as_deref()
+                    .map(|r| format!(": reason={r}"))
+                    .unwrap_or_default(),
+                message
+                    .as_deref()
+                    .map(|m| format!(", message={m}"))
+                    .unwrap_or_default(),
+            ),
+            Some(ContainerState::Running { .. }) | None => String::new(),
+        };
 
     Error::BadRequest(format!(
         "unable to retrieve logs for container {container_name} in pod {}/{}: {underlying}{diagnostics}",
@@ -588,8 +647,30 @@ pub async fn exec(
             .into_response());
     }
 
-    // For SPDY requests and plain HTTP: execute directly and return output
-    // kubectl will receive the output as the HTTP response body
+    // Exec over raw SPDY/3.1 — what `remotecommand.NewSPDYExecutor` speaks.
+    // This branch did not exist: SPDY requests fell through to the plain-HTTP
+    // path below, which runs the command and returns its output as a response
+    // body. client-go saw a non-101 and reported "unable to upgrade connection:
+    // <the command's output>", with the exit code and stdin lost (ISSUES.md #78).
+    if spdy::is_spdy_request(&req) {
+        info!("Upgrading exec to SPDY for pod {}/{}", namespace, name);
+        return upgrade_to_remotecommand(
+            req,
+            remotecommand_session::Target::Exec {
+                container_id: format!("{}_{}", pod.metadata.name, container_name),
+                command: query.command.clone(),
+            },
+            remotecommand_session::Streams {
+                stdin: query.stdin,
+                stdout: query.stdout,
+                stderr: query.stderr,
+                tty: query.tty,
+            },
+        );
+    }
+
+    // Plain HTTP (no upgrade at all): execute directly and return the output as
+    // the response body. Not a Kubernetes protocol; kept for simple clients.
     info!(
         "Direct exec for pod {}/{}: {:?}",
         namespace, name, query.command
@@ -809,40 +890,22 @@ pub async fn attach(
         }
     }
 
-    // Check if this is a SPDY upgrade request (kubectl uses SPDY)
+    // Attach over raw SPDY/3.1. This used to hand the connection to a stub that
+    // wrote "Attach not fully implemented in proxy mode" and closed.
     if spdy::is_spdy_request(&req) {
-        info!(
-            "Upgrading attach to SPDY for pod {}/{} (kubectl compatibility)",
-            namespace, name
+        info!("Upgrading attach to SPDY for pod {}/{}", namespace, name);
+        return upgrade_to_remotecommand(
+            req,
+            remotecommand_session::Target::Attach {
+                container_id: format!("{}_{}", pod.metadata.name, container_name),
+            },
+            remotecommand_session::Streams {
+                stdin: query.stdin,
+                stdout: query.stdout,
+                stderr: query.stderr,
+                tty: query.tty,
+            },
         );
-
-        // Create SPDY upgrade response
-        let response = spdy::create_spdy_upgrade_response().map_err(|e| {
-            Error::Internal(format!("Failed to create SPDY upgrade response: {}", e))
-        })?;
-
-        // Spawn task to handle SPDY connection after upgrade
-        tokio::spawn(async move {
-            match spdy::upgrade_to_spdy(req).await {
-                Ok(spdy_conn) => {
-                    spdy_handlers::handle_spdy_attach(
-                        spdy_conn,
-                        pod,
-                        container_name,
-                        query.stdin,
-                        query.stdout,
-                        query.stderr,
-                        query.tty,
-                    )
-                    .await;
-                }
-                Err(e) => {
-                    tracing::error!("Failed to upgrade to SPDY: {}", e);
-                }
-            }
-        });
-
-        return Ok(response.into_response());
     }
 
     // Handle WebSocket upgrade if requested
@@ -852,6 +915,11 @@ pub async fn attach(
             namespace, name
         );
         Ok(ws
+            // Without this the 101 carries no Sec-WebSocket-Protocol, which
+            // client-go rejects as an invalid protocol and falls back to SPDY —
+            // so attach over WebSocket could never be reached (ISSUES.md #78).
+            // Exec has always negotiated these; attach never did.
+            .protocols(["v5.channel.k8s.io", "v4.channel.k8s.io", "channel.k8s.io"])
             .on_upgrade(move |socket| {
                 streaming::handle_attach_websocket(
                     socket,
@@ -1592,7 +1660,11 @@ mod tests {
         assert_eq!(compute_pdb_desired_healthy(&pdb, 10), 5);
     }
 
-    fn make_pod_with_container_state(name: &str, namespace: &str, state_json: serde_json::Value) -> Pod {
+    fn make_pod_with_container_state(
+        name: &str,
+        namespace: &str,
+        state_json: serde_json::Value,
+    ) -> Pod {
         let json = serde_json::json!({
             "apiVersion": "v1",
             "kind": "Pod",

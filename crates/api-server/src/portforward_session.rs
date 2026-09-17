@@ -23,8 +23,8 @@
 //! whole connection, not just this forward.
 
 use crate::spdy3::{
-    encode_control, encode_data, parse_frame, stream_id_of, syn_stream_header_block, ControlType,
-    Frame, HeaderCodec, FLAG_FIN,
+    parse_frame, spawn_frame_writer, stream_id_of, syn_stream_header_block, ControlType, Frame,
+    HeaderCodec, OutFrame, FLAG_FIN,
 };
 use std::collections::HashMap;
 use std::time::Duration;
@@ -47,25 +47,6 @@ const HALF_CLOSE_GRACE: Duration = Duration::from_secs(1);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CHUNK: usize = 32 * 1024;
 
-/// A frame waiting to be written. Encoding happens in one writer task, in wire
-/// order, because header compression state is shared across the connection: a
-/// `SYN_REPLY` compressed out of order would be unreadable to the client.
-enum Outgoing {
-    SynReply {
-        stream_id: u32,
-    },
-    Data {
-        stream_id: u32,
-        fin: bool,
-        data: Vec<u8>,
-    },
-    RstStream {
-        stream_id: u32,
-        status: u32,
-    },
-    Ping(Vec<u8>),
-}
-
 /// The two streams kubectl opens for one forwarded connection, until both exist.
 #[derive(Default)]
 struct PendingPair {
@@ -84,40 +65,7 @@ pub async fn run_session(
     outgoing: mpsc::Sender<Vec<u8>>,
     pod_ip: String,
 ) {
-    let (out_tx, mut out_rx) = mpsc::channel::<Outgoing>(256);
-
-    let writer = tokio::spawn(async move {
-        let mut codec = HeaderCodec::new();
-        while let Some(frame) = out_rx.recv().await {
-            let bytes = match frame {
-                Outgoing::SynReply { stream_id } => match codec.encode_headers(&[]) {
-                    Ok(block) => {
-                        let mut payload = stream_id.to_be_bytes().to_vec();
-                        payload.extend_from_slice(&block);
-                        encode_control(ControlType::SynReply, 0, &payload)
-                    }
-                    Err(e) => {
-                        warn!("port-forward: could not encode SYN_REPLY: {e}");
-                        break;
-                    }
-                },
-                Outgoing::Data {
-                    stream_id,
-                    fin,
-                    data,
-                } => encode_data(stream_id, if fin { FLAG_FIN } else { 0 }, &data),
-                Outgoing::RstStream { stream_id, status } => {
-                    let mut payload = stream_id.to_be_bytes().to_vec();
-                    payload.extend_from_slice(&status.to_be_bytes());
-                    encode_control(ControlType::RstStream, 0, &payload)
-                }
-                Outgoing::Ping(payload) => encode_control(ControlType::Ping, 0, &payload),
-            };
-            if outgoing.send(bytes).await.is_err() {
-                break;
-            }
-        }
-    });
+    let (out_tx, writer) = spawn_frame_writer(outgoing);
 
     let mut inflate = HeaderCodec::new();
     let mut buf: Vec<u8> = Vec::with_capacity(CHUNK);
@@ -172,7 +120,7 @@ pub async fn run_session(
                     if stream_type != "error" && stream_type != "data" {
                         warn!("port-forward: unknown streamType {stream_type:?}, resetting");
                         let _ = out_tx
-                            .send(Outgoing::RstStream {
+                            .send(OutFrame::RstStream {
                                 stream_id,
                                 status: RST_PROTOCOL_ERROR,
                             })
@@ -182,7 +130,7 @@ pub async fn run_session(
 
                     // kubectl waits for this reply before it opens the data
                     // stream, so it must go out now, not once the pair is whole.
-                    if out_tx.send(Outgoing::SynReply { stream_id }).await.is_err() {
+                    if out_tx.send(OutFrame::SynReply { stream_id }).await.is_err() {
                         break 'session;
                     }
 
@@ -249,7 +197,7 @@ pub async fn run_session(
                     payload,
                     ..
                 } => {
-                    let _ = out_tx.send(Outgoing::Ping(payload)).await;
+                    let _ = out_tx.send(OutFrame::Ping(payload)).await;
                 }
 
                 Frame::Control {
@@ -291,12 +239,12 @@ async fn forward(
     error_stream: u32,
     data_stream: u32,
     mut from_client: mpsc::UnboundedReceiver<Option<Vec<u8>>>,
-    out: mpsc::Sender<Outgoing>,
+    out: mpsc::Sender<OutFrame>,
 ) {
-    let finish = |out: mpsc::Sender<Outgoing>, message: Option<String>| async move {
+    let finish = |out: mpsc::Sender<OutFrame>, message: Option<String>| async move {
         if let Some(message) = message {
             let _ = out
-                .send(Outgoing::Data {
+                .send(OutFrame::Data {
                     stream_id: error_stream,
                     fin: false,
                     data: message.into_bytes(),
@@ -304,14 +252,14 @@ async fn forward(
                 .await;
         }
         let _ = out
-            .send(Outgoing::Data {
+            .send(OutFrame::Data {
                 stream_id: data_stream,
                 fin: true,
                 data: Vec::new(),
             })
             .await;
         let _ = out
-            .send(Outgoing::Data {
+            .send(OutFrame::Data {
                 stream_id: error_stream,
                 fin: true,
                 data: Vec::new(),
@@ -363,7 +311,7 @@ async fn forward(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     if out_for_pod
-                        .send(Outgoing::Data {
+                        .send(OutFrame::Data {
                             stream_id: data_stream,
                             fin: false,
                             data: buf[..n].to_vec(),
@@ -405,33 +353,7 @@ async fn forward(
 
 /// Serves a session over an upgraded raw `SPDY/3.1` connection.
 pub async fn serve_upgraded(upgraded: hyper::upgrade::Upgraded, pod_ip: String) {
-    let io = hyper_util::rt::TokioIo::new(upgraded);
-    let (mut reader, mut writer) = tokio::io::split(io);
-    let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(64);
-    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
-
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            match reader.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if in_tx.send(buf[..n].to_vec()).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-    tokio::spawn(async move {
-        while let Some(bytes) = out_rx.recv().await {
-            if writer.write_all(&bytes).await.is_err() {
-                break;
-            }
-        }
-        let _ = writer.shutdown().await;
-    });
-
+    let (in_rx, out_tx) = crate::spdy3::bridge_upgraded(upgraded);
     run_session(in_rx, out_tx, pod_ip).await;
 }
 
@@ -475,6 +397,7 @@ pub async fn serve_websocket(socket: axum::extract::ws::WebSocket, pod_ip: Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spdy3::{encode_control, encode_data};
     use tokio::net::TcpListener;
 
     /// Builds a client SYN_STREAM exactly as kubectl does: `streamType`,
