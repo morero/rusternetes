@@ -7143,126 +7143,52 @@ impl ContainerRuntime {
     }
 
     /// Read the termination message from a stopped container.
-    /// First tries reading from the host-side bind-mounted file, then falls back to docker cp.
+    ///
+    /// Only ever reads the host-side file that is bind-mounted over the
+    /// container's termination message path. A missing file counts as an empty
+    /// message. There used to be a `docker cp` fallback for that case, and it was
+    /// the root cause of the root-owned volume directories in ISSUES.md #22: once
+    /// `cleanup_pod_volumes` has removed the pod's directory, the file is always
+    /// missing, and the Docker daemon serves an archive from a stopped container
+    /// by mounting its filesystem, bind mounts included, so it recreates every
+    /// missing bind source as a root-owned directory. The kubelet can never
+    /// remove those, and a later pod with the same name cannot start. Real
+    /// Kubernetes also reads the message from the host side only.
     async fn read_termination_message(
         &self,
         container_name: &str,
         container: &Container,
         exit_code: i64,
     ) -> Option<String> {
-        let msg_path = effective_termination_message_path(&container.termination_message_path);
-
-        debug!(
-            "Reading termination message from {} in container {}",
-            msg_path, container_name
-        );
-
         // Extract pod_name from container_name (format: {pod_name}_{container_name})
         let pod_name = container_name
             .rsplitn(2, '_')
             .last()
             .unwrap_or(container_name);
 
-        // Try host-side file first (bind-mounted during container creation)
         let term_host_file = format!(
             "{}/{}/termination/{}",
             self.volumes_base_path, pod_name, container.name
         );
-        if std::path::Path::new(&term_host_file).exists() {
-            // Host file exists — read from it (authoritative, not docker cp)
-            if let Ok(content) = std::fs::read_to_string(&term_host_file) {
-                if !content.is_empty() {
-                    let mut content = content;
-                    if content.len() > 4096 {
-                        content.truncate(4096);
-                    }
-                    debug!(
-                        "Read termination message ({} bytes) from host file for {}",
-                        content.len(),
-                        container_name
-                    );
-                    return Some(content);
-                }
-            }
-            // Host file exists but is empty — termination message is empty (don't fall through to docker cp)
-            debug!(
-                "Termination message file is empty (host-side) for {}",
-                container_name
-            );
-            // FallbackToLogsOnError: only fall back to logs when the container failed (non-zero exit)
-            if container.termination_message_policy.as_deref() == Some("FallbackToLogsOnError")
-                && exit_code != 0
-            {
-                return self.read_container_logs_tail(container_name, 80).await;
-            }
-            return None;
-        }
-
-        // Fall back to docker cp for containers created before the bind-mount fix
-        let mut stream = self.docker.download_from_container(
-            container_name,
-            Some(bollard::container::DownloadFromContainerOptions {
-                path: msg_path.to_string(),
-            }),
-        );
-        let mut all_bytes = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(bytes) => all_bytes.extend_from_slice(&bytes),
-                Err(e) => {
-                    debug!(
-                        "Error reading termination message from {}: {}",
-                        container_name, e
-                    );
-                    if container.termination_message_policy.as_deref()
-                        == Some("FallbackToLogsOnError")
-                        && exit_code != 0
-                    {
-                        return self.read_container_logs_tail(container_name, 80).await;
-                    }
-                    return None;
-                }
-            }
-        }
-
-        if all_bytes.is_empty() {
-            debug!(
-                "Termination message file empty or not found in {}",
-                container_name
-            );
-            if container.termination_message_policy.as_deref() == Some("FallbackToLogsOnError")
-                && exit_code != 0
-            {
-                return self.read_container_logs_tail(container_name, 80).await;
-            }
-            return None;
-        }
-
-        // Docker returns a tar archive; extract the file content
-        let mut archive = tar::Archive::new(&all_bytes[..]);
-        if let Ok(mut entries) = archive.entries() {
-            while let Some(Ok(mut entry)) = entries.next() {
-                let mut content = String::new();
-                if std::io::Read::read_to_string(&mut entry, &mut content).is_ok()
-                    && !content.is_empty()
-                {
-                    if content.len() > 4096 {
-                        content.truncate(4096);
-                    }
-                    debug!(
-                        "Read termination message ({} bytes) from {}",
-                        content.len(),
-                        container_name
-                    );
-                    return Some(content);
-                }
-            }
-        }
-
         debug!(
-            "Failed to extract termination message from tar archive for {}",
-            container_name
+            "Reading termination message from {} for container {}",
+            term_host_file, container_name
         );
+
+        if let Ok(mut content) = std::fs::read_to_string(&term_host_file) {
+            if !content.is_empty() {
+                if content.len() > 4096 {
+                    let mut end = 4096;
+                    while !content.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    content.truncate(end);
+                }
+                return Some(content);
+            }
+        }
+
+        // FallbackToLogsOnError: only fall back to logs when the container failed (non-zero exit)
         if container.termination_message_policy.as_deref() == Some("FallbackToLogsOnError")
             && exit_code != 0
         {

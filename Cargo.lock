@@ -3968,7 +3968,6 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sysinfo",
- "tar",
  "tempfile",
  "tokio",
  "tonic",
