@@ -6,7 +6,10 @@
 //! - /attach - Attach to running containers (SPDY and WebSocket)
 //! - /portforward - Forward ports to pods (SPDY and WebSocket)
 
-use crate::{middleware::AuthContext, spdy, spdy_handlers, state::ApiServerState, streaming};
+use crate::{
+    middleware::AuthContext, portforward_session, spdy, spdy_handlers, state::ApiServerState,
+    streaming,
+};
 use axum::{
     body::Body,
     extract::{ws::WebSocketUpgrade, Path, Query, Request, State},
@@ -904,7 +907,8 @@ pub async fn portforward(
     let pod_key = rusternetes_storage::build_key("pods", Some(&namespace), &name);
     let pod: rusternetes_common::resources::Pod = state.storage.get(&pod_key).await?;
 
-    // Parse ports from query parameter
+    // Parse ports from query parameter. Only the WebSocket *channel* protocol
+    // carries them here; kubectl never does (see below).
     let ports: Vec<u16> = if let Some(ref ports_str) = query.ports {
         ports_str
             .split(',')
@@ -914,37 +918,74 @@ pub async fn portforward(
         vec![]
     };
 
+    // kubectl negotiates ports *inside* the upgraded connection — one SPDY
+    // stream pair per forwarded connection, each with a `port` header — and
+    // never sends `?ports=`. This handler used to demand that parameter before
+    // upgrading, so every kubectl port-forward failed with "No ports specified",
+    // on both of kubectl's transports (ISSUES.md #77).
+    let wants_spdy_tunnel = req
+        .headers()
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .split(',')
+        .any(|p| p.trim() == portforward_session::TUNNEL_SUBPROTOCOL);
+    let is_spdy = spdy::is_spdy_request(&req);
+
+    if is_spdy || (ws.is_some() && wants_spdy_tunnel) {
+        let pod_ip = pod
+            .status
+            .as_ref()
+            .and_then(|s| s.pod_ip.clone())
+            .filter(|ip| !ip.is_empty())
+            .ok_or_else(|| {
+                Error::InvalidResource(format!(
+                    "pod {namespace}/{name} has no IP address yet, so there is nothing to forward to"
+                ))
+            })?;
+
+        // kubectl 1.30+ tries this first: SPDY tunnelled inside a WebSocket.
+        if !is_spdy {
+            if let Some(ws) = ws {
+                info!(
+                    "Port-forward to pod {}/{}: SPDY tunnelled over WebSocket",
+                    namespace, name
+                );
+                return Ok(ws
+                    .protocols([portforward_session::TUNNEL_SUBPROTOCOL])
+                    .on_upgrade(move |socket| portforward_session::serve_websocket(socket, pod_ip))
+                    .into_response());
+            }
+        }
+
+        // The raw SPDY/3.1 upgrade kubectl falls back to.
+        info!("Port-forward to pod {}/{}: raw SPDY/3.1", namespace, name);
+        let response = Response::builder()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "SPDY/3.1")
+            // client-go refuses the connection unless the server echoes the
+            // stream protocol it asked for.
+            .header(
+                "X-Stream-Protocol-Version",
+                portforward_session::STREAM_PROTOCOL,
+            )
+            .body(Body::empty())
+            .map_err(|e| Error::Internal(format!("building SPDY upgrade response: {e}")))?;
+
+        tokio::spawn(async move {
+            match hyper::upgrade::on(req).await {
+                Ok(upgraded) => portforward_session::serve_upgraded(upgraded, pod_ip).await,
+                Err(e) => tracing::error!("port-forward SPDY upgrade failed: {e}"),
+            }
+        });
+        return Ok(response);
+    }
+
     if ports.is_empty() {
         return Err(Error::InvalidResource(
             "No ports specified for port forwarding".to_string(),
         ));
-    }
-
-    // Check if this is a SPDY upgrade request (kubectl uses SPDY)
-    if spdy::is_spdy_request(&req) {
-        info!(
-            "Upgrading port-forward to SPDY for pod {}/{}, ports: {:?} (kubectl compatibility)",
-            namespace, name, ports
-        );
-
-        // Create SPDY upgrade response
-        let response = spdy::create_spdy_upgrade_response().map_err(|e| {
-            Error::Internal(format!("Failed to create SPDY upgrade response: {}", e))
-        })?;
-
-        // Spawn task to handle SPDY connection after upgrade
-        tokio::spawn(async move {
-            match spdy::upgrade_to_spdy(req).await {
-                Ok(spdy_conn) => {
-                    spdy_handlers::handle_spdy_portforward(spdy_conn, pod, ports).await;
-                }
-                Err(e) => {
-                    tracing::error!("Failed to upgrade to SPDY: {}", e);
-                }
-            }
-        });
-
-        return Ok(response.into_response());
     }
 
     // Handle WebSocket upgrade if requested

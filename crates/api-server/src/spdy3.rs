@@ -3,9 +3,10 @@
 //! **Not to be confused with `spdy.rs`**, which despite its name implements
 //! Kubernetes' *channel framing* — `[channel: 1 byte][length: 4][data]` — the
 //! thing that carries exec's stdin/stdout/stderr once a connection is upgraded.
-//! That framing has no notion of streams or headers, which is why
-//! `handle_spdy_portforward` could take its ports as a parameter without anyone
-//! noticing there was nowhere to get them from (ISSUES.md #77).
+//! That framing has no notion of streams or headers, which is why the previous
+//! port-forward handler could take its ports as a parameter without anyone
+//! noticing there was nowhere to get them from (ISSUES.md #77). It has been
+//! replaced by `portforward_session`, which uses this module.
 //!
 //! Port-forward is the one subresource whose parameters are negotiated *inside*
 //! the upgraded connection rather than in the request URL. kubectl opens two
