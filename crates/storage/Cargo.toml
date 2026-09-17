@@ -12,7 +12,11 @@ redis = ["dep:rhino"]
 
 [dependencies]
 rusternetes-common = { path = "../common" }
-rhino = { git = "https://github.com/calfonso/rhino", branch = "main", optional = true }
+# morero/rhino, a fork, not upstreamed to calfonso/rhino: its SQLite driver
+# wrote a key's revision row and the `kine_current` pointer to it as two
+# unsynchronised statements, so a late pointer write could move a key
+# backwards and leave it permanently unwritable. See ISSUES.md #79.
+rhino = { git = "https://github.com/morero/rhino", branch = "platform-ertia-fixes", optional = true }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
