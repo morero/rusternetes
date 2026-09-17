@@ -5979,6 +5979,32 @@ impl ContainerRuntime {
     }
 
     /// Check if a pod's containers are running
+    /// Whether *any* container of this pod is still running, pause included.
+    ///
+    /// Distinct from [`Self::is_pod_running`], which answers "is this pod
+    /// healthy" and is deliberately false for a pod whose app container has
+    /// stopped. The question here is the blunter one the deletion path needs:
+    /// is there anything left alive that removing the Pod object would orphan?
+    ///
+    /// Asking it is the difference between "we told the containers to stop" and
+    /// "the containers stopped". `stop_pod_for` returns once it has *asked* —
+    /// with a grace period the container is entitled to use — so treating its
+    /// return as termination deletes the object while the workload is still
+    /// running (ISSUES.md #76).
+    pub async fn any_container_running(&self, pod_name: &str) -> Result<bool> {
+        let mut filters = HashMap::new();
+        filters.insert("name".to_string(), vec![format!("{}_", pod_name)]);
+        let containers = self
+            .docker
+            .list_containers(Some(ListContainersOptions {
+                all: false, // running only
+                filters,
+                ..Default::default()
+            }))
+            .await?;
+        Ok(!containers.is_empty())
+    }
+
     pub async fn is_pod_running(&self, pod_name: &str) -> Result<bool> {
         let mut filters = HashMap::new();
         filters.insert("name".to_string(), vec![format!("{}_", pod_name)]);

@@ -1569,14 +1569,40 @@ impl Kubelet {
                     }
                 }
                 // If the pod was explicitly deleted (deletionTimestamp set), remove it
-                // from storage now that containers are stopped and status is terminal.
-                // Without this, removing pod_states causes the next reconcile to default
-                // back to SyncPod, which detects deletionTimestamp => needs_terminating,
-                // re-entering TerminatingPod indefinitely.
-                if pod.metadata.deletion_timestamp.is_some() {
+                // from storage — but only once its containers are actually gone.
+                // Without this removal, dropping pod_states makes the next reconcile
+                // default back to SyncPod, which detects deletionTimestamp =>
+                // needs_terminating, re-entering TerminatingPod indefinitely.
+                //
+                // The "actually gone" check is the fix for the second half of
+                // ISSUES.md #76. This comment used to say "now that containers are
+                // stopped" and the code trusted it, but `stop_pod_for` returns when it
+                // has *asked* them to stop, with a grace period they are entitled to
+                // use. Measured: the object was deleted four seconds into a
+                // thirty-second grace period, and the kubelet then logged its own
+                // still-running containers as "orphaned pod — not in etcd". For that
+                // whole window the cluster reported a workload gone while it ran on,
+                // and an operator in that state keeps reconciling and keeps writing.
+                //
+                // Leaving the object in place is the correct alternative: a Pod whose
+                // containers refuse to die *should* sit there visibly terminating,
+                // which is what real Kubernetes does. The next sync re-enters this
+                // path and tries again.
+                let containers_gone = !self
+                    .runtime
+                    .any_container_running(pod_name)
+                    .await
+                    .unwrap_or(false);
+                if pod.metadata.deletion_timestamp.is_some() && containers_gone {
                     let _ = self.storage.delete(&key).await;
                     debug!(
                         "Pod {}/{} removed from storage (deletionTimestamp set, no finalizers)",
+                        namespace, pod_name
+                    );
+                } else if pod.metadata.deletion_timestamp.is_some() {
+                    debug!(
+                        "Pod {}/{} is deleted but still has running containers — keeping the \
+                         object until they are gone (ISSUES.md #76)",
                         namespace, pod_name
                     );
                 } else {

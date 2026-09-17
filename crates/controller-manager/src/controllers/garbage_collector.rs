@@ -668,7 +668,48 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         match current {
             Ok(value) => {
                 if let Ok(meta) = self.extract_metadata(&value) {
-                    if !meta.has_finalizers() {
+                    // A Pod is never this collector's to finish. Its deletion
+                    // completes on the node: the kubelet stops the containers and
+                    // then removes the object. Sweeping it here because the
+                    // finalizer list happens to be empty races the kubelet and
+                    // wins, leaving containers running with nothing in the API to
+                    // say so (ISSUES.md #76).
+                    //
+                    // This only became reachable once controllers started *marking*
+                    // pods instead of deleting them outright — before that the GC
+                    // never saw a pod with a deletionTimestamp, so the gap was
+                    // hidden behind a worse bug. Measured after that change: marked
+                    // at 07:44:54.958, collected here at 07:44:58.428, containers
+                    // still running for another 28 seconds.
+                    // A *scheduled* Pod is never this collector's to finish. Its
+                    // deletion completes on the node: the kubelet stops the
+                    // containers and then removes the object. Sweeping it here
+                    // because the finalizer list happens to be empty races the
+                    // kubelet and wins, leaving containers running with nothing in
+                    // the API to say so (ISSUES.md #76). Measured after controllers
+                    // began marking pods rather than erasing them: marked at
+                    // 07:44:54.958, collected here at 07:44:58.428, containers still
+                    // running 28 seconds later.
+                    //
+                    // The `nodeName` condition is what keeps this from breaking
+                    // cascade deletion. An *unscheduled* pod has no kubelet that will
+                    // ever look at it, so leaving it alone would strand it forever —
+                    // and a deleted ReplicaSet's unscheduled pods have no other
+                    // collector. Deferring to the node is only correct when there is
+                    // a node to defer to.
+                    let scheduled_pod = resource.resource_type == "pods"
+                        && resource
+                            .value
+                            .get("spec")
+                            .and_then(|s| s.get("nodeName"))
+                            .and_then(|n| n.as_str())
+                            .is_some_and(|n| !n.is_empty());
+                    if scheduled_pod {
+                        debug!(
+                            "Leaving {} to its kubelet — pod deletion completes on the node",
+                            resource.key
+                        );
+                    } else if !meta.has_finalizers() {
                         info!(
                             "Deleting resource (no finalizers remaining): {}",
                             resource.key
