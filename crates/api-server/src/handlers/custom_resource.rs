@@ -36,11 +36,7 @@ use tracing::{debug, info, warn};
 /// `platform.ertia.io/release-bindings` finalizer via a merge patch.
 fn should_complete_pending_deletion(cr: &CustomResource) -> bool {
     cr.metadata.deletion_timestamp.is_some()
-        && cr
-            .metadata
-            .finalizers
-            .as_ref()
-            .is_none_or(|f| f.is_empty())
+        && cr.metadata.finalizers.as_ref().is_none_or(|f| f.is_empty())
 }
 
 /// Create a new custom resource instance
@@ -514,7 +510,31 @@ pub async fn list_custom_resources(
         return Ok(Json(table).into_response());
     }
 
-    let list = List::new("List", "v1", crs);
+    // `apiVersion: <group>/<version>`, `kind: <Kind>List` — what real
+    // Kubernetes returns, and what a *typed* client needs. This used to answer
+    // every custom resource list with the generic `apiVersion: v1, kind: List`
+    // envelope. kubectl decodes that fine (it reads lists generically), which
+    // is why it went unnoticed, but a Go client with a scheme cannot: its
+    // informers never sync, so every controller watching a CRD silently stops
+    // reconciling. Found live — CloudNativePG's instance manager sat in
+    // "failed waiting for *v1.Cluster Informer to sync" until this was fixed,
+    // leaving its Postgres pod permanently not-Ready.
+    let list_kind = crd
+        .spec
+        .names
+        .list_kind
+        .clone()
+        .unwrap_or_else(|| format!("{}List", crd.spec.names.kind));
+    let mut list = List::new(list_kind, format!("{}/{}", group, version), crs);
+
+    // The list's resourceVersion is the store revision the read was taken at,
+    // not the highest revision among the items: an empty list otherwise
+    // reports "1", and a client starting a watch there asks for a revision far
+    // in the past.
+    if let Ok(rev) = state.storage.current_revision().await {
+        list.metadata.resource_version = Some(rev.to_string());
+    }
+
     Ok(Json(list).into_response())
 }
 
@@ -833,23 +853,16 @@ pub async fn patch_custom_resource(
             })?;
             let desired_json: serde_json::Value = if content_type.contains("yaml") {
                 serde_yaml::from_slice(&body_bytes).map_err(|e| {
-                    rusternetes_common::Error::InvalidResource(format!(
-                        "Invalid patch YAML: {}",
-                        e
-                    ))
+                    rusternetes_common::Error::InvalidResource(format!("Invalid patch YAML: {}", e))
                 })?
             } else {
                 serde_json::from_slice(&body_bytes).map_err(|e| {
-                    rusternetes_common::Error::InvalidResource(format!(
-                        "Invalid patch JSON: {}",
-                        e
-                    ))
+                    rusternetes_common::Error::InvalidResource(format!("Invalid patch JSON: {}", e))
                 })?
             };
 
             let apply_params = if force {
-                rusternetes_common::server_side_apply::ApplyParams::new(field_manager)
-                    .with_force()
+                rusternetes_common::server_side_apply::ApplyParams::new(field_manager).with_force()
             } else {
                 rusternetes_common::server_side_apply::ApplyParams::new(field_manager)
             };
@@ -1310,9 +1323,10 @@ pub async fn patch_custom_resource_status(
     // `.status`, not an object with a `status` key, so this unwrap is only
     // ever applicable to the object-shaped patch types.
     let patch_value = match &patch_value {
-        serde_json::Value::Object(obj) if obj.contains_key("status") => {
-            obj.get("status").cloned().unwrap_or(serde_json::Value::Null)
-        }
+        serde_json::Value::Object(obj) if obj.contains_key("status") => obj
+            .get("status")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
         other => other.clone(),
     };
 
@@ -1868,9 +1882,10 @@ pub async fn update_custom_resource_status(
     // read back its own corrupted status and built the next update from it.
     // Mirrors the same unwrap already applied in `patch_custom_resource_status`.
     let status = match &status {
-        serde_json::Value::Object(obj) if obj.contains_key("status") => {
-            obj.get("status").cloned().unwrap_or(serde_json::Value::Null)
-        }
+        serde_json::Value::Object(obj) if obj.contains_key("status") => obj
+            .get("status")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
         other => other.clone(),
     };
 
