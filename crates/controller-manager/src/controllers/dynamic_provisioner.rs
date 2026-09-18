@@ -15,6 +15,11 @@ use std::time::Duration;
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
+/// Fallback root for dynamically provisioned volumes when neither the
+/// StorageClass nor `RUSTERNETES_DYNAMIC_PV_ROOT` names one. On /tmp, and so
+/// not durable across a reboot — see `provision`.
+const DEFAULT_DYNAMIC_PV_ROOT: &str = "/tmp/rusternetes/dynamic-pvs";
+
 pub struct DynamicProvisionerController<S: Storage> {
     storage: Arc<S>,
 }
@@ -415,13 +420,34 @@ impl<S: Storage + 'static> DynamicProvisionerController<S> {
         let mut capacity = HashMap::new();
         capacity.insert("storage".to_string(), requested_storage.clone());
 
-        // Determine the path for the volume
+        // Where the volume's data actually lives. The StorageClass decides;
+        // failing that, `RUSTERNETES_DYNAMIC_PV_ROOT`; failing that, a path
+        // under /tmp.
+        //
+        // That last fallback is a data-loss hazard, not just a default: /tmp is
+        // cleared on reboot on most systems, so every dynamically provisioned
+        // volume comes back empty while its PVC still reports Bound and its PV
+        // still points at the path. Seen for real — a Postgres cluster whose
+        // data directory simply was not there any more after a restart, with
+        // the pod reporting "stat .../pgdata: no such file or directory" and
+        // never becoming ready. Anything that must outlive a reboot has to set
+        // one of the first two.
+        let env_root = std::env::var("RUSTERNETES_DYNAMIC_PV_ROOT").ok();
         let base_path = storage_class
             .parameters
             .as_ref()
             .and_then(|p| p.get("path"))
             .map(|s| s.as_str())
-            .unwrap_or("/tmp/rusternetes/dynamic-pvs");
+            .or(env_root.as_deref())
+            .unwrap_or(DEFAULT_DYNAMIC_PV_ROOT);
+        if base_path.starts_with("/tmp/") {
+            warn!(
+                "Provisioning {} under {} — /tmp is cleared on reboot, so this volume's data will \
+                 not survive one. Set RUSTERNETES_DYNAMIC_PV_ROOT or the StorageClass's `path` \
+                 parameter to keep it.",
+                pv_name, base_path
+            );
+        }
 
         let volume_path = format!("{}/{}", base_path, pv_name);
 
