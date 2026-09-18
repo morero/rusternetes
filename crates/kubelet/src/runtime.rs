@@ -84,6 +84,47 @@ struct ProbeState {
 }
 
 /// ContainerRuntime manages containers using Docker/Podman with CNI networking
+/// Builds the Service host entries for a pod in `pod_namespace`: one line per
+/// Service that has a ready address, carrying the names Kubernetes' own
+/// resolver would answer for it.
+///
+/// The bare `<service>` form is only emitted for Services in the pod's own
+/// namespace, matching what the search path would resolve there; a Service
+/// elsewhere is reachable by its qualified names only, never by bare name.
+fn service_host_entries_from(
+    endpoints: &[rusternetes_common::resources::endpoints::Endpoints],
+    pod_namespace: &str,
+    cluster_domain: &str,
+) -> Vec<(String, Vec<String>)> {
+    let mut entries = Vec::new();
+    for ep in endpoints {
+        let name = &ep.metadata.name;
+        let namespace = ep.metadata.namespace.as_deref().unwrap_or("default");
+        let Some(ip) = ep
+            .subsets
+            .iter()
+            .filter_map(|s| s.addresses.as_ref())
+            .flatten()
+            .map(|a| a.ip.as_str())
+            .find(|ip| !ip.is_empty())
+        else {
+            continue;
+        };
+
+        let mut names = vec![
+            format!("{name}.{namespace}.svc.{cluster_domain}"),
+            format!("{name}.{namespace}.svc"),
+            format!("{name}.{namespace}"),
+        ];
+        if namespace == pod_namespace {
+            names.push(name.clone());
+        }
+        entries.push((ip.to_string(), names));
+    }
+    entries.sort_by(|a, b| a.1[0].cmp(&b.1[0]));
+    entries
+}
+
 pub struct ContainerRuntime {
     docker: Docker,
     storage: Option<Arc<rusternetes_storage::StorageBackend>>,
@@ -1320,7 +1361,7 @@ impl ContainerRuntime {
         };
 
         // Create /etc/hosts now that we know the pod IP.
-        let hosts_file_path = self.create_pod_hosts_file(pod, pod_ip.as_deref())?;
+        let hosts_file_path = self.create_pod_hosts_file(pod, pod_ip.as_deref()).await?;
 
         // /etc/hosts is bind-mounted into each app container (see start_container).
         // No need to upload into the pause container — app containers use the bind mount.
@@ -1465,7 +1506,7 @@ impl ContainerRuntime {
                             if let Ok(Some(ip)) = self.get_pod_ip(pod_name).await {
                                 pod_ip = Some(ip);
                                 resolved_ip = true;
-                                self.create_pod_hosts_file(pod, pod_ip.as_deref())?;
+                                self.create_pod_hosts_file(pod, pod_ip.as_deref()).await?;
                             }
                         }
 
@@ -1588,7 +1629,7 @@ impl ContainerRuntime {
                         if let Ok(Some(ip)) = self.get_pod_ip(pod_name).await {
                             pod_ip = Some(ip);
                             resolved_ip = true;
-                            self.create_pod_hosts_file(pod, pod_ip.as_deref())?;
+                            self.create_pod_hosts_file(pod, pod_ip.as_deref()).await?;
                         }
                     }
                 }
@@ -1614,7 +1655,7 @@ impl ContainerRuntime {
                 if let Ok(Some(ip)) = self.get_pod_ip(pod_name).await {
                     pod_ip = Some(ip.clone());
                     resolved_ip = true;
-                    self.create_pod_hosts_file(pod, pod_ip.as_deref())?;
+                    self.create_pod_hosts_file(pod, pod_ip.as_deref()).await?;
                     info!("Resolved pod IP {} for pod {} (non-CNI mode)", ip, pod_name);
                 }
             }
@@ -1727,7 +1768,46 @@ impl ContainerRuntime {
     ///
     /// Returns the path to the hosts file, or None if the pod is CoreDNS
     /// (which uses the host's /etc/hosts directly).
-    fn create_pod_hosts_file(&self, pod: &Pod, pod_ip: Option<&str>) -> Result<Option<String>> {
+    /// The `/etc/hosts` lines that let a pod reach Services by name.
+    ///
+    /// This harness runs without CoreDNS and without kube-proxy, so a Service's
+    /// DNS name resolves nowhere and its ClusterIP routes nowhere. Everything
+    /// that needed to talk to a Service therefore pinned a *pod IP* by hand, in
+    /// a manifest, and every one of those pins went stale the moment the pod
+    /// behind it was recreated — an hour of debugging each time, for a pod
+    /// whose logs only say "connection refused" against an address nothing
+    /// answers on any more.
+    ///
+    /// Writing the mapping into each pod's hosts file costs one storage read
+    /// per sync and removes that whole class: the name resolves, and because
+    /// the file is rewritten on every sync pass, it follows the endpoint when
+    /// the backing pod moves. It is not DNS — no SRV records, no headless
+    /// per-pod names, one address per Service — but it is what makes
+    /// `<service>.<namespace>.svc.<cluster-domain>` work here.
+    ///
+    /// Reads Endpoints, not Services: those already carry the ready addresses
+    /// the endpoints controller resolved, so there is no selector matching to
+    /// repeat and an unbacked Service correctly contributes nothing.
+    async fn service_host_entries(&self, pod_namespace: &str) -> Vec<(String, Vec<String>)> {
+        let Some(storage) = self.storage.as_ref() else {
+            return Vec::new();
+        };
+        let prefix = rusternetes_storage::build_prefix("endpoints", None);
+        let endpoints: Vec<rusternetes_common::resources::endpoints::Endpoints> =
+            match rusternetes_storage::Storage::list(storage.as_ref(), &prefix).await {
+                Ok(list) => list,
+                Err(e) => {
+                    debug!("Could not read Endpoints for /etc/hosts: {e}");
+                    return Vec::new();
+                }
+            };
+        service_host_entries_from(&endpoints, pod_namespace, &self.cluster_domain)
+    }
+    async fn create_pod_hosts_file(
+        &self,
+        pod: &Pod,
+        pod_ip: Option<&str>,
+    ) -> Result<Option<String>> {
         let pod_name = &pod.metadata.name;
         let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
         let spec = pod.spec.as_ref().unwrap();
@@ -1797,6 +1877,23 @@ impl ContainerRuntime {
                     }
                 }
             }
+        }
+
+        // Service names, resolved from Endpoints. Appended after any
+        // spec.hostAliases on purpose: a lookup takes the first matching line,
+        // so an explicit alias still wins over what is discovered here.
+        let service_entries = self.service_host_entries(namespace).await;
+        if !service_entries.is_empty() {
+            content.push_str("# Services in this cluster (kubelet-managed)\n");
+            for (ip, names) in &service_entries {
+                content.push_str(&format!("{}\t{}\n", ip, names.join("\t")));
+            }
+            debug!(
+                "Added {} Service entries to /etc/hosts for pod {}/{}",
+                service_entries.len(),
+                namespace,
+                pod_name
+            );
         }
 
         std::fs::write(&hosts_path, &content)
@@ -8171,6 +8268,19 @@ impl ContainerRuntime {
             Some(s) => s,
             None => return Ok(()),
         };
+        // Keep /etc/hosts current. Its Service entries point at the pods
+        // currently backing each Service, and those move: a database pod that
+        // is recreated comes back on a different address, and this file is the
+        // only resolver a pod has in this harness. Rewritten in place, so the
+        // container's bind mount sees the new content without a restart.
+        let pod_ip = pod.status.as_ref().and_then(|s| s.pod_ip.clone());
+        if let Err(e) = self.create_pod_hosts_file(pod, pod_ip.as_deref()).await {
+            debug!(
+                "Could not refresh /etc/hosts for pod {}/{}: {}",
+                namespace, pod_name, e
+            );
+        }
+
         let volumes = match &spec.volumes {
             Some(v) => v,
             None => return Ok(()),
@@ -9718,6 +9828,103 @@ mod tests {
     }
 
     // --- hosts file content tests ---
+
+    use super::service_host_entries_from;
+
+    fn endpoints_for(
+        name: &str,
+        namespace: &str,
+        ips: &[&str],
+    ) -> rusternetes_common::resources::endpoints::Endpoints {
+        use rusternetes_common::resources::endpoints::{
+            EndpointAddress, EndpointSubset, Endpoints,
+        };
+        let mut ep = Endpoints::new(
+            name,
+            vec![EndpointSubset {
+                addresses: Some(
+                    ips.iter()
+                        .map(|ip| EndpointAddress {
+                            ip: (*ip).to_string(),
+                            hostname: None,
+                            node_name: None,
+                            target_ref: None,
+                        })
+                        .collect(),
+                ),
+                not_ready_addresses: None,
+                ports: None,
+            }],
+        );
+        ep.metadata.namespace = Some(namespace.to_string());
+        ep
+    }
+
+    #[test]
+    fn service_entries_carry_every_name_a_resolver_would_answer() {
+        let eps = vec![endpoints_for(
+            "platform-db-cluster-rw",
+            "default",
+            &["172.19.0.4"],
+        )];
+        let entries = service_host_entries_from(&eps, "default", "cluster.local");
+        assert_eq!(entries.len(), 1);
+        let (ip, names) = &entries[0];
+        assert_eq!(ip, "172.19.0.4");
+        assert_eq!(
+            names,
+            &vec![
+                "platform-db-cluster-rw.default.svc.cluster.local".to_string(),
+                "platform-db-cluster-rw.default.svc".to_string(),
+                "platform-db-cluster-rw.default".to_string(),
+                "platform-db-cluster-rw".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_service_in_another_namespace_gets_no_bare_name() {
+        // The bare name would resolve for the wrong namespace: a pod in
+        // `default` asking for `guts` must not reach `other/guts`.
+        let eps = vec![endpoints_for("guts", "other", &["172.19.0.7"])];
+        let entries = service_host_entries_from(&eps, "default", "cluster.local");
+        assert_eq!(
+            entries[0].1,
+            vec![
+                "guts.other.svc.cluster.local".to_string(),
+                "guts.other.svc".to_string(),
+                "guts.other".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_service_with_no_ready_address_is_skipped() {
+        // An unbacked Service must contribute nothing: a hosts entry pointing
+        // at an empty address would break name resolution rather than leave it
+        // unresolved, which is the more honest failure.
+        let eps = vec![
+            endpoints_for("no-backends", "default", &[]),
+            endpoints_for("blank-ip", "default", &[""]),
+            endpoints_for("real", "default", &["172.19.0.9"]),
+        ];
+        let entries = service_host_entries_from(&eps, "default", "cluster.local");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "172.19.0.9");
+    }
+
+    #[test]
+    fn entries_are_ordered_so_the_file_does_not_churn() {
+        // The file is rewritten every sync; unstable ordering would rewrite it
+        // every time and make real changes invisible in a diff.
+        let eps = vec![
+            endpoints_for("zebra", "default", &["172.19.0.3"]),
+            endpoints_for("alpha", "default", &["172.19.0.2"]),
+        ];
+        let entries = service_host_entries_from(&eps, "default", "cluster.local");
+        assert_eq!(entries[0].1[0], "alpha.default.svc.cluster.local");
+        assert_eq!(entries[1].1[0], "zebra.default.svc.cluster.local");
+    }
 
     #[test]
     fn test_hosts_file_always_contains_localhost() {
