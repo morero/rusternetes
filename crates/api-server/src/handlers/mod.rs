@@ -49,6 +49,7 @@ pub mod pod;
 pub mod pod_subresources;
 pub mod poddisruptionbudget;
 pub mod podtemplate;
+pub mod printers;
 pub mod priorityclass;
 pub mod proxy;
 pub mod rbac;
