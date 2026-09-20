@@ -647,7 +647,9 @@ fn job_duration(obj: &Value) -> String {
     compact_duration(end.signed_duration_since(start))
 }
 
-fn age_of(obj: &Value) -> String {
+/// Exposed for `table_response`'s NAME+AGE fallback, which renders kinds
+/// this module has no entry for and therefore cannot build cells for.
+pub(crate) fn age_of(obj: &Value) -> String {
     obj.pointer("/metadata/creationTimestamp")
         .and_then(Value::as_str)
         .map(elapsed_since)

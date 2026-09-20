@@ -603,12 +603,16 @@ pub async fn list(
 
     // Check if table format is requested
     let accept = headers.get("accept").and_then(|v| v.to_str().ok());
-    if crate::handlers::table::wants_table(accept) {
-        let table = crate::handlers::table::generic_table(
-            services,
-            Some(resource_version.to_string()),
-            "Service",
-        );
+    // Real `kubectl get svc` columns — TYPE, CLUSTER-IP, EXTERNAL-IP,
+    // PORT(S) — instead of the NAME and AGE this served before, which made
+    // the command close to useless for the one kind people reach for it with
+    // most. Falls through to the plain List when no table was asked for.
+    if let Some(table) = crate::handlers::table_response(
+        accept,
+        "Service",
+        &services,
+        Some(resource_version.to_string()),
+    ) {
         return Ok(Json(table).into_response());
     }
 
@@ -668,12 +672,16 @@ pub async fn list_all_services(
 
     // Check if table format is requested
     let accept = headers.get("accept").and_then(|v| v.to_str().ok());
-    if crate::handlers::table::wants_table(accept) {
-        let table = crate::handlers::table::generic_table(
-            services,
-            Some(resource_version.to_string()),
-            "Service",
-        );
+    // Real `kubectl get svc` columns — TYPE, CLUSTER-IP, EXTERNAL-IP,
+    // PORT(S) — instead of the NAME and AGE this served before, which made
+    // the command close to useless for the one kind people reach for it with
+    // most. Falls through to the plain List when no table was asked for.
+    if let Some(table) = crate::handlers::table_response(
+        accept,
+        "Service",
+        &services,
+        Some(resource_version.to_string()),
+    ) {
         return Ok(Json(table).into_response());
     }
 
