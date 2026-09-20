@@ -257,6 +257,14 @@ pub async fn run(
 
     let s = storage.clone();
     tokio::spawn(async move {
+        let c = Arc::new(controllers::kube_root_ca::KubeRootCaController::new(s));
+        if let Err(e) = c.run().await {
+            error!("kube-root-ca.crt controller error: {}", e);
+        }
+    });
+
+    let s = storage.clone();
+    tokio::spawn(async move {
         let c = Arc::new(ServiceAccountController::new(s));
         if let Err(e) = c.run().await {
             error!("ServiceAccount controller error: {}", e);

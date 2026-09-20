@@ -13,6 +13,7 @@ pub mod garbage_collector;
 pub mod hpa;
 pub mod ingress;
 pub mod job;
+pub mod kube_root_ca;
 pub mod loadbalancer;
 pub mod namespace;
 pub mod network_policy;

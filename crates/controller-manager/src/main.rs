@@ -556,6 +556,22 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Start kube-root-ca.crt controller (watch-based). Beside the
+    // ServiceAccount controller on purpose: both exist to populate every
+    // namespace, and a pod needs what both of them write before it can talk
+    // to the API server over TLS.
+    let kube_root_ca_controller = Arc::new(controllers::kube_root_ca::KubeRootCaController::new(
+        storage.clone(),
+    ));
+    spawn_controller!("kube-root-ca.crt controller", leader_elector, {
+        let controller = kube_root_ca_controller.clone();
+        async move {
+            if let Err(e) = controller.run().await {
+                tracing::error!("kube-root-ca.crt controller error: {}", e);
+            }
+        }
+    });
+
     // Start ServiceAccount controller (watch-based)
     let serviceaccount_controller = Arc::new(ServiceAccountController::new(storage.clone()));
     spawn_controller!("ServiceAccount controller", leader_elector, {
