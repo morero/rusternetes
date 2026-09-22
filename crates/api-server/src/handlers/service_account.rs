@@ -395,7 +395,7 @@ pub async fn deletecollection_serviceaccounts(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
+) -> Result<Json<serde_json::Value>> {
     info!(
         "DeleteCollection serviceaccounts in namespace: {} with params: {:?}",
         namespace, params
@@ -417,7 +417,7 @@ pub async fn deletecollection_serviceaccounts(
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
         info!("Dry-run: ServiceAccount collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
+        return Ok(crate::handlers::deletecollection_status("ServiceAccount"));
     }
 
     // Get all serviceaccounts in the namespace
@@ -449,7 +449,7 @@ pub async fn deletecollection_serviceaccounts(
         "DeleteCollection completed: {} serviceaccounts deleted",
         deleted_count
     );
-    Ok(StatusCode::OK)
+    Ok(crate::handlers::deletecollection_status("ServiceAccount"))
 }
 
 /// Create a token for a service account (TokenRequest API)

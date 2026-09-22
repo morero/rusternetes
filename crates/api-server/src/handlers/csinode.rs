@@ -192,7 +192,7 @@ pub async fn deletecollection_csinodes(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
+) -> Result<Json<serde_json::Value>> {
     info!("DeleteCollection csinodes with params: {:?}", params);
 
     // Check authorization
@@ -210,7 +210,7 @@ pub async fn deletecollection_csinodes(
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
         info!("Dry-run: CSINode collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
+        return Ok(crate::handlers::deletecollection_status("CSINode"));
     }
 
     // Get all csinodes
@@ -242,7 +242,7 @@ pub async fn deletecollection_csinodes(
         "DeleteCollection completed: {} csinodes deleted",
         deleted_count
     );
-    Ok(StatusCode::OK)
+    Ok(crate::handlers::deletecollection_status("CSINode"))
 }
 
 #[cfg(test)]

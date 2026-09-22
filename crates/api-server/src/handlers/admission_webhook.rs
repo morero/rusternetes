@@ -622,7 +622,7 @@ pub async fn deletecollection_validatingwebhookconfigurations(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
+) -> Result<Json<serde_json::Value>> {
     info!(
         "DeleteCollection validatingwebhookconfigurations with params: {:?}",
         params
@@ -647,7 +647,9 @@ pub async fn deletecollection_validatingwebhookconfigurations(
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
         info!("Dry-run: ValidatingWebhookConfiguration collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
+        return Ok(crate::handlers::deletecollection_status(
+            "ValidatingWebhookConfiguration",
+        ));
     }
 
     // Get all validatingwebhookconfigurations
@@ -682,14 +684,16 @@ pub async fn deletecollection_validatingwebhookconfigurations(
         "DeleteCollection completed: {} validatingwebhookconfigurations deleted",
         deleted_count
     );
-    Ok(StatusCode::OK)
+    Ok(crate::handlers::deletecollection_status(
+        "ValidatingWebhookConfiguration",
+    ))
 }
 
 pub async fn deletecollection_mutatingwebhookconfigurations(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
+) -> Result<Json<serde_json::Value>> {
     info!(
         "DeleteCollection mutatingwebhookconfigurations with params: {:?}",
         params
@@ -714,7 +718,9 @@ pub async fn deletecollection_mutatingwebhookconfigurations(
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
         info!("Dry-run: MutatingWebhookConfiguration collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
+        return Ok(crate::handlers::deletecollection_status(
+            "MutatingWebhookConfiguration",
+        ));
     }
 
     // Get all mutatingwebhookconfigurations
@@ -749,5 +755,7 @@ pub async fn deletecollection_mutatingwebhookconfigurations(
         "DeleteCollection completed: {} mutatingwebhookconfigurations deleted",
         deleted_count
     );
-    Ok(StatusCode::OK)
+    Ok(crate::handlers::deletecollection_status(
+        "MutatingWebhookConfiguration",
+    ))
 }

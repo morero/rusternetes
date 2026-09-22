@@ -365,7 +365,7 @@ pub async fn deletecollection_horizontalpodautoscalers(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
+) -> Result<Json<serde_json::Value>> {
     info!(
         "DeleteCollection horizontalpodautoscalers in namespace: {} with params: {:?}",
         namespace, params
@@ -391,7 +391,9 @@ pub async fn deletecollection_horizontalpodautoscalers(
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
         info!("Dry-run: HorizontalPodAutoscaler collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
+        return Ok(crate::handlers::deletecollection_status(
+            "HorizontalPodAutoscaler",
+        ));
     }
 
     // Get all horizontalpodautoscalers in the namespace
@@ -430,7 +432,9 @@ pub async fn deletecollection_horizontalpodautoscalers(
         "DeleteCollection completed: {} horizontalpodautoscalers deleted",
         deleted_count
     );
-    Ok(StatusCode::OK)
+    Ok(crate::handlers::deletecollection_status(
+        "HorizontalPodAutoscaler",
+    ))
 }
 
 #[cfg(test)]

@@ -193,7 +193,7 @@ pub async fn deletecollection_volumeattributesclasses(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
+) -> Result<Json<serde_json::Value>> {
     info!(
         "DeleteCollection volumeattributesclasses with params: {:?}",
         params
@@ -215,7 +215,9 @@ pub async fn deletecollection_volumeattributesclasses(
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
         info!("Dry-run: VolumeAttributesClass collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
+        return Ok(crate::handlers::deletecollection_status(
+            "VolumeAttributesClass",
+        ));
     }
 
     // Get all volumeattributesclasses
@@ -247,7 +249,9 @@ pub async fn deletecollection_volumeattributesclasses(
         "DeleteCollection completed: {} volumeattributesclasses deleted",
         deleted_count
     );
-    Ok(StatusCode::OK)
+    Ok(crate::handlers::deletecollection_status(
+        "VolumeAttributesClass",
+    ))
 }
 
 #[cfg(test)]

@@ -218,7 +218,7 @@ pub async fn deletecollection_ingressclasses(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
+) -> Result<Json<serde_json::Value>> {
     info!("DeleteCollection ingressclasses with params: {:?}", params);
 
     // Check authorization
@@ -236,7 +236,7 @@ pub async fn deletecollection_ingressclasses(
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
         info!("Dry-run: IngressClass collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
+        return Ok(crate::handlers::deletecollection_status("IngressClass"));
     }
 
     // Get all ingressclasses
@@ -268,5 +268,5 @@ pub async fn deletecollection_ingressclasses(
         "DeleteCollection completed: {} ingressclasses deleted",
         deleted_count
     );
-    Ok(StatusCode::OK)
+    Ok(crate::handlers::deletecollection_status("IngressClass"))
 }

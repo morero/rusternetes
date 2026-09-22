@@ -414,7 +414,7 @@ pub async fn deletecollection_prioritylevelconfigurations(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
+) -> Result<Json<serde_json::Value>> {
     info!(
         "DeleteCollection prioritylevelconfigurations with params: {:?}",
         params
@@ -439,7 +439,9 @@ pub async fn deletecollection_prioritylevelconfigurations(
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
         info!("Dry-run: PriorityLevelConfiguration collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
+        return Ok(crate::handlers::deletecollection_status(
+            "PriorityLevelConfiguration",
+        ));
     }
 
     // Get all prioritylevelconfigurations
@@ -474,14 +476,16 @@ pub async fn deletecollection_prioritylevelconfigurations(
         "DeleteCollection completed: {} prioritylevelconfigurations deleted",
         deleted_count
     );
-    Ok(StatusCode::OK)
+    Ok(crate::handlers::deletecollection_status(
+        "PriorityLevelConfiguration",
+    ))
 }
 
 pub async fn deletecollection_flowschemas(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
+) -> Result<Json<serde_json::Value>> {
     info!("DeleteCollection flowschemas");
     let attrs = RequestAttributes::new(auth_ctx.user, "deletecollection", "flowschemas")
         .with_api_group("flowcontrol.apiserver.k8s.io");
@@ -490,7 +494,7 @@ pub async fn deletecollection_flowschemas(
         Decision::Deny(reason) => return Err(rusternetes_common::Error::Forbidden(reason)),
     }
     if crate::handlers::dryrun::is_dry_run(&params) {
-        return Ok(StatusCode::OK);
+        return Ok(crate::handlers::deletecollection_status("FlowSchema"));
     }
     let prefix = build_prefix("flowschemas", None);
     let items: Vec<FlowSchema> = state.storage.list(&prefix).await?;
@@ -498,5 +502,5 @@ pub async fn deletecollection_flowschemas(
         let key = build_key("flowschemas", None, &item.metadata.name);
         let _ = state.storage.delete(&key).await;
     }
-    Ok(StatusCode::OK)
+    Ok(crate::handlers::deletecollection_status("FlowSchema"))
 }

@@ -448,7 +448,7 @@ pub async fn deletecollection_validatingadmissionpolicies(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
+) -> Result<Json<serde_json::Value>> {
     info!(
         "DeleteCollection validatingadmissionpolicies with params: {:?}",
         params
@@ -473,7 +473,9 @@ pub async fn deletecollection_validatingadmissionpolicies(
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
         info!("Dry-run: ValidatingAdmissionPolicy collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
+        return Ok(crate::handlers::deletecollection_status(
+            "ValidatingAdmissionPolicy",
+        ));
     }
 
     // Get all validatingadmissionpolicies
@@ -508,14 +510,16 @@ pub async fn deletecollection_validatingadmissionpolicies(
         "DeleteCollection completed: {} validatingadmissionpolicies deleted",
         deleted_count
     );
-    Ok(StatusCode::OK)
+    Ok(crate::handlers::deletecollection_status(
+        "ValidatingAdmissionPolicy",
+    ))
 }
 
 pub async fn deletecollection_validatingadmissionpolicybindings(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
+) -> Result<Json<serde_json::Value>> {
     info!(
         "DeleteCollection validatingadmissionpolicybindings with params: {:?}",
         params
@@ -542,7 +546,9 @@ pub async fn deletecollection_validatingadmissionpolicybindings(
         info!(
             "Dry-run: ValidatingAdmissionPolicyBinding collection would be deleted (not deleted)"
         );
-        return Ok(StatusCode::OK);
+        return Ok(crate::handlers::deletecollection_status(
+            "ValidatingAdmissionPolicyBinding",
+        ));
     }
 
     // Get all validatingadmissionpolicybindings
@@ -581,5 +587,7 @@ pub async fn deletecollection_validatingadmissionpolicybindings(
         "DeleteCollection completed: {} validatingadmissionpolicybindings deleted",
         deleted_count
     );
-    Ok(StatusCode::OK)
+    Ok(crate::handlers::deletecollection_status(
+        "ValidatingAdmissionPolicyBinding",
+    ))
 }

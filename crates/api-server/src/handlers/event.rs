@@ -439,7 +439,7 @@ pub async fn deletecollection_events(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
+) -> Result<Json<serde_json::Value>> {
     info!(
         "DeleteCollection events in namespace: {} with params: {:?}",
         namespace, params
@@ -461,7 +461,7 @@ pub async fn deletecollection_events(
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
         info!("Dry-run: Event collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
+        return Ok(crate::handlers::deletecollection_status("Event"));
     }
 
     // Get all events in the namespace
@@ -493,7 +493,7 @@ pub async fn deletecollection_events(
         "DeleteCollection completed: {} events deleted",
         deleted_count
     );
-    Ok(StatusCode::OK)
+    Ok(crate::handlers::deletecollection_status("Event"))
 }
 
 // ---- events.k8s.io/v1 API group handlers ----

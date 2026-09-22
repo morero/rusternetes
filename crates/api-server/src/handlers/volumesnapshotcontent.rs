@@ -197,7 +197,7 @@ pub async fn deletecollection_volumesnapshotcontents(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
+) -> Result<Json<serde_json::Value>> {
     info!(
         "DeleteCollection volumesnapshotcontents with params: {:?}",
         params
@@ -218,7 +218,9 @@ pub async fn deletecollection_volumesnapshotcontents(
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
         info!("Dry-run: VolumeSnapshotContent collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
+        return Ok(crate::handlers::deletecollection_status(
+            "VolumeSnapshotContent",
+        ));
     }
 
     // Get all volumesnapshotcontents
@@ -250,5 +252,7 @@ pub async fn deletecollection_volumesnapshotcontents(
         "DeleteCollection completed: {} volumesnapshotcontents deleted",
         deleted_count
     );
-    Ok(StatusCode::OK)
+    Ok(crate::handlers::deletecollection_status(
+        "VolumeSnapshotContent",
+    ))
 }

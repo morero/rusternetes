@@ -904,7 +904,7 @@ pub async fn deletecollection_roles(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<StatusCode> {
+) -> Result<Json<serde_json::Value>> {
     info!(
         "DeleteCollection roles in namespace: {} with params: {:?}",
         namespace, params
@@ -926,7 +926,7 @@ pub async fn deletecollection_roles(
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
         info!("Dry-run: Role collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
+        return Ok(crate::handlers::deletecollection_status("Role"));
     }
 
     // Get all roles in the namespace
@@ -958,7 +958,7 @@ pub async fn deletecollection_roles(
         "DeleteCollection completed: {} roles deleted",
         deleted_count
     );
-    Ok(StatusCode::OK)
+    Ok(crate::handlers::deletecollection_status("Role"))
 }
 
 pub async fn deletecollection_rolebindings(
@@ -966,7 +966,7 @@ pub async fn deletecollection_rolebindings(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<StatusCode> {
+) -> Result<Json<serde_json::Value>> {
     info!(
         "DeleteCollection rolebindings in namespace: {} with params: {:?}",
         namespace, params
@@ -988,7 +988,7 @@ pub async fn deletecollection_rolebindings(
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
         info!("Dry-run: RoleBinding collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
+        return Ok(crate::handlers::deletecollection_status("RoleBinding"));
     }
 
     // Get all rolebindings in the namespace
@@ -1020,14 +1020,14 @@ pub async fn deletecollection_rolebindings(
         "DeleteCollection completed: {} rolebindings deleted",
         deleted_count
     );
-    Ok(StatusCode::OK)
+    Ok(crate::handlers::deletecollection_status("RoleBinding"))
 }
 
 pub async fn deletecollection_clusterroles(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<StatusCode> {
+) -> Result<Json<serde_json::Value>> {
     info!("DeleteCollection clusterroles with params: {:?}", params);
 
     // Check authorization
@@ -1045,7 +1045,7 @@ pub async fn deletecollection_clusterroles(
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
         info!("Dry-run: ClusterRole collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
+        return Ok(crate::handlers::deletecollection_status("ClusterRole"));
     }
 
     // Get all clusterroles
@@ -1077,14 +1077,14 @@ pub async fn deletecollection_clusterroles(
         "DeleteCollection completed: {} clusterroles deleted",
         deleted_count
     );
-    Ok(StatusCode::OK)
+    Ok(crate::handlers::deletecollection_status("ClusterRole"))
 }
 
 pub async fn deletecollection_clusterrolebindings(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<StatusCode> {
+) -> Result<Json<serde_json::Value>> {
     info!(
         "DeleteCollection clusterrolebindings with params: {:?}",
         params
@@ -1105,7 +1105,9 @@ pub async fn deletecollection_clusterrolebindings(
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
         info!("Dry-run: ClusterRoleBinding collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
+        return Ok(crate::handlers::deletecollection_status(
+            "ClusterRoleBinding",
+        ));
     }
 
     // Get all clusterrolebindings
@@ -1141,7 +1143,9 @@ pub async fn deletecollection_clusterrolebindings(
         "DeleteCollection completed: {} clusterrolebindings deleted",
         deleted_count
     );
-    Ok(StatusCode::OK)
+    Ok(crate::handlers::deletecollection_status(
+        "ClusterRoleBinding",
+    ))
 }
 
 // Use macros to create PATCH handlers for RBAC resources

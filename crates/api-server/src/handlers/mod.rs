@@ -175,6 +175,56 @@ pub fn table_response<T: serde::Serialize>(
     Some(table.with_metadata(resource_version, None, None))
 }
 
+/// The `Status` body a `deletecollection` must answer with.
+///
+/// Kubernetes answers deleteCollection with a `Status` object, not an empty
+/// 200 — see staging/src/k8s.io/apiserver/pkg/endpoints/handlers/delete.go.
+/// Clients deserialize the body unconditionally, so a bodyless 200 is not a
+/// lenient success, it is a parse error:
+///
+///   Error deserializing response: EOF while parsing a value at line 1 column 0
+///
+/// Found with `workflow-operator`, which deletes a `Workflow`'s runner Jobs
+/// by label selector on cleanup. Every such call failed on the empty body, so
+/// the operator logged "the Jobs are leaked and must be removed by hand" and
+/// leaked them — the deletes had in fact succeeded, and only the reply was
+/// wrong. `statefulsets` already answered correctly; the other 57
+/// `deletecollection` handlers did not.
+pub fn deletecollection_status(kind: &str) -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "kind": "Status",
+        "apiVersion": "v1",
+        "metadata": {},
+        "status": "Success",
+        "code": 200,
+        "details": { "kind": kind }
+    }))
+}
+
+#[cfg(test)]
+mod deletecollection_tests {
+    use super::*;
+
+    /// A `deletecollection` reply has to be a parseable `Status`. The bug this
+    /// guards is not a wrong field, it is *no body at all*: clients
+    /// deserialize unconditionally, so an empty 200 reads as
+    /// "EOF while parsing a value at line 1 column 0" and a successful
+    /// delete is reported as a failure.
+    #[test]
+    fn deletecollection_answers_with_a_status() {
+        let axum::Json(body) = deletecollection_status("Job");
+        assert_eq!(body["kind"], "Status");
+        assert_eq!(body["apiVersion"], "v1");
+        assert_eq!(body["status"], "Success");
+        assert_eq!(body["code"], 200);
+        assert_eq!(body["details"]["kind"], "Job");
+        // It must survive a round trip as JSON, which is all the client does.
+        let encoded = serde_json::to_string(&body).unwrap();
+        let decoded: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded["status"], "Success");
+    }
+}
+
 #[cfg(test)]
 mod table_response_tests {
     use super::*;
@@ -195,8 +245,13 @@ mod table_response_tests {
     /// running.
     #[test]
     fn a_known_kind_gets_its_real_columns() {
-        let table = table_response(Some("application/json;as=Table"), "Service", &[service()], None)
-            .expect("asked for a table");
+        let table = table_response(
+            Some("application/json;as=Table"),
+            "Service",
+            &[service()],
+            None,
+        )
+        .expect("asked for a table");
         let headers: Vec<&str> = table
             .column_definitions
             .iter()
@@ -258,7 +313,11 @@ mod table_response_tests {
     fn each_row_carries_its_object() {
         let table = table_response(Some("as=Table"), "Service", &[service()], None).unwrap();
         assert_eq!(
-            table.rows[0].object.as_ref().unwrap().pointer("/metadata/name"),
+            table.rows[0]
+                .object
+                .as_ref()
+                .unwrap()
+                .pointer("/metadata/name"),
             Some(&json!("guts"))
         );
     }

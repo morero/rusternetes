@@ -386,7 +386,7 @@ pub async fn deletecollection_poddisruptionbudgets(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
+) -> Result<Json<serde_json::Value>> {
     info!(
         "DeleteCollection poddisruptionbudgets in namespace: {} with params: {:?}",
         namespace, params
@@ -408,7 +408,9 @@ pub async fn deletecollection_poddisruptionbudgets(
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
         info!("Dry-run: PodDisruptionBudget collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
+        return Ok(crate::handlers::deletecollection_status(
+            "PodDisruptionBudget",
+        ));
     }
 
     // Get all poddisruptionbudgets in the namespace
@@ -444,7 +446,9 @@ pub async fn deletecollection_poddisruptionbudgets(
         "DeleteCollection completed: {} poddisruptionbudgets deleted",
         deleted_count
     );
-    Ok(StatusCode::OK)
+    Ok(crate::handlers::deletecollection_status(
+        "PodDisruptionBudget",
+    ))
 }
 
 #[cfg(test)]

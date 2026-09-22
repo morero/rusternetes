@@ -313,7 +313,7 @@ pub async fn deletecollection_leases(
     Extension(auth_ctx): Extension<AuthContext>,
     Path(namespace): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<StatusCode> {
+) -> Result<Json<serde_json::Value>> {
     info!(
         "DeleteCollection leases in namespace: {} with params: {:?}",
         namespace, params
@@ -335,7 +335,7 @@ pub async fn deletecollection_leases(
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
     if is_dry_run {
         info!("Dry-run: Lease collection would be deleted (not deleted)");
-        return Ok(StatusCode::OK);
+        return Ok(crate::handlers::deletecollection_status("Lease"));
     }
 
     // Get all leases in the namespace
@@ -367,5 +367,5 @@ pub async fn deletecollection_leases(
         "DeleteCollection completed: {} leases deleted",
         deleted_count
     );
-    Ok(StatusCode::OK)
+    Ok(crate::handlers::deletecollection_status("Lease"))
 }
