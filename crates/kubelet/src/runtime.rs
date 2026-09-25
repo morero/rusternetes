@@ -125,6 +125,26 @@ fn service_host_entries_from(
     entries
 }
 
+/// Claim the right to pull `image`, returning whether this caller should start
+/// it. `false` means a pull is already running and must be left alone.
+///
+/// The claim is what keeps one slow pull from becoming many: `sync_pod` runs
+/// again every couple of minutes while a large image comes down, and without
+/// this each pass would start another pull of the same thing.
+fn claim_pull(in_flight: &Mutex<std::collections::HashSet<String>>, image: &str) -> bool {
+    in_flight.lock().unwrap().insert(image.to_string())
+}
+
+/// Whether an image is ready to create a container from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageReadiness {
+    /// Present locally; a container can be created now.
+    Ready,
+    /// A pull is running in the background. The caller should abandon this
+    /// sync and look again on the next one — the pull is not cancelled.
+    Pulling,
+}
+
 pub struct ContainerRuntime {
     docker: Docker,
     storage: Option<Arc<rusternetes_storage::StorageBackend>>,
@@ -143,7 +163,13 @@ pub struct ContainerRuntime {
     /// Probe state tracker: key is "{pod_name}/{container_name}/{probe_type}"
     probe_states: Mutex<HashMap<String, ProbeState>>,
     /// Cache of images known to exist locally (avoid repeated Docker API calls)
-    image_cache: Mutex<std::collections::HashSet<String>>,
+    image_cache: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Images currently being pulled, by normalized name.
+    ///
+    /// A pull runs in a detached task and outlives the `sync_pod` that asked
+    /// for it — see [`ContainerRuntime::ensure_image`]. This set is what stops
+    /// each subsequent sync starting a second pull of the same image.
+    image_pulls: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Cache of shell availability per image (true = has /bin/sh)
     shell_cache: Mutex<HashMap<String, bool>>,
 }
@@ -700,7 +726,8 @@ impl ContainerRuntime {
             kubernetes_service_host,
             token_manager,
             probe_states: Mutex::new(HashMap::new()),
-            image_cache: Mutex::new(std::collections::HashSet::new()),
+            image_cache: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            image_pulls: Arc::new(Mutex::new(std::collections::HashSet::new())),
             shell_cache: Mutex::new(HashMap::new()),
         })
     }
@@ -931,8 +958,28 @@ impl ContainerRuntime {
         Ok(())
     }
 
-    /// Pull an image if necessary based on the pull policy
-    pub async fn ensure_image(&self, image: &str, pull_policy: Option<&str>) -> Result<()> {
+    /// Pull an image if necessary based on the pull policy.
+    ///
+    /// A pull runs in a **detached task** and is never awaited here, because
+    /// the caller is inside `sync_pod`, which the pod worker abandons after a
+    /// bounded time. Awaiting it meant a pull that took longer than the bound
+    /// was cancelled and restarted from nothing on the next sync, forever: a
+    /// ~3GB image logged `Pulling image: …` every two minutes and the
+    /// container never started, failing on `404: No such image` each time.
+    /// That is ISSUES #91, and it is the same shape as #90 — work that
+    /// legitimately outlives a sync must not be owned by that sync.
+    ///
+    /// Upstream separates this the same way: an image manager owns the pull
+    /// with its own lifetime, so a slow registry or a large image delays a pod
+    /// instead of deadlocking it.
+    ///
+    /// Returns [`ImageReadiness::Pulling`] rather than an error when a pull is
+    /// under way, so a caller can tell "not yet" from "this failed".
+    pub async fn ensure_image(
+        &self,
+        image: &str,
+        pull_policy: Option<&str>,
+    ) -> Result<ImageReadiness> {
         let policy = pull_policy.unwrap_or("IfNotPresent");
 
         // Normalize image name to include registry if not specified
@@ -971,31 +1018,51 @@ impl ContainerRuntime {
         );
 
         if should_pull {
-            info!("Pulling image: {}", normalized_image);
-
-            // Try to pull the image with proper registry handling
-            if let Err(e) = self.pull_image_with_retry(&normalized_image).await {
-                error!("Failed to pull image {}: {}", normalized_image, e);
-
-                // If normalized image failed and it's different from original, try original
-                if normalized_image != image {
-                    warn!("Retrying with original image name: {}", image);
-                    self.pull_image_with_retry(image).await?;
-                } else {
-                    return Err(e);
-                }
+            // Already pulling? Say so and leave the running pull alone. Without
+            // this every sync would start another pull of the same image.
+            if !claim_pull(&self.image_pulls, &normalized_image) {
+                debug!("Image {} is already being pulled", normalized_image);
+                return Ok(ImageReadiness::Pulling);
             }
 
-            info!("Successfully pulled image: {}", image);
-            // Cache the pulled image
-            let mut cache = self.image_cache.lock().unwrap();
-            cache.insert(image.to_string());
-            cache.insert(normalized_image.clone());
-        } else {
-            debug!("Image {} already exists locally, skipping pull", image);
+            info!("Pulling image: {} (in the background)", normalized_image);
+
+            let docker = self.docker.clone();
+            let cache = Arc::clone(&self.image_cache);
+            let in_flight = Arc::clone(&self.image_pulls);
+            let original = image.to_string();
+            let normalized = normalized_image.clone();
+
+            tokio::spawn(async move {
+                let mut result = Self::pull_with_retry(&docker, &normalized).await;
+                if let Err(ref e) = result {
+                    error!("Failed to pull image {}: {}", normalized, e);
+                    // A normalized name can be wrong for a registry that wants
+                    // the name as written; try that before giving up.
+                    if normalized != original {
+                        warn!("Retrying with original image name: {}", original);
+                        result = Self::pull_with_retry(&docker, &original).await;
+                    }
+                }
+                match result {
+                    Ok(()) => {
+                        info!("Successfully pulled image: {}", normalized);
+                        let mut cache = cache.lock().unwrap();
+                        cache.insert(original);
+                        cache.insert(normalized.clone());
+                    }
+                    Err(e) => error!("Giving up pulling image {}: {}", normalized, e),
+                }
+                // Cleared whatever the outcome: a failed pull must be
+                // retryable on the next sync, not wedged as "in progress".
+                in_flight.lock().unwrap().remove(&normalized);
+            });
+
+            return Ok(ImageReadiness::Pulling);
         }
 
-        Ok(())
+        debug!("Image {} already exists locally, skipping pull", image);
+        Ok(ImageReadiness::Ready)
     }
 
     /// Check if an image exists locally
@@ -1034,12 +1101,18 @@ impl ContainerRuntime {
 
     /// Pull image with retry logic
     async fn pull_image_with_retry(&self, image: &str) -> Result<()> {
+        Self::pull_with_retry(&self.docker, image).await
+    }
+
+    /// The pull itself, over a `Docker` handle rather than `&self`, so it can
+    /// run in a detached task that outlives the caller.
+    async fn pull_with_retry(docker: &Docker, image: &str) -> Result<()> {
         let options = CreateImageOptions {
             from_image: image,
             ..Default::default()
         };
 
-        let mut stream = self.docker.create_image(Some(options), None, None);
+        let mut stream = docker.create_image(Some(options), None, None);
         let mut last_error = None;
 
         while let Some(result) = stream.next().await {
@@ -1401,9 +1474,26 @@ impl ContainerRuntime {
                     .collect();
                 let results = futures_util::future::join_all(futs).await;
                 for (i, r) in results.into_iter().enumerate() {
-                    if let Err(e) = r {
-                        error!("Failed to pull image {}: {}", unique[i].0, e);
-                        return Err(e);
+                    match r {
+                        // Not an error: the pull is running in the background
+                        // and this sync stops here rather than creating a
+                        // container whose image is not down yet. The next sync
+                        // finds it either present or still pulling.
+                        Ok(ImageReadiness::Pulling) => {
+                            info!(
+                                "Waiting on image {} for pod {} — pull in progress",
+                                unique[i].0, pod_name
+                            );
+                            return Err(anyhow::anyhow!(
+                                "image {} is still being pulled",
+                                unique[i].0
+                            ));
+                        }
+                        Ok(ImageReadiness::Ready) => {}
+                        Err(e) => {
+                            error!("Failed to pull image {}: {}", unique[i].0, e);
+                            return Err(e);
+                        }
                     }
                 }
             }
@@ -2202,9 +2292,19 @@ impl ContainerRuntime {
 
         // Ensure busybox image is available (critical for podman which may not auto-pull)
         // Use IfNotPresent policy to avoid unnecessary pulls on every pod start
-        self.ensure_image("busybox:latest", Some("IfNotPresent"))
+        // The sandbox image is small and almost always cached, but the same
+        // rule applies: if it is being fetched, stop here rather than create a
+        // container from an image that is not down yet.
+        if self
+            .ensure_image("busybox:latest", Some("IfNotPresent"))
             .await
-            .context("Failed to ensure busybox image for pause container")?;
+            .context("Failed to ensure busybox image for pause container")?
+            == ImageReadiness::Pulling
+        {
+            return Err(anyhow::anyhow!(
+                "sandbox image busybox:latest is still being pulled"
+            ));
+        }
 
         let config = Config {
             image: Some("busybox:latest".to_string()),
@@ -9303,6 +9403,50 @@ pub fn parse_cpu_quantity(s: &str) -> i64 {
         s.trim_end_matches('m').parse::<i64>().unwrap_or(0)
     } else {
         (s.parse::<f64>().unwrap_or(0.0) * 1000.0) as i64
+    }
+}
+
+#[cfg(test)]
+mod image_pull_claim_tests {
+    use super::claim_pull;
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    /// The invariant ISSUES #91 turns on: `sync_pod` runs again every couple of
+    /// minutes while a large image comes down, and each pass must leave the
+    /// running pull alone rather than start another.
+    #[test]
+    fn only_the_first_caller_starts_a_pull() {
+        let in_flight = Mutex::new(HashSet::new());
+        assert!(claim_pull(
+            &in_flight,
+            "timescale/timescaledb-ha:pg16-ts2.17"
+        ));
+        assert!(!claim_pull(
+            &in_flight,
+            "timescale/timescaledb-ha:pg16-ts2.17"
+        ));
+        assert!(!claim_pull(
+            &in_flight,
+            "timescale/timescaledb-ha:pg16-ts2.17"
+        ));
+    }
+
+    #[test]
+    fn different_images_are_claimed_independently() {
+        let in_flight = Mutex::new(HashSet::new());
+        assert!(claim_pull(&in_flight, "a:1"));
+        assert!(claim_pull(&in_flight, "b:1"));
+    }
+
+    /// The claim is released whatever the outcome, so a pull that failed is
+    /// retried on the next sync rather than wedged as "in progress" forever.
+    #[test]
+    fn a_released_claim_can_be_taken_again() {
+        let in_flight = Mutex::new(HashSet::new());
+        assert!(claim_pull(&in_flight, "a:1"));
+        in_flight.lock().unwrap().remove("a:1");
+        assert!(claim_pull(&in_flight, "a:1"));
     }
 }
 

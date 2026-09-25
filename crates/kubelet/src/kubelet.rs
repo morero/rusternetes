@@ -2011,16 +2011,28 @@ impl Kubelet {
                                     ic.name, idx, namespace, pod_name
                                 );
                                 // Ensure image is available before starting
-                                if let Err(e) = self
+                                match self
                                     .runtime
                                     .ensure_image(&ic.image, ic.image_pull_policy.as_deref())
                                     .await
                                 {
-                                    warn!(
-                                        "Failed to pull image for init container {}: {}",
-                                        ic.name, e
-                                    );
-                                    return Ok(());
+                                    Ok(crate::runtime::ImageReadiness::Ready) => {}
+                                    // Not a failure — the pull outlives this
+                                    // sync, so come back to it on the next one.
+                                    Ok(crate::runtime::ImageReadiness::Pulling) => {
+                                        info!(
+                                            "Init container {} for pod {}/{} is waiting on image {} — pull in progress",
+                                            ic.name, namespace, pod_name, ic.image
+                                        );
+                                        return Ok(());
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to pull image for init container {}: {}",
+                                            ic.name, e
+                                        );
+                                        return Ok(());
+                                    }
                                 }
                                 let volume_paths: std::collections::HashMap<String, String> = pod
                                     .spec
