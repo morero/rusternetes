@@ -1161,27 +1161,53 @@ impl ProtoRegistry {
                             FieldType::Message("SessionAffinityConfig".into()),
                         ),
                     ),
+                    // Fields 17-22 were permuted, and the numbers below are
+                    // `k8s.io/api/core/v1/generated.proto`'s, not a guess:
+                    //
+                    //   17 = ipFamilyPolicy (string)
+                    //   18 = clusterIPs (repeated string)
+                    //   19 = ipFamilies (repeated string)
+                    //   20 = allocateLoadBalancerNodePorts (bool)
+                    //   21 = loadBalancerClass (string)
+                    //   22 = internalTrafficPolicy (string)
+                    //
+                    // Two of those were wire-type mismatches, not just wrong
+                    // names: 20 and 21 carry a bool and a string respectively,
+                    // and this schema expected the opposite. A varint read as
+                    // a length-delimited string does not merely produce a
+                    // wrong value, it derails the rest of the message.
+                    //
+                    // Why it presented as a *create works, update fails* bug:
+                    // a Service body CNPG sends on create carries none of
+                    // 17-19 — the api-server defaults `clusterIP(s)`,
+                    // `ipFamilies` and `ipFamilyPolicy` itself. An update
+                    // round-trips them back, so only then does the decode meet
+                    // these fields. It surfaced as CNPG stuck at
+                    // `Unable to create required cluster objects` with
+                    // `put services <cluster>-r` failing, and client-go could
+                    // only report its own generic 422 text, exactly as in
+                    // ISSUES #32.
+                    (17, ("ipFamilyPolicy".into(), FieldType::String)),
                     (
-                        17,
-                        (
-                            "ipFamilies".into(),
-                            FieldType::Repeated(Box::new(FieldType::String)),
-                        ),
-                    ),
-                    (18, ("ipFamilyPolicy".into(), FieldType::String)),
-                    (
-                        19,
+                        18,
                         (
                             "clusterIPs".into(),
                             FieldType::Repeated(Box::new(FieldType::String)),
                         ),
                     ),
-                    (20, ("internalTrafficPolicy".into(), FieldType::String)),
                     (
-                        21,
+                        19,
+                        (
+                            "ipFamilies".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        20,
                         ("allocateLoadBalancerNodePorts".into(), FieldType::Bool),
                     ),
-                    (22, ("loadBalancerClass".into(), FieldType::String)),
+                    (21, ("loadBalancerClass".into(), FieldType::String)),
+                    (22, ("internalTrafficPolicy".into(), FieldType::String)),
                     (23, ("trafficDistribution".into(), FieldType::String)),
                 ]),
             },
@@ -1195,6 +1221,9 @@ impl ProtoRegistry {
                     (3, ("port".into(), FieldType::Int)),
                     (4, ("targetPort".into(), FieldType::IntOrString)),
                     (5, ("nodePort".into(), FieldType::Int)),
+                    // 6, not 3-then-5: `appProtocol` was absent from this
+                    // schema, so it was dropped on every protobuf round-trip.
+                    (6, ("appProtocol".into(), FieldType::String)),
                 ]),
             },
         );
@@ -4027,6 +4056,90 @@ mod tests {
         }
     }
 
+
+    /// ServiceSpec protobuf field numbers, pinned against upstream
+    /// `kubernetes/api/core/v1/generated.proto` — the same kind of pin as
+    /// `pod_spec_field_numbers_match_upstream`, added for the same reason and
+    /// after the same kind of outage.
+    ///
+    /// Fields 17-22 were permuted here. Two of them were wire-type mismatches
+    /// rather than merely wrong names — upstream 20 is a bool and 21 a string,
+    /// and this schema had them the other way round — and a varint read as a
+    /// length-delimited string derails the rest of the message rather than
+    /// producing one wrong value.
+    ///
+    /// It presented as "create works, update fails", which is what made it hard
+    /// to see: a `Service` body sent on create carries none of 17-19, because
+    /// the api-server defaults `clusterIP(s)`, `ipFamilies` and
+    /// `ipFamilyPolicy` itself. Only an update round-trips them back, so only
+    /// an update met the broken fields. CNPG sat at `Unable to create required
+    /// cluster objects` with `put services <cluster>-r` failing, and client-go
+    /// could report nothing better than its own generic 422 text — ISSUES #32
+    /// again, one verb over.
+    #[test]
+    fn service_spec_field_numbers_match_upstream() {
+        let registry = super::ProtoRegistry::new();
+        let schema = registry
+            .schemas
+            .get("ServiceSpec")
+            .expect("ServiceSpec schema is registered");
+        for (number, name) in [
+            (1u32, "ports"),
+            (2, "selector"),
+            (3, "clusterIP"),
+            (4, "type"),
+            (5, "externalIPs"),
+            (7, "sessionAffinity"),
+            (8, "loadBalancerIP"),
+            (9, "loadBalancerSourceRanges"),
+            (10, "externalName"),
+            (11, "externalTrafficPolicy"),
+            (12, "healthCheckNodePort"),
+            (13, "publishNotReadyAddresses"),
+            (14, "sessionAffinityConfig"),
+            (17, "ipFamilyPolicy"),
+            (18, "clusterIPs"),
+            (19, "ipFamilies"),
+            (20, "allocateLoadBalancerNodePorts"),
+            (21, "loadBalancerClass"),
+            (22, "internalTrafficPolicy"),
+            (23, "trafficDistribution"),
+        ] {
+            let actual = schema
+                .fields
+                .get(&number)
+                .unwrap_or_else(|| panic!("ServiceSpec field {number} ({name}) is missing"));
+            assert_eq!(
+                actual.0, name,
+                "ServiceSpec field {number} should be {name}, found {}",
+                actual.0
+            );
+        }
+    }
+
+    /// The two fields whose wire type, not just whose name, was wrong.
+    #[test]
+    fn service_spec_wire_types_match_upstream() {
+        let registry = super::ProtoRegistry::new();
+        let schema = registry.schemas.get("ServiceSpec").unwrap();
+        assert!(
+            matches!(schema.fields.get(&20).unwrap().1, super::FieldType::Bool),
+            "upstream 20 is `optional bool allocateLoadBalancerNodePorts`"
+        );
+        assert!(
+            matches!(schema.fields.get(&21).unwrap().1, super::FieldType::String),
+            "upstream 21 is `optional string loadBalancerClass`"
+        );
+    }
+
+    /// `appProtocol` was absent from `ServicePort`, so it was dropped on every
+    /// protobuf round-trip rather than decoded wrongly.
+    #[test]
+    fn service_port_carries_app_protocol() {
+        let registry = super::ProtoRegistry::new();
+        let schema = registry.schemas.get("ServicePort").unwrap();
+        assert_eq!(schema.fields.get(&6).map(|f| f.0.as_str()), Some("appProtocol"));
+    }
 
     use super::*;
 
