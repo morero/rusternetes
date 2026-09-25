@@ -719,6 +719,18 @@ pub async fn update_custom_resource(
         }
     }
 
+    // Structural pruning, same as the create path and for the same reason.
+    // Only `create_custom_resource` pruned, so an unknown field could not be
+    // introduced by a create but could by every update and patch — and those
+    // are how controllers actually write. Live cost: a `Cluster` written with
+    // `spec.postgresql.sharedPreloadLibraries` (camelCase; CNPG's field is
+    // `shared_preload_libraries`) was stored verbatim and read back happily,
+    // so the setting looked applied while CNPG ignored it. `CREATE EXTENSION
+    // timescaledb` failed with `must be preloaded` through two pod restarts
+    // before the spelling was suspected. Pruning turns that into an immediately
+    // visible absence, which is the whole point of it.
+    prune_custom_resource(&crd, &version, &mut cr);
+
     // Skip persistence for dry-run after webhooks have run.
     if cr_is_dry_run {
         return Ok(Json(cr));
@@ -895,6 +907,9 @@ pub async fn patch_custom_resource(
                             ))
                         })?;
                     validate_custom_resource(&crd, &version, &applied)?;
+                    // Structural pruning for the apply branch too — see the
+                    // note on the update path.
+                    prune_custom_resource(&crd, &version, &mut applied);
                     let saved = if is_create {
                         applied.metadata.ensure_uid();
                         applied.metadata.ensure_creation_timestamp();
@@ -1186,6 +1201,11 @@ pub async fn patch_custom_resource(
 
     // Validate the patched resource against CRD schema
     validate_custom_resource(&crd, &version, &patched)?;
+
+    // Structural pruning — see the note on the update path. A patch is the
+    // most common way a controller writes, so leaving this out meant pruning
+    // effectively did not apply to the objects that matter.
+    prune_custom_resource(&crd, &version, &mut patched);
 
     // Ensure name matches
     patched.metadata.name = name.clone();
@@ -2180,6 +2200,68 @@ mod tests {
     };
     use rusternetes_common::types::ObjectMeta;
     use serde_json::json;
+
+    /// Pruning must reach nested objects, not just the top of `spec`.
+    ///
+    /// The existing webhook test covers `spec.extraField`. What escaped in
+    /// practice was two levels down: a `Cluster` written with
+    /// `spec.postgresql.sharedPreloadLibraries` — camelCase, where CNPG's
+    /// field is `shared_preload_libraries` — was stored verbatim and read back
+    /// happily, so the setting looked applied while the operator ignored it.
+    /// `CREATE EXTENSION timescaledb` failed with `must be preloaded` through
+    /// two pod restarts before the spelling was suspected.
+    #[test]
+    fn pruning_removes_an_unknown_field_nested_inside_spec() {
+        let crd: CustomResourceDefinition = serde_json::from_value(json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": "clusters.postgresql.cnpg.io"},
+            "spec": {
+                "group": "postgresql.cnpg.io",
+                "names": {"plural": "clusters", "singular": "cluster",
+                          "kind": "Cluster", "listKind": "ClusterList"},
+                "scope": "Namespaced",
+                "versions": [{
+                    "name": "v1", "served": true, "storage": true,
+                    "schema": {"openAPIV3Schema": {"type": "object", "properties": {
+                        "spec": {"type": "object", "properties": {
+                            "postgresql": {"type": "object", "properties": {
+                                "shared_preload_libraries": {
+                                    "type": "array", "items": {"type": "string"}
+                                }
+                            }}
+                        }}
+                    }}}
+                }]
+            }
+        }))
+        .unwrap();
+
+        let mut cr: CustomResource = serde_json::from_value(json!({
+            "apiVersion": "postgresql.cnpg.io/v1",
+            "kind": "Cluster",
+            "metadata": {"name": "db"},
+            "spec": {"postgresql": {
+                "shared_preload_libraries": ["timescaledb"],
+                "sharedPreloadLibraries": ["timescaledb"]
+            }}
+        }))
+        .unwrap();
+
+        prune_custom_resource(&crd, "v1", &mut cr);
+
+        let pg = cr.spec.expect("spec preserved");
+        let pg = pg.get("postgresql").expect("postgresql preserved");
+        assert_eq!(
+            pg.get("shared_preload_libraries"),
+            Some(&json!(["timescaledb"])),
+            "the real field must survive"
+        );
+        assert!(
+            pg.get("sharedPreloadLibraries").is_none(),
+            "the misspelling must be pruned, not stored: {pg:?}"
+        );
+    }
 
     fn create_test_crd() -> CustomResourceDefinition {
         CustomResourceDefinition {
