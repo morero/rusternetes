@@ -8133,7 +8133,27 @@ impl ContainerRuntime {
         // Stop the pause container last — the network namespace dies with it
         if let Some(ref pause_id) = pause_container_id {
             info!("Stopping pause container: {} (last)", pause_id);
-            let stop_options = StopContainerOptions { t: remaining_grace };
+            // A short fixed timeout, NOT the pod's grace period.
+            //
+            // `terminationGracePeriodSeconds` is time granted to the *workload*
+            // to shut down cleanly. The sandbox holds no application state; k8s
+            // tears it down promptly once the app containers are gone
+            // (`StopPodSandbox`), and giving it the app's budget is a category
+            // error with teeth here: this sandbox is `busybox` running
+            // `sleep infinity`, and BusyBox `sleep` as PID 1 installs no
+            // SIGTERM handler, so Docker waits the entire timeout before
+            // SIGKILL — every time.
+            //
+            // With CNPG's 1800s grace period that meant a 30-minute wait that
+            // the pod worker's own 120s sync timeout aborted at every attempt,
+            // restarting it two minutes later, forever. The pod's postgres
+            // container had exited cleanly within seconds; the pod still
+            // reported `1/1 Running` hours later, with a `deletionTimestamp`,
+            // no finalizers, and no way to ever finish. ISSUES #90.
+            const SANDBOX_STOP_TIMEOUT_SECS: i64 = 5;
+            let stop_options = StopContainerOptions {
+                t: SANDBOX_STOP_TIMEOUT_SECS,
+            };
             if let Err(e) = self
                 .docker
                 .stop_container(pause_id, Some(stop_options))

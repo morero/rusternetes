@@ -218,6 +218,41 @@ pub(crate) fn effective_restart_policy(raw: Option<&str>) -> &'static str {
     }
 }
 
+/// How long one `sync_pod` may run before the pod worker abandons it.
+///
+/// A steady-state sync is bounded at 120s, which is generous for container
+/// startup and probes. A sync for a pod that is *terminating* is bounded by
+/// that pod's own grace period plus a margin for the teardown that follows the
+/// stop, because a timeout shorter than the termination it is supervising
+/// stops being a safety net and becomes the reason the work never finishes:
+/// the sync is abandoned mid-stop, restarted, and abandoned again. See
+/// ISSUES #90, where that loop kept a pod `1/1 Running` with a
+/// `deletionTimestamp` and no finalizers indefinitely.
+///
+/// Kept as a bound rather than removed — upstream pod workers have no per-sync
+/// timeout, but a bound that cannot cut short legitimate work still beats none.
+fn sync_timeout_secs(pod: &Pod) -> u64 {
+    const STEADY_STATE_SECS: u64 = 120;
+    const TEARDOWN_MARGIN_SECS: u64 = 60;
+
+    if pod.metadata.deletion_timestamp.is_none() {
+        return STEADY_STATE_SECS;
+    }
+    let grace = pod
+        .metadata
+        .deletion_grace_period_seconds
+        .or_else(|| {
+            pod.spec
+                .as_ref()
+                .and_then(|s| s.termination_grace_period_seconds)
+        })
+        .unwrap_or(30)
+        .max(0) as u64;
+    grace
+        .saturating_add(TEARDOWN_MARGIN_SECS)
+        .max(STEADY_STATE_SECS)
+}
+
 impl Kubelet {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
@@ -1373,10 +1408,27 @@ impl Kubelet {
                         // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_container.go:860
                         //   grace_period can be up to terminationGracePeriodSeconds (default 30s)
                         //   plus preStop hook execution time.
-                        // K8s pod workers don't have a per-sync timeout — they
-                        // K8s pod workers don't have a per-sync timeout.
-                        // 120s is generous enough for container startup + probes.
-                        let timeout_secs = 120u64;
+                        // K8s pod workers have no per-sync timeout at all. This
+                        // one exists to stop a wedged sync pinning a worker
+                        // forever, and 120s is generous for startup + probes —
+                        // but it must never be shorter than a termination this
+                        // same sync is legitimately performing, or the timeout
+                        // becomes the thing that prevents completion.
+                        //
+                        // That is not hypothetical: a pod with CNPG's 1800s
+                        // grace period was aborted at 120s, restarted two
+                        // minutes later, and never finished terminating —
+                        // `deletionTimestamp` set, no finalizers, still
+                        // reporting `1/1 Running` hours later (ISSUES #90).
+                        // The sandbox timeout above is the other half of that
+                        // fix; this half keeps any *app* container with a long
+                        // grace period from reproducing it.
+                        //
+                        // Deliberately derived from the pod's own budget plus a
+                        // margin for the teardown that follows the stop, rather
+                        // than removed: a bound that cannot cut short legitimate
+                        // work still beats no bound.
+                        let timeout_secs = sync_timeout_secs(&pod);
                         match tokio::time::timeout(
                             Duration::from_secs(timeout_secs),
                             kubelet.sync_pod(&pod),
@@ -5182,6 +5234,56 @@ mod tests {
             "Failed to create PersistentVolumeClaim host path directory"
         ));
         assert!(!is_transient_volume_wait_error("ErrImagePull"));
+    }
+}
+
+#[cfg(test)]
+mod sync_timeout_tests {
+    use super::sync_timeout_secs;
+    use rusternetes_common::resources::Pod;
+
+    fn pod(deleting: bool, spec_grace: Option<i64>, deletion_grace: Option<i64>) -> Pod {
+        let mut p = Pod::new(
+            "probe",
+            rusternetes_common::resources::pod::PodSpec::default(),
+        );
+        if deleting {
+            p.metadata.deletion_timestamp = Some(chrono::Utc::now());
+        }
+        p.metadata.deletion_grace_period_seconds = deletion_grace;
+        if let Some(g) = spec_grace {
+            let mut spec = p.spec.take().unwrap_or_default();
+            spec.termination_grace_period_seconds = Some(g);
+            p.spec = Some(spec);
+        }
+        p
+    }
+
+    #[test]
+    fn a_running_pod_uses_the_steady_state_bound() {
+        assert_eq!(sync_timeout_secs(&pod(false, Some(1800), None)), 120);
+    }
+
+    /// The case that produced ISSUES #90: CNPG's grace period is 1800s, and a
+    /// 120s bound abandoned the termination it was supervising, over and over.
+    #[test]
+    fn a_terminating_pod_is_bounded_above_its_own_grace_period() {
+        assert_eq!(sync_timeout_secs(&pod(true, Some(1800), None)), 1860);
+    }
+
+    #[test]
+    fn the_deletion_grace_period_wins_over_the_spec() {
+        assert_eq!(sync_timeout_secs(&pod(true, Some(1800), Some(10))), 120);
+    }
+
+    #[test]
+    fn a_short_grace_period_never_drops_below_the_steady_state_bound() {
+        assert_eq!(sync_timeout_secs(&pod(true, Some(5), None)), 120);
+    }
+
+    #[test]
+    fn a_terminating_pod_with_no_grace_period_uses_the_default() {
+        assert_eq!(sync_timeout_secs(&pod(true, None, None)), 120);
     }
 }
 
