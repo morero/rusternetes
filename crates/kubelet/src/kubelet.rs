@@ -191,6 +191,25 @@ fn is_transient_volume_wait_error(err_msg: &str) -> bool {
         || (err_msg.contains("PersistentVolume") && err_msg.contains("not found"))
 }
 
+/// Whether a pod-sync failure is "the image is still coming down", which is a
+/// wait rather than a failure.
+///
+/// Since [`ContainerRuntime::ensure_image`] moved the pull into a detached
+/// task (ISSUES #91), a sync that finds a pull in progress stops early and
+/// says so. Without classifying that as transient, the pod worker reads it as
+/// the pod having *failed to start*: a `restartPolicy: Never` pod goes
+/// straight to `Failed` and is torn down seconds after being created, while
+/// the pull it was waiting for is still running. Observed exactly that way on
+/// the first live test of the #91 fix — `Failed to start pod default/pull-probe:
+/// image … is still being pulled`, then `terminating — stopping containers`,
+/// 2.4 seconds after the pod was created.
+///
+/// The pod belongs in `Pending` with `Waiting{ContainerCreating}` until the
+/// image is there, which is what upstream does while an image manager works.
+fn is_transient_image_pull_wait_error(err_msg: &str) -> bool {
+    err_msg.contains("is still being pulled")
+}
+
 /// The restart policy to actually act on, normalised.
 ///
 /// Returns one of exactly `"Never"`, `"OnFailure"`, `"Always"`. Anything else —
@@ -2242,9 +2261,11 @@ impl Kubelet {
                             //          pkg/kubelet/kubelet_pods.go:2496 — defaultWaitingState
                             // See is_transient_volume_wait_error's doc comment for why
                             // the PVC/PV cases matter as much as Secret/ConfigMap here.
-                            if is_transient_volume_wait_error(&err_msg) {
+                            if is_transient_volume_wait_error(&err_msg)
+                                || is_transient_image_pull_wait_error(&err_msg)
+                            {
                                 warn!(
-                                    "Pod {}/{} waiting for volume (will retry): {}",
+                                    "Pod {}/{} waiting (will retry): {}",
                                     namespace, pod_name, err_msg
                                 );
                                 let key = build_key("pods", Some(namespace), pod_name);
@@ -5246,6 +5267,43 @@ mod tests {
             "Failed to create PersistentVolumeClaim host path directory"
         ));
         assert!(!is_transient_volume_wait_error("ErrImagePull"));
+    }
+}
+
+#[cfg(test)]
+mod transient_wait_tests {
+    use super::{is_transient_image_pull_wait_error, is_transient_volume_wait_error};
+
+    /// Without this classification a `restartPolicy: Never` pod goes straight
+    /// to `Failed` seconds after creation while the pull it is waiting for is
+    /// still running — observed on the first live test of the #91 fix.
+    #[test]
+    fn a_pull_in_progress_is_a_wait_not_a_failure() {
+        assert!(is_transient_image_pull_wait_error(
+            "image timescale/timescaledb-ha:pg16-ts2.17 is still being pulled"
+        ));
+        assert!(is_transient_image_pull_wait_error(
+            "sandbox image busybox:latest is still being pulled"
+        ));
+    }
+
+    #[test]
+    fn a_real_pull_failure_is_not_a_wait() {
+        assert!(!is_transient_image_pull_wait_error(
+            "Image pull failed: manifest unknown"
+        ));
+        assert!(!is_transient_image_pull_wait_error("404: No such image"));
+    }
+
+    /// The two predicates stay independent — a pull wait is not a volume wait.
+    #[test]
+    fn the_volume_predicate_is_unchanged_by_this() {
+        assert!(!is_transient_volume_wait_error(
+            "image foo:1 is still being pulled"
+        ));
+        assert!(is_transient_volume_wait_error(
+            "PersistentVolumeClaim is not bound to a volume"
+        ));
     }
 }
 
