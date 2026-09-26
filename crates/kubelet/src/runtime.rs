@@ -1,19 +1,19 @@
 use crate::kubelet::effective_restart_policy;
 use anyhow::{Context, Result};
+use bollard::Docker;
 use bollard::container::{
     Config, CreateContainerOptions, InspectContainerOptions, ListContainersOptions,
     RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
 };
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
-use bollard::Docker;
 use chrono::Utc;
 use futures_util::StreamExt;
 use rusternetes_common::resources::{
     ConfigMap, Container, ContainerState, ContainerStatus, ExecAction, GRPCAction, HTTPGetAction,
     LifecycleHandler, PersistentVolume, PersistentVolumeClaim, Pod, Probe, Secret, TCPSocketAction,
 };
-use rusternetes_storage::{build_key, Storage};
+use rusternetes_storage::{Storage, build_key};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -875,7 +875,10 @@ impl ContainerRuntime {
         {
             Ok(out) => out,
             Err(e) => {
-                warn!("Failed to create network namespace for pod {}: {}. Falling back to Podman networking.", pod_name, e);
+                warn!(
+                    "Failed to create network namespace for pod {}: {}. Falling back to Podman networking.",
+                    pod_name, e
+                );
                 return None;
             }
         };
@@ -884,7 +887,10 @@ impl ContainerRuntime {
             let stderr = String::from_utf8_lossy(&output.stderr);
             // Ignore error if namespace already exists
             if !stderr.contains("File exists") {
-                warn!("Failed to create network namespace for pod {}: {}. Falling back to Podman networking.", pod_name, stderr);
+                warn!(
+                    "Failed to create network namespace for pod {}: {}. Falling back to Podman networking.",
+                    pod_name, stderr
+                );
                 return None;
             }
             info!(
@@ -908,7 +914,10 @@ impl ContainerRuntime {
                     );
                 }
                 Err(e) => {
-                    warn!("Failed to setup CNI network for pod {}: {}. Falling back to Podman networking.", pod_name, e);
+                    warn!(
+                        "Failed to setup CNI network for pod {}: {}. Falling back to Podman networking.",
+                        pod_name, e
+                    );
                     // Clean up the network namespace on failure
                     let _ = Command::new("ip")
                         .args(["netns", "del", &netns_name])
@@ -2477,7 +2486,7 @@ impl ContainerRuntime {
                     .await
                 {
                     Ok(info) if info.state.as_ref().and_then(|s| s.running).unwrap_or(false) => {
-                        break
+                        break;
                     }
                     Ok(_) if std::time::Instant::now() > deadline => {
                         anyhow::bail!(
@@ -3498,9 +3507,15 @@ impl ContainerRuntime {
                     if let Ok(ca_content) = std::fs::read(&ca_cert_source) {
                         std::fs::write(&ca_path, ca_content)
                             .context("Failed to write CA certificate")?;
-                        info!("Injected CA certificate into service account secret volume at {} (from {})", ca_path, ca_cert_source);
+                        info!(
+                            "Injected CA certificate into service account secret volume at {} (from {})",
+                            ca_path, ca_cert_source
+                        );
                     } else {
-                        warn!("CA certificate not found at {}, pods may not be able to verify API server", ca_cert_source);
+                        warn!(
+                            "CA certificate not found at {}, pods may not be able to verify API server",
+                            ca_cert_source
+                        );
                     }
                 }
             }
@@ -3869,7 +3884,10 @@ impl ContainerRuntime {
                                         // Optional configmap not found, skip
                                     }
                                     Err(e) => {
-                                        warn!("Failed to get ConfigMap {} for projected volume: {}. Skipping.", cm_name, e);
+                                        warn!(
+                                            "Failed to get ConfigMap {} for projected volume: {}. Skipping.",
+                                            cm_name, e
+                                        );
                                     }
                                 }
                             }
@@ -3934,7 +3952,10 @@ impl ContainerRuntime {
                                         // Optional secret not found, skip
                                     }
                                     Err(e) => {
-                                        warn!("Failed to get Secret {} for projected volume: {}. Skipping.", secret_name, e);
+                                        warn!(
+                                            "Failed to get Secret {} for projected volume: {}. Skipping.",
+                                            secret_name, e
+                                        );
                                     }
                                 }
                             }
@@ -4816,17 +4837,19 @@ impl ContainerRuntime {
                         Ok(expanded) => {
                             if expanded.is_empty() {
                                 return Err(anyhow::anyhow!(
-                                        "CreateContainerConfigError: subPathExpr '{}' expanded to empty string in container {}",
-                                        expr, container.name
-                                    ));
+                                    "CreateContainerConfigError: subPathExpr '{}' expanded to empty string in container {}",
+                                    expr,
+                                    container.name
+                                ));
                             }
                             Some(expanded)
                         }
                         Err(e) => {
                             return Err(anyhow::anyhow!(
-                                    "CreateContainerConfigError: subPathExpr expansion failed for container {}: {}",
-                                    container.name, e
-                                ));
+                                "CreateContainerConfigError: subPathExpr expansion failed for container {}: {}",
+                                container.name,
+                                e
+                            ));
                         }
                     }
                 } else if let Some(ref sub_path) = mount.sub_path {
@@ -4834,21 +4857,21 @@ impl ContainerRuntime {
                         // Validate plain subPath for path traversal / absolute path
                         if sub_path.starts_with('/') {
                             return Err(anyhow::anyhow!(
-                                    "CreateContainerConfigError: subPath must not be an absolute path in container {}",
-                                    container.name
-                                ));
+                                "CreateContainerConfigError: subPath must not be an absolute path in container {}",
+                                container.name
+                            ));
                         }
                         if sub_path.contains('`') {
                             return Err(anyhow::anyhow!(
-                                    "CreateContainerConfigError: subPath must not contain backticks in container {}",
-                                    container.name
-                                ));
+                                "CreateContainerConfigError: subPath must not contain backticks in container {}",
+                                container.name
+                            ));
                         }
                         if sub_path.split('/').any(|c| c == "..") {
                             return Err(anyhow::anyhow!(
-                                    "CreateContainerConfigError: subPath must not contain '..' in container {}",
-                                    container.name
-                                ));
+                                "CreateContainerConfigError: subPath must not contain '..' in container {}",
+                                container.name
+                            ));
                         }
                         Some(sub_path.clone())
                     } else {
@@ -5400,7 +5423,23 @@ impl ContainerRuntime {
                 } else {
                     None
                 },
-                pid_mode: if pod
+                // `hostPID` wins over `shareProcessNamespace`: Kubernetes
+                // rejects a pod that sets both, and the host namespace is
+                // strictly the wider of the two, so honouring it first
+                // cannot under-share.
+                //
+                // hostPID was accepted and silently ignored until
+                // 2026-09-26. That is worse than rejecting it: a pod asking
+                // for the host PID namespace is asking for it because it
+                // intends to inspect other processes, and it gets the
+                // privilege it asked for (cap_add and the hostPath mounts
+                // both map through) while seeing only its own namespace.
+                // Found on Grafana Alloy's Beyla eBPF instrumentation, which
+                // would have run with CAP_BPF, SYS_PTRACE and PERFMON and
+                // discovered no processes to instrument.
+                pid_mode: if pod.spec.as_ref().and_then(|s| s.host_pid).unwrap_or(false) {
+                    Some("host".to_string())
+                } else if pod
                     .spec
                     .as_ref()
                     .and_then(|s| s.share_process_namespace)
@@ -6476,7 +6515,10 @@ impl ContainerRuntime {
                                         (
                                             ContainerState::Waiting {
                                                 reason: Some("CrashLoopBackOff".to_string()),
-                                                message: Some(format!("back-off restarting failed container init container \"{}\" exited with {}", ic.name, exit_code)),
+                                                message: Some(format!(
+                                                    "back-off restarting failed container init container \"{}\" exited with {}",
+                                                    ic.name, exit_code
+                                                )),
                                             },
                                             None,
                                             None,
@@ -8908,7 +8950,7 @@ impl ContainerRuntime {
                 return Err(anyhow::anyhow!(
                     "Unsupported resource field: {}",
                     resource_ref.resource
-                ))
+                ));
             }
         };
 
@@ -9453,9 +9495,10 @@ mod image_pull_claim_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_fsgroup_to_path, bound_pv_name, effective_probe_host, effective_sub_path_expr,
-        effective_termination_message_path, security_opts_for, should_fully_cleanup_pod,
-        token_mount_is_stranded, token_needs_rotation, write_file_if_changed, ContainerRuntime,
+        ContainerRuntime, apply_fsgroup_to_path, bound_pv_name, effective_probe_host,
+        effective_sub_path_expr, effective_termination_message_path, security_opts_for,
+        should_fully_cleanup_pod, token_mount_is_stranded, token_needs_rotation,
+        write_file_if_changed,
     };
     use rusternetes_common::resources::pod::PodSecurityContext as PodLevelSecurityContext;
     use rusternetes_common::resources::{
