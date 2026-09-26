@@ -754,6 +754,71 @@ pub struct ManagedFieldsEntry {
 }
 
 #[cfg(test)]
+mod generate_name_tests {
+    use super::ObjectMeta;
+
+    fn meta(name: &str, generate: Option<&str>) -> ObjectMeta {
+        let mut m = ObjectMeta::default();
+        m.name = name.to_string();
+        m.generate_name = generate.map(str::to_string);
+        m
+    }
+
+    /// The case that was broken end to end: `generateName` set, `name` empty.
+    /// Generation itself always worked — it simply ran after name validation,
+    /// so the request was rejected before reaching it (cert-manager's
+    /// `CertificateRequest`s are named this way, which is what blocked
+    /// guts-gateway's TLS).
+    #[test]
+    fn an_empty_name_takes_the_generate_name_prefix() {
+        let mut m = meta("", Some("cert-req-"));
+        m.ensure_name();
+        assert!(
+            m.name.starts_with("cert-req-"),
+            "expected the prefix to be kept, got {}",
+            m.name
+        );
+        assert!(
+            m.name.len() > "cert-req-".len(),
+            "a suffix must be appended, got {}",
+            m.name
+        );
+    }
+
+    #[test]
+    fn an_explicit_name_is_never_overwritten() {
+        let mut m = meta("chosen", Some("ignored-"));
+        m.ensure_name();
+        assert_eq!(m.name, "chosen");
+    }
+
+    /// Two objects created from one prefix must not collide.
+    #[test]
+    fn generated_names_differ() {
+        let (mut a, mut b) = (meta("", Some("p-")), meta("", Some("p-")));
+        a.ensure_name();
+        b.ensure_name();
+        assert_ne!(a.name, b.name);
+    }
+
+    /// The generated suffix has to survive `validate_resource_name`, which
+    /// permits only lowercase alphanumerics, `-` and `.`.
+    #[test]
+    fn a_generated_name_is_a_valid_dns_subdomain() {
+        let mut m = meta("", Some("p-"));
+        m.ensure_name();
+        assert!(
+            m.name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.'),
+            "generated {} is not a valid name",
+            m.name
+        );
+        assert!(m.name.chars().last().unwrap().is_ascii_alphanumeric());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

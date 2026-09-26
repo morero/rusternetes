@@ -62,6 +62,22 @@ pub async fn create_custom_resource(
     //
     // `validate_resource_name` already existed for this; it was simply never
     // called here (only `configmap` and `secret` used it).
+    // Resolve `metadata.generateName` BEFORE validating the name.
+    //
+    // `ObjectMeta::ensure_name` has always implemented generation — empty
+    // `name` plus a `generateName` prefix yields a suffixed name — but it ran
+    // later, via `ensure_uid`, so validation rejected the still-empty name
+    // first and the request never got that far. The result was that
+    // server-side name generation, a core API feature, did not work at all:
+    // `kubectl create` of any object with only `generateName` returned
+    // `name must be non-empty`.
+    //
+    // Found via cert-manager, which names `CertificateRequest`s that way. A
+    // `Certificate` sat `Issuing` forever with "Secret does not exist" while
+    // its `Issuer` was `Ready`, because the request it needed could never be
+    // created — and that blocked guts-gateway, whose TLS comes from exactly
+    // that path.
+    cr.metadata.ensure_name();
     crate::handlers::validation::validate_resource_name(&cr.metadata.name)?;
 
     let cr_name = cr.metadata.name.clone();
