@@ -24,8 +24,8 @@ use rusternetes_common::{
     observability::MetricsRegistry,
     resources::{
         CustomResource, CustomResourceDefinition, CustomResourceDefinitionNames,
-        CustomResourceDefinitionSpec, CustomResourceDefinitionVersion, CustomResourceSubresourceStatus,
-        CustomResourceSubresources, ResourceScope,
+        CustomResourceDefinitionSpec, CustomResourceDefinitionVersion,
+        CustomResourceSubresourceStatus, CustomResourceSubresources, ResourceScope,
     },
     types::ObjectMeta,
 };
@@ -116,7 +116,11 @@ async fn seed_crd_with_status_subresource(mem: &Arc<MemoryStorage>) {
         },
         status: None,
     };
-    let key = build_key("customresourcedefinitions", None, "crontabs.stable.example.com");
+    let key = build_key(
+        "customresourcedefinitions",
+        None,
+        "crontabs.stable.example.com",
+    );
     mem.create(&key, &crd).await.expect("seed CRD");
 }
 
@@ -198,12 +202,8 @@ async fn status_merge_patch_wrapped_under_status_key_merges_correctly() {
 async fn status_merge_patch_already_unwrapped_still_works() {
     let (mem, router) = spawn_router();
     seed_crd_with_status_subresource(&mem).await;
-    let key = seed_crontab_with_status(
-        &mem,
-        "unwrapped-crontab",
-        json!({"phase": "Pending"}),
-    )
-    .await;
+    let key =
+        seed_crontab_with_status(&mem, "unwrapped-crontab", json!({"phase": "Pending"})).await;
 
     let (status_code, response_body) = send_with_ct(
         router,
@@ -241,12 +241,7 @@ async fn status_merge_patch_already_unwrapped_still_works() {
 async fn status_put_unwraps_whole_object_body_to_just_status() {
     let (mem, router) = spawn_router();
     seed_crd_with_status_subresource(&mem).await;
-    let key = seed_crontab_with_status(
-        &mem,
-        "put-crontab",
-        json!({"phase": "Pending"}),
-    )
-    .await;
+    let key = seed_crontab_with_status(&mem, "put-crontab", json!({"phase": "Pending"})).await;
 
     // Real clients PUT the full object — apiVersion/kind/metadata/spec
     // alongside the mutated status — not just a bare status value.
@@ -278,5 +273,55 @@ async fn status_put_unwraps_whole_object_body_to_just_status() {
         json!({"phase": "Running", "lastScheduleTime": "2026-01-01T00:00:00Z"}),
         "must store just the extracted .status content, not the whole PUT body nested inside itself; got {}",
         stored["status"]
+    );
+}
+
+/// `GET .../status` must return the FULL object, not a bare status.
+///
+/// A subresource GET in Kubernetes returns the same kind the main resource
+/// does — `apiVersion`, `kind`, `metadata` and all — differing only in which
+/// part is authoritative. Returning the unwrapped status looks reasonable and
+/// breaks every typed client, because there is no `kind` to decode against.
+///
+/// `kubectl patch <res> --subresource=status` does a GET before it patches, so
+/// it failed with `error: Object 'Kind' is missing in
+/// '{"availableArchitectures":[…]}'` — the status content quoted back as if it
+/// were an object. That made a status field unfixable by hand, which turned a
+/// CNPG `Cluster` deadlocked on a stale `status.image` into a rebuild of the
+/// platform database: the one-field revert that would have fixed it could not
+/// be issued.
+#[tokio::test]
+async fn status_get_returns_the_whole_object_not_a_bare_status() {
+    let (mem, router) = spawn_router();
+    seed_crd_with_status_subresource(&mem).await;
+    seed_crontab_with_status(
+        &mem,
+        "ct-get",
+        json!({"phase": "Running", "availableArchitectures": ["amd64"]}),
+    )
+    .await;
+
+    let (code, body) = send_with_ct(
+        router,
+        Method::GET,
+        &format!("/apis/{GROUP}/v1/namespaces/{TEST_NS}/{PLURAL}/ct-get/status"),
+        "application/json",
+        Vec::new(),
+    )
+    .await;
+
+    assert_eq!(code, 200, "body={body}");
+    assert_eq!(
+        body["kind"], "CronTab",
+        "a typed client decodes on `kind`; without it the response is undecodable: {body}"
+    );
+    assert_eq!(body["apiVersion"], format!("{GROUP}/v1"), "body={body}");
+    assert_eq!(body["metadata"]["name"], "ct-get", "body={body}");
+    // The status still has to be there, and intact.
+    assert_eq!(body["status"]["phase"], "Running", "body={body}");
+    assert_eq!(
+        body["status"]["availableArchitectures"],
+        json!(["amd64"]),
+        "body={body}"
     );
 }

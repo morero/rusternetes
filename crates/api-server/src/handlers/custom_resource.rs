@@ -1809,9 +1809,24 @@ pub async fn get_custom_resource_status(
     )
     .await?;
 
-    // Extract and return just the status field
-    let status = cr.status.unwrap_or(serde_json::Value::Null);
-    Ok(Json(status))
+    // The FULL object, not a bare status.
+    //
+    // A `/status` subresource GET in Kubernetes returns the same object kind
+    // the main resource does — `apiVersion`, `kind`, `metadata` and all —
+    // differing only in which part is authoritative. Returning the unwrapped
+    // status looks reasonable and breaks every typed client, because there is
+    // no `kind` to decode against.
+    //
+    // Live cost: `kubectl patch <res> --subresource=status` does a GET before
+    // it patches, so it failed with `error: Object 'Kind' is missing in
+    // '{"availableArchitectures":[…]}'` — the status content, quoted back as
+    // if it were an object. That made a status field unfixable by hand, which
+    // turned a CNPG `Cluster` deadlocked on a stale `status.image` into a
+    // rebuild of the platform database: the one-field revert that would have
+    // fixed it could not be issued. See ISSUES #92.
+    Ok(Json(serde_json::to_value(&cr).map_err(|e| {
+        rusternetes_common::Error::Internal(e.to_string())
+    })?))
 }
 
 /// Update the status subresource of a custom resource
