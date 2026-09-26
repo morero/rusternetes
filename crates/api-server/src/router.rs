@@ -882,20 +882,6 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             "/apis/apiregistration.k8s.io/v1",
             get(handlers::discovery::get_apiregistration_v1_resources),
         )
-        .route(
-            "/apis/apiregistration.k8s.io/v1/apiservices",
-            get(handlers::generic::list_apiservices).post(handlers::generic::create_apiservice),
-        )
-        .route(
-            "/apis/apiregistration.k8s.io/v1/apiservices/:name",
-            get(handlers::generic::get_apiservice)
-                .put(handlers::generic::update_apiservice)
-                .delete(handlers::generic::delete_apiservice),
-        )
-        .route(
-            "/apis/apiregistration.k8s.io/v1/apiservices/:name/status",
-            get(handlers::generic::get_apiservice).put(handlers::generic::update_apiservice_status),
-        )
         .route("/version", get(handlers::discovery::get_version))
         // OpenAPI spec endpoints
         .route("/openapi/v2", get(handlers::openapi::get_swagger_spec))
@@ -2464,6 +2450,44 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         .route(
             "/apis/apps/v1/watch/namespaces/:namespace/controllerrevisions",
             get(handlers::watch::watch_controllerrevisions),
+        )
+        // `APIService` CRUD belongs here, not with discovery.
+        //
+        // These three were registered in `discovery_routes`, which is merged
+        // into `public_routes` and therefore layered with
+        // `skip_auth_middleware` — so no `AuthContext` extension is inserted.
+        // Their handlers take `Extension<AuthContext>`, so every request died
+        // with `Missing request extension: Extension of type
+        // api_server::middleware::AuthContext was not found`, returned as a
+        // 500 rather than as anything a client could act on.
+        //
+        // That broke cert-manager's cainjector outright: it watches
+        // `APIService` to inject CA bundles into aggregated API services, its
+        // informer could never list, and so it injected nothing at all —
+        // including the `caBundle` on cert-manager's own
+        // `MutatingWebhookConfiguration`. The api-server then refused to call
+        // that webhook (`certificate verify failed: unable to get local issuer
+        // certificate`), no `CertificateRequest` could be admitted, and
+        // guts-gateway sat Pending waiting for a TLS Secret that could never
+        // be issued.
+        //
+        // The discovery endpoint `/apis/apiregistration.k8s.io/v1` itself
+        // stays public, which is correct — it is discovery. It is the
+        // collection and item routes that are ordinary authenticated resource
+        // access.
+        .route(
+            "/apis/apiregistration.k8s.io/v1/apiservices",
+            get(handlers::generic::list_apiservices).post(handlers::generic::create_apiservice),
+        )
+        .route(
+            "/apis/apiregistration.k8s.io/v1/apiservices/:name",
+            get(handlers::generic::get_apiservice)
+                .put(handlers::generic::update_apiservice)
+                .delete(handlers::generic::delete_apiservice),
+        )
+        .route(
+            "/apis/apiregistration.k8s.io/v1/apiservices/:name/status",
+            get(handlers::generic::get_apiservice).put(handlers::generic::update_apiservice_status),
         )
         // CRD fallback — must be inside protected_routes so auth middleware applies
         .fallback(custom_resource_fallback);
