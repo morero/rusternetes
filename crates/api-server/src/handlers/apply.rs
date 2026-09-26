@@ -7,17 +7,17 @@
 
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
+    Extension, Json,
     body::Bytes,
     extract::{Path, Query, State},
-    Extension, Json,
 };
 use rusternetes_common::{
-    authz::{Decision, RequestAttributes},
-    server_side_apply::{server_side_apply, ApplyParams, ApplyResult},
     Result,
+    authz::{Decision, RequestAttributes},
+    server_side_apply::{ApplyParams, ApplyResult, server_side_apply},
 };
-use rusternetes_storage::{build_key, Storage};
-use serde::{de::DeserializeOwned, Serialize};
+use rusternetes_storage::{Storage, build_key};
+use serde::{Serialize, de::DeserializeOwned};
 use std::sync::Arc;
 use tracing::info;
 
@@ -164,6 +164,10 @@ where
             if is_create {
                 ensure_metadata_defaults_on_create(&mut applied_json);
             }
+            // The typed create/update handlers default their own spec;
+            // nothing did on this path until now. See
+            // defaults::apply_spec_defaults_json for what that cost.
+            crate::handlers::defaults::apply_spec_defaults_json(resource_type, &mut applied_json);
             // Convert to resource type
             let applied_resource: T = serde_json::from_value(applied_json).map_err(|e| {
                 rusternetes_common::Error::InvalidResource(format!("Invalid result: {}", e))
@@ -275,6 +279,10 @@ where
             if is_create {
                 ensure_metadata_defaults_on_create(&mut applied_json);
             }
+            // The typed create/update handlers default their own spec;
+            // nothing did on this path until now. See
+            // defaults::apply_spec_defaults_json for what that cost.
+            crate::handlers::defaults::apply_spec_defaults_json(resource_type, &mut applied_json);
             // Convert to resource type
             let applied_resource: T = serde_json::from_value(applied_json).map_err(|e| {
                 rusternetes_common::Error::InvalidResource(format!("Invalid result: {}", e))

@@ -1,8 +1,3 @@
-use rusternetes_common::resources::deployment::{DeploymentStrategy, RollingUpdateDeployment};
-use rusternetes_common::resources::workloads::{
-    DaemonSetUpdateStrategy, RollingUpdateDaemonSet, RollingUpdateStatefulSetStrategy,
-    StatefulSetUpdateStrategy,
-};
 /// Shared defaulting functions matching K8s API server defaulting.
 ///
 /// K8s applies defaults through registered scheme defaulting functions.
@@ -13,6 +8,11 @@ use rusternetes_common::resources::workloads::{
 /// K8s ref: pkg/apis/core/v1/defaults.go
 /// K8s ref: pkg/apis/apps/v1/defaults.go
 use rusternetes_common::resources::PodSpec;
+use rusternetes_common::resources::deployment::{DeploymentStrategy, RollingUpdateDeployment};
+use rusternetes_common::resources::workloads::{
+    DaemonSetUpdateStrategy, RollingUpdateDaemonSet, RollingUpdateStatefulSetStrategy,
+    StatefulSetUpdateStrategy,
+};
 
 /// Whether an optional string field counts as *unset* for defaulting purposes.
 ///
@@ -49,12 +49,7 @@ fn is_unset(field: &Option<String>) -> bool {
 /// persisted and the symptom is many layers away from the cause.
 pub fn validate_pod_spec_enums(spec: &PodSpec) -> Result<(), String> {
     const RESTART_POLICIES: [&str; 3] = ["Always", "OnFailure", "Never"];
-    const DNS_POLICIES: [&str; 4] = [
-        "ClusterFirst",
-        "ClusterFirstWithHostNet",
-        "Default",
-        "None",
-    ];
+    const DNS_POLICIES: [&str; 4] = ["ClusterFirst", "ClusterFirstWithHostNet", "Default", "None"];
 
     if let Some(policy) = spec.restart_policy.as_deref() {
         if !RESTART_POLICIES.contains(&policy) {
@@ -403,12 +398,7 @@ mod tests {
     #[test]
     fn all_legal_enum_values_are_accepted() {
         for restart in ["Always", "OnFailure", "Never"] {
-            for dns in [
-                "ClusterFirst",
-                "ClusterFirstWithHostNet",
-                "Default",
-                "None",
-            ] {
+            for dns in ["ClusterFirst", "ClusterFirstWithHostNet", "Default", "None"] {
                 let mut spec = PodSpec::default();
                 spec.restart_policy = Some(restart.to_string());
                 spec.dns_policy = Some(dns.to_string());
@@ -603,5 +593,135 @@ mod tests {
             template.spec.containers[0].image_pull_policy.as_deref(),
             Some("Always")
         );
+    }
+}
+
+/// Default each service port's protocol to TCP.
+///
+/// K8s ref: pkg/apis/core/v1/defaults.go SetDefaults_Service — "if
+/// sp.Protocol == \"\" { sp.Protocol = v1.ProtocolTCP }".
+///
+/// Not cosmetic. The endpointslice controller copies this field straight
+/// through to the EndpointSlice ports it derives, so an omitted protocol
+/// here becomes an omitted protocol there, and a client that reasonably
+/// treats it as always-present dereferences nil. Found live, 2026-09-26:
+/// kube-state-metrics crash-looped on SIGSEGV in createEndpointSlicePorts
+/// against cnpg's webhook Service, the one Service on the cluster whose
+/// chart leaves the protocol out. The identical bug was already fixed once
+/// for the port *name* (see endpointslice.rs's own note about `kubectl
+/// describe` crashing on a nil name) — same shape, other field, and it was
+/// fixed downstream rather than here, so this one recurred.
+///
+/// Returns whether anything was filled in, which the patch path needs: it
+/// only writes back when post-patch processing actually changed something.
+pub(crate) fn apply_service_port_defaults(
+    spec: &mut rusternetes_common::resources::ServiceSpec,
+) -> bool {
+    let mut changed = false;
+    for port in spec.ports.iter_mut() {
+        if port.protocol.is_none() {
+            port.protocol = Some("TCP".to_string());
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Apply this resource type's own spec defaults to an already-merged JSON
+/// object.
+///
+/// The typed `create`/`update` handlers each call their own defaulter, but
+/// server-side apply does not go through them — it merges JSON and writes
+/// the result — so nothing defaulted anything on that path. Found live,
+/// 2026-09-26: every Deployment on the cluster had `strategy: null`,
+/// because release-operator applies, and kube-state-metrics crash-looped on
+/// "nil value for IntOrString" reading the rollingUpdate that upstream
+/// guarantees is populated.
+///
+/// Dispatching on the resource-type string rather than on `T` is what keeps
+/// this usable from the generic apply handler, which knows the string and
+/// not the type. Each arm round-trips through the typed struct so there is
+/// exactly one definition of each kind's defaults, not a second JSON-level
+/// copy that drifts.
+///
+/// A value that will not deserialize is left alone: the very next thing the
+/// caller does is deserialize it properly and report the error.
+pub(crate) fn apply_spec_defaults_json(resource_type: &str, json: &mut serde_json::Value) {
+    use rusternetes_common::resources::{
+        CronJob, DaemonSet, Deployment, Job, ReplicaSet, Service, StatefulSet,
+    };
+
+    macro_rules! default_as {
+        ($ty:ty, $f:expr) => {{
+            if let Ok(mut typed) = serde_json::from_value::<$ty>(json.clone()) {
+                #[allow(clippy::redundant_closure_call)]
+                $f(&mut typed);
+                if let Ok(v) = serde_json::to_value(&typed) {
+                    *json = v;
+                }
+            }
+        }};
+    }
+
+    match resource_type {
+        "deployments" => default_as!(Deployment, apply_deployment_defaults),
+        "replicasets" => default_as!(ReplicaSet, apply_replicaset_defaults),
+        "statefulsets" => default_as!(StatefulSet, apply_statefulset_defaults),
+        "daemonsets" => default_as!(DaemonSet, apply_daemonset_defaults),
+        "jobs" => default_as!(Job, apply_job_defaults),
+        "cronjobs" => default_as!(CronJob, apply_cronjob_defaults),
+        "services" => default_as!(Service, |s: &mut Service| {
+            apply_service_port_defaults(&mut s.spec);
+        }),
+        // Everything else has no spec defaulter to run.
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod service_default_tests {
+    use super::apply_service_port_defaults;
+    use rusternetes_common::resources::ServiceSpec;
+
+    /// The bug this exists to prevent: an omitted protocol survives into the
+    /// derived EndpointSlice and crashes clients that treat it as always
+    /// present (kube-state-metrics, live, 2026-09-26).
+    #[test]
+    fn service_port_protocol_defaults_to_tcp() {
+        let mut spec = ServiceSpec {
+            ports: vec![rusternetes_common::resources::ServicePort {
+                name: Some("webhook-server".to_string()),
+                port: 9443,
+                target_port: None,
+                protocol: None,
+                node_port: None,
+                app_protocol: None,
+            }],
+            ..ServiceSpec::default()
+        };
+
+        assert!(apply_service_port_defaults(&mut spec));
+        assert_eq!(spec.ports[0].protocol.as_deref(), Some("TCP"));
+    }
+
+    #[test]
+    fn service_port_protocol_is_not_overwritten() {
+        let mut spec = ServiceSpec {
+            ports: vec![rusternetes_common::resources::ServicePort {
+                name: Some("dns".to_string()),
+                port: 53,
+                target_port: None,
+                protocol: Some("UDP".to_string()),
+                node_port: None,
+                app_protocol: None,
+            }],
+            ..ServiceSpec::default()
+        };
+
+        assert!(
+            !apply_service_port_defaults(&mut spec),
+            "nothing was missing, so the patch path must not write back"
+        );
+        assert_eq!(spec.ports[0].protocol.as_deref(), Some("UDP"));
     }
 }

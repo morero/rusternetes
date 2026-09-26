@@ -1,16 +1,16 @@
 use crate::{handlers::watch::WatchParams, middleware::AuthContext, state::ApiServerState};
 use axum::{
+    Extension, Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Extension, Json,
 };
 use rusternetes_common::{
+    List, Result,
     authz::{Decision, RequestAttributes},
     resources::{LoadBalancerStatus, Service, ServiceStatus, ServiceType},
-    List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{Storage, build_key, build_prefix};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -98,6 +98,7 @@ pub async fn create(
     }
 
     apply_session_affinity_defaults(&mut service.spec, false);
+    let _ = crate::handlers::defaults::apply_service_port_defaults(&mut service.spec);
 
     // Default target_port to port value if not set
     for port in &mut service.spec.ports {
@@ -419,6 +420,7 @@ pub async fn update(
     // Clear the affinity config when affinity is set to "None" on update so
     // the stored object matches the K8s API contract.
     apply_session_affinity_defaults(&mut service.spec, true);
+    let _ = crate::handlers::defaults::apply_service_port_defaults(&mut service.spec);
 
     // When service type changes to ExternalName, clear ClusterIP and NodePorts
     if matches!(service.spec.service_type, Some(ServiceType::ExternalName)) {
@@ -715,7 +717,11 @@ pub async fn patch(
     // Post-patch: handle service type transitions
     let mut service = result.0;
     let key = rusternetes_storage::build_key("services", Some(&namespace), &name);
-    let mut needs_update = false;
+    // A patch can add a port, so this path defaults too — otherwise a
+    // service that gained a protocol-less port by patch keeps the nil all
+    // the way into its EndpointSlice.
+    let mut needs_update =
+        crate::handlers::defaults::apply_service_port_defaults(&mut service.spec);
 
     if matches!(service.spec.service_type, Some(ServiceType::ExternalName)) {
         // Changing TO ExternalName — clear ClusterIP and NodePorts
