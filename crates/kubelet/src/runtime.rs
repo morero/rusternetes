@@ -11,7 +11,8 @@ use chrono::Utc;
 use futures_util::StreamExt;
 use rusternetes_common::resources::{
     ConfigMap, Container, ContainerState, ContainerStatus, ExecAction, GRPCAction, HTTPGetAction,
-    LifecycleHandler, PersistentVolume, PersistentVolumeClaim, Pod, Probe, Secret, TCPSocketAction,
+    LifecycleHandler, PersistentVolume, PersistentVolumeClaim, Pod, PodSpec, Probe, Secret,
+    TCPSocketAction,
 };
 use rusternetes_storage::{Storage, build_key};
 use std::collections::HashMap;
@@ -26,6 +27,74 @@ use crate::cni::CniRuntime;
 /// Wrapper for pre-encoded protobuf bytes (gRPC health check request).
 #[derive(Clone, Debug, Default)]
 struct EncodedBytes(Vec<u8>);
+
+/// The Docker namespace modes a pod's containers run in.
+pub(crate) struct NamespaceModes {
+    pub network_mode: Option<String>,
+    pub ipc_mode: Option<String>,
+    pub pid_mode: Option<String>,
+}
+
+/// Maps a pod's namespace-sharing intent onto Docker's three mode fields.
+///
+/// Extracted and unit-tested because this mapping has silently dropped a field
+/// twice. `hostPID` was accepted and ignored until 2026-09-26; `hostNetwork` was
+/// accepted and ignored until the same day, found while deploying a
+/// `hostNetwork` WireGuard gateway that would have created its interface inside
+/// a container netns and listened where nothing could reach it. Both are the
+/// same failure: the pod gets every *other* privilege it asked for — `cap_add`,
+/// `privileged` and `hostPath` all map through — while the namespace it needs
+/// them in is not the one it is placed in. Nothing errors, and the workload
+/// reports healthy while doing nothing.
+///
+/// A `host*` flag always wins over pod-level sharing. Kubernetes rejects a pod
+/// that sets `hostPID` and `shareProcessNamespace` together, and the host
+/// namespace is strictly the wider of the two, so honouring it first cannot
+/// under-share.
+pub(crate) fn namespace_modes(
+    pod: &Pod,
+    pod_name: &str,
+    netns_path: Option<&str>,
+    use_cni: bool,
+) -> NamespaceModes {
+    let spec = pod.spec.as_ref();
+    let flag = |f: fn(&PodSpec) -> Option<bool>| spec.and_then(f).unwrap_or(false);
+    let host_network = flag(|s| s.host_network);
+    let host_ipc = flag(|s| s.host_ipc);
+    let host_pid = flag(|s| s.host_pid);
+    let share_pid = flag(|s| s.share_process_namespace);
+    let pause = format!("container:{}_pause", pod_name);
+
+    NamespaceModes {
+        // A hostNetwork pod has no sandbox of its own to join: its containers
+        // are IN the host's network namespace, which is also why its pod IP is
+        // the node's. Joining the pause container instead would give it an
+        // isolated namespace that merely looks right from inside.
+        network_mode: if host_network {
+            Some("host".to_string())
+        } else if let Some(netns) = netns_path {
+            Some(format!("ns:{}", netns))
+        } else {
+            // Always the pause container's network namespace: pod IP = pause
+            // container IP is fundamental to Kubernetes networking.
+            Some(pause.clone())
+        },
+        ipc_mode: if host_ipc {
+            Some("host".to_string())
+        } else if !use_cni {
+            Some(pause.clone())
+        } else {
+            None
+        },
+        pid_mode: if host_pid {
+            Some("host".to_string())
+        } else if share_pid {
+            Some(pause)
+        } else {
+            None
+        },
+    }
+}
 
 impl prost::Message for EncodedBytes {
     fn encode_raw(&self, buf: &mut impl prost::bytes::BufMut) {
@@ -5353,6 +5422,10 @@ impl ContainerRuntime {
             None // Hostname is set on the pause container instead
         };
 
+        // Namespace sharing, in one place and unit-tested: see namespace_modes
+        // for why that matters more than it looks.
+        let modes = namespace_modes(&pod, pod_name, netns_path.as_deref(), self.use_cni);
+
         let mut config = Config {
             image: Some(container.image.clone()),
             labels: Some(self.ownership_labels(pod_name)),
@@ -5411,44 +5484,9 @@ impl ContainerRuntime {
                 // we fell back to the Docker bridge which gave each container its
                 // OWN IP — breaking pod proxy, service routing, and inter-container
                 // communication. K8s ref: all containers share the pod sandbox network.
-                network_mode: if let Some(netns) = netns_path {
-                    Some(format!("ns:{}", netns))
-                } else {
-                    // Always use pause container's network namespace
-                    Some(format!("container:{}_pause", pod_name))
-                },
-                // Share IPC and PID namespaces with pause container (K8s pod semantics)
-                ipc_mode: if !self.use_cni {
-                    Some(format!("container:{}_pause", pod_name))
-                } else {
-                    None
-                },
-                // `hostPID` wins over `shareProcessNamespace`: Kubernetes
-                // rejects a pod that sets both, and the host namespace is
-                // strictly the wider of the two, so honouring it first
-                // cannot under-share.
-                //
-                // hostPID was accepted and silently ignored until
-                // 2026-09-26. That is worse than rejecting it: a pod asking
-                // for the host PID namespace is asking for it because it
-                // intends to inspect other processes, and it gets the
-                // privilege it asked for (cap_add and the hostPath mounts
-                // both map through) while seeing only its own namespace.
-                // Found on Grafana Alloy's Beyla eBPF instrumentation, which
-                // would have run with CAP_BPF, SYS_PTRACE and PERFMON and
-                // discovered no processes to instrument.
-                pid_mode: if pod.spec.as_ref().and_then(|s| s.host_pid).unwrap_or(false) {
-                    Some("host".to_string())
-                } else if pod
-                    .spec
-                    .as_ref()
-                    .and_then(|s| s.share_process_namespace)
-                    .unwrap_or(false)
-                {
-                    Some(format!("container:{}_pause", pod_name))
-                } else {
-                    None
-                },
+                network_mode: modes.network_mode,
+                ipc_mode: modes.ipc_mode,
+                pid_mode: modes.pid_mode,
                 // Share UTS namespace with pause container so app containers
                 // inherit the pod hostname. Without this, containers get their
                 // container ID as hostname instead of the pod name.
@@ -9495,10 +9533,10 @@ mod image_pull_claim_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContainerRuntime, apply_fsgroup_to_path, bound_pv_name, effective_probe_host,
-        effective_sub_path_expr, effective_termination_message_path, security_opts_for,
-        should_fully_cleanup_pod, token_mount_is_stranded, token_needs_rotation,
-        write_file_if_changed,
+        ContainerRuntime, NamespaceModes, apply_fsgroup_to_path, bound_pv_name,
+        effective_probe_host, effective_sub_path_expr, effective_termination_message_path,
+        namespace_modes, security_opts_for, should_fully_cleanup_pod, token_mount_is_stranded,
+        token_needs_rotation, write_file_if_changed,
     };
     use rusternetes_common::resources::pod::PodSecurityContext as PodLevelSecurityContext;
     use rusternetes_common::resources::{
@@ -13581,5 +13619,127 @@ mod tests {
             grace, 45,
             "spec.terminationGracePeriodSeconds must propagate"
         );
+    }
+
+    /// A pod spec carrying every namespace-sharing flag this kubelet claims to
+    /// support, so each assertion below is about one field in isolation.
+    fn pod_with(mutate: impl FnOnce(&mut PodSpec)) -> Pod {
+        let mut spec = PodSpec {
+            containers: vec![Container {
+                name: "app".to_string(),
+                image: "busybox".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        mutate(&mut spec);
+        Pod {
+            type_meta: TypeMeta {
+                kind: "Pod".to_string(),
+                api_version: "v1".to_string(),
+            },
+            metadata: ObjectMeta::new("p").with_namespace("default"),
+            spec: Some(spec),
+            status: None,
+        }
+    }
+
+    /// The regression sweep. Every `host*` flag below is a field this kubelet
+    /// accepts from a pod spec, and each one has to reach Docker as `"host"` or
+    /// the pod silently runs in the wrong namespace while holding every other
+    /// privilege it asked for.
+    ///
+    /// Two of these three shipped broken. `hostPID` was accepted and ignored
+    /// until 2026-09-26 (found on Beyla's eBPF instrumentation, which ran with
+    /// CAP_BPF and SYS_PTRACE and saw no processes); `hostNetwork` was accepted
+    /// and ignored until the same day (found on a hostNetwork WireGuard gateway
+    /// that would have listened where nothing could reach it). Both reported
+    /// healthy the whole time.
+    ///
+    /// This test exists so the third one is caught here rather than in
+    /// production. When a new namespace-sharing field is added, add it here.
+    #[test]
+    fn host_namespace_flags_reach_docker() {
+        let cases: Vec<(
+            &str,
+            fn(&mut PodSpec),
+            fn(&NamespaceModes) -> &Option<String>,
+        )> = vec![
+            (
+                "hostNetwork",
+                |s| s.host_network = Some(true),
+                |m| &m.network_mode,
+            ),
+            ("hostIPC", |s| s.host_ipc = Some(true), |m| &m.ipc_mode),
+            ("hostPID", |s| s.host_pid = Some(true), |m| &m.pid_mode),
+        ];
+        for (name, set, read) in cases {
+            let modes = namespace_modes(&pod_with(set), "p", None, false);
+            assert_eq!(
+                read(&modes).as_deref(),
+                Some("host"),
+                "{name} must reach Docker as the host namespace, not be silently dropped"
+            );
+        }
+    }
+
+    /// Without any host flag, containers join the pause container so the pod
+    /// shares one network identity — pod IP = pause container IP, which is
+    /// fundamental to Kubernetes networking.
+    #[test]
+    fn without_host_flags_containers_join_the_pause_sandbox() {
+        let modes = namespace_modes(&pod_with(|_| {}), "mypod", None, false);
+        assert_eq!(modes.network_mode.as_deref(), Some("container:mypod_pause"));
+        assert_eq!(modes.ipc_mode.as_deref(), Some("container:mypod_pause"));
+        assert_eq!(modes.pid_mode, None, "PID is not shared unless asked for");
+    }
+
+    /// A CNI netns is joined by path, and is what a non-hostNetwork pod uses
+    /// when one exists.
+    #[test]
+    fn a_cni_netns_is_joined_by_path() {
+        let modes = namespace_modes(&pod_with(|_| {}), "p", Some("/var/run/netns/abc"), true);
+        assert_eq!(modes.network_mode.as_deref(), Some("ns:/var/run/netns/abc"));
+    }
+
+    /// hostNetwork has no sandbox to join: it must win over the CNI netns, or a
+    /// pod that asked for the host's network gets an isolated one that merely
+    /// looks right from inside.
+    #[test]
+    fn host_network_wins_over_a_cni_netns() {
+        let modes = namespace_modes(
+            &pod_with(|s| s.host_network = Some(true)),
+            "p",
+            Some("/var/run/netns/abc"),
+            true,
+        );
+        assert_eq!(modes.network_mode.as_deref(), Some("host"));
+    }
+
+    /// Kubernetes rejects a pod setting both, and the host namespace is strictly
+    /// wider, so honouring hostPID first cannot under-share.
+    #[test]
+    fn host_pid_wins_over_share_process_namespace() {
+        let modes = namespace_modes(
+            &pod_with(|s| {
+                s.host_pid = Some(true);
+                s.share_process_namespace = Some(true);
+            }),
+            "p",
+            None,
+            false,
+        );
+        assert_eq!(modes.pid_mode.as_deref(), Some("host"));
+    }
+
+    #[test]
+    fn share_process_namespace_alone_joins_the_pause_container() {
+        let modes = namespace_modes(
+            &pod_with(|s| s.share_process_namespace = Some(true)),
+            "mypod",
+            None,
+            false,
+        );
+        assert_eq!(modes.pid_mode.as_deref(), Some("container:mypod_pause"));
     }
 }
