@@ -1,12 +1,12 @@
 use anyhow::Result;
 use futures::StreamExt;
 use rusternetes_common::resources::node::Taint;
-use rusternetes_common::resources::pod::{SecretVolumeSource, Toleration, Volume, VolumeMount};
+use rusternetes_common::resources::pod::{Toleration, Volume, VolumeMount};
 use rusternetes_common::resources::{
     ControllerRevision, DaemonSet, DaemonSetStatus, Node, Pod, PodStatus,
 };
 use rusternetes_common::types::{OwnerReference, Phase};
-use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
+use rusternetes_storage::{Storage, WorkQueue, build_key, extract_key};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
@@ -1052,28 +1052,97 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         // Get service account name, default to "default"
         let sa_name = spec.service_account_name.as_deref().unwrap_or("default");
 
-        // The service account token secret name follows the pattern: {sa-name}-token
-        let token_secret_name = format!("{}-token", sa_name);
-
-        // Define the service account token volume
+        // A PROJECTED volume, the same three sources the api-server's own
+        // ServiceAccount admission builds (see admission.rs's
+        // inject_service_account_token, and upstream's
+        // plugin/pkg/admission/serviceaccount/admission.go).
+        //
+        // This used to mount the legacy `{sa-name}-token` Secret instead,
+        // which is why no DaemonSet on this platform could talk to the API
+        // server. That Secret carries an empty `ca.crt` and a token the
+        // api-server does not accept, so every DaemonSet pod got
+        // "x509: certificate signed by unknown authority" and then "the
+        // server has asked for the client to provide credentials" — found
+        // live, 2026-09-26, on Grafana Alloy, whose pod-log and
+        // PodMonitor discovery both need the API.
+        //
+        // Deployment pods were unaffected, and that is the whole reason
+        // this survived: they are admitted through the api-server, which
+        // injects the projected volume correctly. This controller writes
+        // pods straight to storage, so admission never runs for them and
+        // this is the only place the volume can come from — which is also
+        // why the fix is to build the right volume here rather than to
+        // delete the injection.
+        let _ = sa_name;
         let sa_token_volume = Volume {
             name: "kube-api-access".to_string(),
             empty_dir: None,
             host_path: None,
             config_map: None,
-            secret: Some(SecretVolumeSource {
-                secret_name: Some(token_secret_name.clone()),
-                items: None,
-                default_mode: None,
-                optional: None,
-            }),
+            secret: None,
             persistent_volume_claim: None,
             downward_api: None,
             csi: None,
             ephemeral: None,
             nfs: None,
             iscsi: None,
-            projected: None,
+            projected: Some(rusternetes_common::resources::ProjectedVolumeSource {
+                default_mode: None,
+                sources: Some(vec![
+                    // 1. The bound JWT the kubelet mints for this pod.
+                    rusternetes_common::resources::VolumeProjection {
+                        service_account_token: Some(
+                            rusternetes_common::resources::ServiceAccountTokenProjection {
+                                path: "token".to_string(),
+                                expiration_seconds: Some(3607),
+                                audience: None,
+                            },
+                        ),
+                        config_map: None,
+                        secret: None,
+                        downward_api: None,
+                        cluster_trust_bundle: None,
+                    },
+                    // 2. ca.crt, for verifying the api-server's certificate.
+                    rusternetes_common::resources::VolumeProjection {
+                        service_account_token: None,
+                        config_map: Some(rusternetes_common::resources::ConfigMapProjection {
+                            name: Some("kube-root-ca.crt".to_string()),
+                            items: Some(vec![rusternetes_common::resources::KeyToPath {
+                                key: "ca.crt".to_string(),
+                                path: "ca.crt".to_string(),
+                                mode: None,
+                            }]),
+                            optional: Some(true),
+                        }),
+                        secret: None,
+                        downward_api: None,
+                        cluster_trust_bundle: None,
+                    },
+                    // 3. The pod's own namespace.
+                    rusternetes_common::resources::VolumeProjection {
+                        service_account_token: None,
+                        config_map: None,
+                        secret: None,
+                        downward_api: Some(rusternetes_common::resources::DownwardAPIProjection {
+                            items: Some(vec![
+                                rusternetes_common::resources::DownwardAPIVolumeFile {
+                                    path: "namespace".to_string(),
+                                    field_ref: Some(
+                                        rusternetes_common::resources::ObjectFieldSelector {
+                                            api_version: Some("v1".to_string()),
+                                            field_path: "metadata.namespace".to_string(),
+                                        },
+                                    ),
+                                    resource_field_ref: None,
+                                    mode: None,
+                                },
+                            ]),
+                        }),
+                        cluster_trust_bundle: None,
+                    },
+                ]),
+            }),
             image: None,
         };
 
