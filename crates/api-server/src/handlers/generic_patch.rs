@@ -110,7 +110,7 @@ where
             // Apply with server-side apply semantics
             let force = params
                 .get("force")
-                .and_then(|v| v.parse::<bool>().ok())
+                .and_then(|v| crate::handlers::watch::parse_k8s_bool(v))
                 .unwrap_or(false);
 
             let apply_params = if force {
@@ -433,7 +433,7 @@ where
             // Apply with server-side apply semantics
             let force = params
                 .get("force")
-                .and_then(|v| v.parse::<bool>().ok())
+                .and_then(|v| crate::handlers::watch::parse_k8s_bool(v))
                 .unwrap_or(false);
 
             let apply_params = if force {

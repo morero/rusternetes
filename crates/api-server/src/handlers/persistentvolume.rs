@@ -102,7 +102,7 @@ pub async fn list_pvs(
     // Check if this is a watch request
     if params
         .get("watch")
-        .and_then(|v| v.parse::<bool>().ok())
+        .and_then(|v| crate::handlers::watch::parse_k8s_bool(v))
         .unwrap_or(false)
     {
         let watch_params = crate::handlers::watch::WatchParams {
@@ -117,10 +117,10 @@ pub async fn list_pvs(
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
-                .and_then(|v| v.parse::<bool>().ok()),
+                .and_then(|v| crate::handlers::watch::parse_k8s_bool(v)),
             send_initial_events: params
                 .get("sendInitialEvents")
-                .and_then(|v| v.parse::<bool>().ok()),
+                .and_then(|v| crate::handlers::watch::parse_k8s_bool(v)),
         };
         return crate::handlers::watch::watch_cluster_scoped::<PersistentVolume>(
             state,

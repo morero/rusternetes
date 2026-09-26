@@ -2,20 +2,20 @@
 
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
+    Extension,
     body::Body,
     extract::{Path, Query, State},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
-    Extension,
 };
 use futures::StreamExt;
 use rusternetes_common::{
+    Error, Result,
     authz::{Decision, RequestAttributes},
     types::ObjectMeta,
-    Error, Result,
 };
-use rusternetes_storage::{build_prefix, Storage, WatchEvent};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use rusternetes_storage::{Storage, WatchEvent, build_prefix};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{interval, timeout};
@@ -123,11 +123,32 @@ fn rbac_resource_name<'a>(resource_type: &'a str, api_group: &str) -> &'a str {
         .unwrap_or(resource_type)
 }
 
+/// Parses a query-string boolean the way the Kubernetes API does.
+///
+/// Go's `strconv.ParseBool` — which every Kubernetes API handler reaches for —
+/// accepts `1`, `t`, `T`, `TRUE`, `true`, `True` and their false counterparts.
+/// Rust's `str::parse::<bool>` accepts only `true` and `false`, so `?watch=1`
+/// parsed as `None` and fell through to the non-watch path: the client asked to
+/// watch and got a single List, then sat waiting for events on a response that
+/// had already ended.
+///
+/// Found while debugging a capability index whose store never populated. That
+/// turned out to be unrelated, but the reproduction — `curl '...?watch=1'` —
+/// returned a `BundleList` where `?watch=true` returned a stream, which is how
+/// this surfaced.
+pub fn parse_k8s_bool(v: &str) -> Option<bool> {
+    match v {
+        "1" | "t" | "T" | "TRUE" | "true" | "True" => Some(true),
+        "0" | "f" | "F" | "FALSE" | "false" | "False" => Some(false),
+        _ => None,
+    }
+}
+
 /// Check if a query param map indicates a watch request
 pub fn is_watch_request(params: &std::collections::HashMap<String, String>) -> bool {
     params
         .get("watch")
-        .and_then(|v| v.parse::<bool>().ok())
+        .and_then(|v| parse_k8s_bool(v))
         .unwrap_or(false)
 }
 
@@ -143,10 +164,10 @@ pub fn watch_params_from_query(params: &std::collections::HashMap<String, String
         watch: Some(true),
         allow_watch_bookmarks: params
             .get("allowWatchBookmarks")
-            .and_then(|v| v.parse::<bool>().ok()),
+            .and_then(|v| parse_k8s_bool(v)),
         send_initial_events: params
             .get("sendInitialEvents")
-            .and_then(|v| v.parse::<bool>().ok()),
+            .and_then(|v| parse_k8s_bool(v)),
     }
 }
 
@@ -2963,5 +2984,45 @@ mod tests {
             &m,
             &Some("metadata.namespace!=default".to_string())
         ));
+    }
+
+    /// Every form Go's strconv.ParseBool accepts, because that is what the
+    /// Kubernetes API accepts and therefore what clients send. `?watch=1` used
+    /// to parse as None and fall through to the non-watch path, handing the
+    /// client a single List on a response that then ended while it waited for
+    /// events.
+    #[test]
+    fn k8s_bools_accept_every_go_parsebool_form() {
+        for v in ["1", "t", "T", "TRUE", "true", "True"] {
+            assert_eq!(super::parse_k8s_bool(v), Some(true), "{v}");
+        }
+        for v in ["0", "f", "F", "FALSE", "false", "False"] {
+            assert_eq!(super::parse_k8s_bool(v), Some(false), "{v}");
+        }
+    }
+
+    #[test]
+    fn k8s_bools_reject_what_go_rejects() {
+        for v in ["", "yes", "no", "2", "tRuE", "on"] {
+            assert_eq!(super::parse_k8s_bool(v), None, "{v}");
+        }
+    }
+
+    /// The bug, at the level it actually bit: a watch request spelled `watch=1`
+    /// has to be recognised as one.
+    #[test]
+    fn watch_is_recognised_however_it_is_spelled() {
+        for v in ["1", "t", "T", "TRUE", "true", "True"] {
+            let params = std::collections::HashMap::from([("watch".to_string(), v.to_string())]);
+            assert!(super::is_watch_request(&params), "watch={v}");
+        }
+        for v in ["0", "false", "False"] {
+            let params = std::collections::HashMap::from([("watch".to_string(), v.to_string())]);
+            assert!(!super::is_watch_request(&params), "watch={v}");
+        }
+        assert!(
+            !super::is_watch_request(&std::collections::HashMap::new()),
+            "absent means not a watch"
+        );
     }
 }

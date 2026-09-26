@@ -190,7 +190,7 @@ pub async fn list(
     // Check if this is a watch request
     if params
         .get("watch")
-        .and_then(|v| v.parse::<bool>().ok())
+        .and_then(|v| crate::handlers::watch::parse_k8s_bool(v))
         .unwrap_or(false)
     {
         let watch_params = crate::handlers::watch::WatchParams {
@@ -205,10 +205,10 @@ pub async fn list(
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
-                .and_then(|v| v.parse::<bool>().ok()),
+                .and_then(|v| crate::handlers::watch::parse_k8s_bool(v)),
             send_initial_events: params
                 .get("sendInitialEvents")
-                .and_then(|v| v.parse::<bool>().ok()),
+                .and_then(|v| crate::handlers::watch::parse_k8s_bool(v)),
         };
         return crate::handlers::watch::watch_namespaced::<Lease>(
             state,
@@ -253,7 +253,7 @@ pub async fn list_all_leases(
     // Check if this is a watch request
     if params
         .get("watch")
-        .and_then(|v| v.parse::<bool>().ok())
+        .and_then(|v| crate::handlers::watch::parse_k8s_bool(v))
         .unwrap_or(false)
     {
         let watch_params = crate::handlers::watch::WatchParams {
@@ -268,10 +268,10 @@ pub async fn list_all_leases(
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
-                .and_then(|v| v.parse::<bool>().ok()),
+                .and_then(|v| crate::handlers::watch::parse_k8s_bool(v)),
             send_initial_events: params
                 .get("sendInitialEvents")
-                .and_then(|v| v.parse::<bool>().ok()),
+                .and_then(|v| crate::handlers::watch::parse_k8s_bool(v)),
         };
         return crate::handlers::watch::watch_cluster_scoped::<Lease>(
             state,

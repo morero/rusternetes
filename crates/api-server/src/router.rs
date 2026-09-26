@@ -401,7 +401,7 @@ async fn custom_resource_fallback(
                 .unwrap_or_default();
             let is_watch = query_params
                 .get("watch")
-                .and_then(|v| v.parse::<bool>().ok())
+                .and_then(|v| crate::handlers::watch::parse_k8s_bool(v))
                 .unwrap_or(false);
 
             if is_watch {
@@ -428,10 +428,10 @@ async fn custom_resource_fallback(
                     watch: Some(true),
                     allow_watch_bookmarks: query_params
                         .get("allowWatchBookmarks")
-                        .and_then(|v| v.parse::<bool>().ok()),
+                        .and_then(|v| crate::handlers::watch::parse_k8s_bool(v)),
                     send_initial_events: query_params
                         .get("sendInitialEvents")
-                        .and_then(|v| v.parse::<bool>().ok()),
+                        .and_then(|v| crate::handlers::watch::parse_k8s_bool(v)),
                 };
                 if let Some(ns) = namespace {
                     match crate::handlers::watch::watch_namespaced_with_kind_override::<

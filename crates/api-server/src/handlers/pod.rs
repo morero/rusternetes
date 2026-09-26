@@ -1052,7 +1052,7 @@ pub async fn list(
     // Check if this is a watch request
     if params
         .get("watch")
-        .and_then(|v| v.parse::<bool>().ok())
+        .and_then(|v| crate::handlers::watch::parse_k8s_bool(v))
         .unwrap_or(false)
     {
         info!("Starting watch for pods in namespace: {}", namespace);
@@ -1069,11 +1069,11 @@ pub async fn list(
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
-                .and_then(|v| v.parse::<bool>().ok()),
+                .and_then(|v| crate::handlers::watch::parse_k8s_bool(v)),
 
             send_initial_events: params
                 .get("sendInitialEvents")
-                .and_then(|v| v.parse::<bool>().ok()),
+                .and_then(|v| crate::handlers::watch::parse_k8s_bool(v)),
         };
         return crate::handlers::watch::watch_namespaced::<Pod>(
             state,
@@ -1169,7 +1169,7 @@ pub async fn list_all_pods(
     // Check if this is a watch request
     if params
         .get("watch")
-        .and_then(|v| v.parse::<bool>().ok())
+        .and_then(|v| crate::handlers::watch::parse_k8s_bool(v))
         .unwrap_or(false)
     {
         info!("Watch request for all pods");
@@ -1186,11 +1186,11 @@ pub async fn list_all_pods(
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
-                .and_then(|v| v.parse::<bool>().ok()),
+                .and_then(|v| crate::handlers::watch::parse_k8s_bool(v)),
 
             send_initial_events: params
                 .get("sendInitialEvents")
-                .and_then(|v| v.parse::<bool>().ok()),
+                .and_then(|v| crate::handlers::watch::parse_k8s_bool(v)),
         };
         return crate::handlers::watch::watch_cluster_scoped::<Pod>(
             state,
@@ -1337,7 +1337,7 @@ pub async fn patch(
             // Apply with server-side apply semantics
             let force = params
                 .get("force")
-                .and_then(|v| v.parse::<bool>().ok())
+                .and_then(|v| crate::handlers::watch::parse_k8s_bool(v))
                 .unwrap_or(false);
 
             let apply_params = if force {

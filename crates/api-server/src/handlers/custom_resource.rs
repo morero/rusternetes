@@ -861,7 +861,7 @@ pub async fn patch_custom_resource(
         if let (true, Some(field_manager)) = (is_apply, query.get("fieldManager").cloned()) {
             let force = query
                 .get("force")
-                .and_then(|v| v.parse::<bool>().ok())
+                .and_then(|v| crate::handlers::watch::parse_k8s_bool(v))
                 .unwrap_or(false);
 
             let current_json = match state.storage.get::<CustomResource>(&key).await {
