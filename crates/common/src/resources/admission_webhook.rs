@@ -41,6 +41,21 @@ pub struct ValidatingWebhook {
     pub client_config: WebhookClientConfig,
 
     /// Rules describes what operations on what resources the webhook cares about
+    ///
+    /// Optional, as upstream has it (`+optional`, `omitempty`): a webhook with
+    /// no rules is legal and simply matches nothing. Without `default` here,
+    /// deserialization demanded the field, so any write that legitimately
+    /// omitted it was rejected with `missing field 'rules'`.
+    ///
+    /// That is not a theoretical shape. cert-manager's cainjector patches
+    /// these objects with nothing but `clientConfig.caBundle`, so its webhook
+    /// entries carry no rules — every injection failed with `unable to apply
+    /// target object with CA data`. The consequence ran a long way: no
+    /// caBundle meant the api-server would not trust cert-manager's own
+    /// webhook, so no `CertificateRequest` could be admitted, so no
+    /// certificate was ever issued, so guts-gateway sat Pending forever
+    /// waiting on a TLS Secret.
+    #[serde(default)]
     pub rules: Vec<RuleWithOperations>,
 
     /// FailurePolicy defines how unrecognized errors are handled
@@ -60,21 +75,31 @@ pub struct ValidatingWebhook {
     pub match_policy: Option<MatchPolicy>,
 
     /// NamespaceSelector decides whether to run the webhook on an object based on namespace
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace_selector: Option<LabelSelector>,
 
     /// ObjectSelector decides whether to run the webhook on an object based on labels
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_selector: Option<LabelSelector>,
 
     /// SideEffects states whether this webhook has side effects
+    // `default` so a partial write deserializes: cert-manager's cainjector
+    // patches these objects with nothing but `clientConfig.caBundle`, and each
+    // non-defaulted field rejected that in turn — `rules`, then `sideEffects`,
+    // and so on down the struct.
+    #[serde(default)]
     pub side_effects: SideEffectClass,
 
     /// TimeoutSeconds specifies the timeout for this webhook (1-30 seconds)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<i32>,
 
     /// AdmissionReviewVersions is an ordered list of AdmissionReview versions the webhook accepts
+    // `default` so a partial write deserializes: cert-manager's cainjector
+    // patches these objects with nothing but `clientConfig.caBundle`, and each
+    // non-defaulted field rejected that in turn — `rules`, then `sideEffects`,
+    // and so on down the struct.
+    #[serde(default)]
     pub admission_review_versions: Vec<String>,
 
     /// MatchConditions are CEL expressions that must be true for the webhook to be called
@@ -115,6 +140,21 @@ pub struct MutatingWebhook {
     pub client_config: WebhookClientConfig,
 
     /// Rules describes what operations on what resources the webhook cares about
+    ///
+    /// Optional, as upstream has it (`+optional`, `omitempty`): a webhook with
+    /// no rules is legal and simply matches nothing. Without `default` here,
+    /// deserialization demanded the field, so any write that legitimately
+    /// omitted it was rejected with `missing field 'rules'`.
+    ///
+    /// That is not a theoretical shape. cert-manager's cainjector patches
+    /// these objects with nothing but `clientConfig.caBundle`, so its webhook
+    /// entries carry no rules — every injection failed with `unable to apply
+    /// target object with CA data`. The consequence ran a long way: no
+    /// caBundle meant the api-server would not trust cert-manager's own
+    /// webhook, so no `CertificateRequest` could be admitted, so no
+    /// certificate was ever issued, so guts-gateway sat Pending forever
+    /// waiting on a TLS Secret.
+    #[serde(default)]
     pub rules: Vec<RuleWithOperations>,
 
     /// FailurePolicy defines how unrecognized errors are handled
@@ -134,21 +174,31 @@ pub struct MutatingWebhook {
     pub match_policy: Option<MatchPolicy>,
 
     /// NamespaceSelector decides whether to run the webhook on an object based on namespace
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace_selector: Option<LabelSelector>,
 
     /// ObjectSelector decides whether to run the webhook on an object based on labels
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_selector: Option<LabelSelector>,
 
     /// SideEffects states whether this webhook has side effects
+    // `default` so a partial write deserializes: cert-manager's cainjector
+    // patches these objects with nothing but `clientConfig.caBundle`, and each
+    // non-defaulted field rejected that in turn — `rules`, then `sideEffects`,
+    // and so on down the struct.
+    #[serde(default)]
     pub side_effects: SideEffectClass,
 
     /// TimeoutSeconds specifies the timeout for this webhook (1-30 seconds)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<i32>,
 
     /// AdmissionReviewVersions is an ordered list of AdmissionReview versions the webhook accepts
+    // `default` so a partial write deserializes: cert-manager's cainjector
+    // patches these objects with nothing but `clientConfig.caBundle`, and each
+    // non-defaulted field rejected that in turn — `rules`, then `sideEffects`,
+    // and so on down the struct.
+    #[serde(default)]
     pub admission_review_versions: Vec<String>,
 
     /// MatchConditions are CEL expressions that must be true for the webhook to be called
@@ -227,9 +277,15 @@ pub enum MatchPolicy {
 }
 
 /// SideEffectClass denotes the level of side effects a webhook may have
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub enum SideEffectClass {
     /// Unknown means the webhook may have unknown side effects
+    ///
+    /// The `Default` so a webhook entry that omits `sideEffects` — as a
+    /// caBundle-only patch does — deserializes instead of failing. `Unknown`
+    /// is the conservative choice: it is what the API assumes when it cannot
+    /// tell, and it does not silently promise that a webhook is dry-run safe.
+    #[default]
     Unknown,
     /// None means the webhook has no side effects on dryRun
     None,
