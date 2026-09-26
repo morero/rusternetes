@@ -1,21 +1,38 @@
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
-    extract::{Path, State},
     Extension, Json,
+    extract::{Path, State},
 };
 use chrono::Utc;
 use rusternetes_common::{
+    List, Result,
     authz::{Decision, RequestAttributes},
     resources::{
         ContainerMetrics, NodeMetrics, NodeMetricsMetadata, PodMetrics, PodMetricsMetadata,
     },
-    List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{Storage, build_key, build_prefix};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::debug;
 
+// Authorization here names the resource `nodes`/`pods` in group
+// `metrics.k8s.io` with **no subresource**, which is what the aggregated
+// metrics API actually is upstream. It used to add
+// `.with_subresource("metrics")`, i.e. check for `nodes/metrics` — a
+// subresource that does not exist and that therefore no ClusterRole anywhere
+// grants. Every non-admin client was refused with "User does not have
+// permission to perform this action" while holding the exact grant the
+// upstream docs, metrics-server's own reader role and `kubectl top` all use:
+//
+//   - apiGroups: ["metrics.k8s.io"]
+//     resources: ["nodes", "pods"]
+//     verbs: ["get", "list"]
+//
+// Found live, 2026-09-26: guts' cluster-inventory collector held precisely
+// that grant, was refused every 30s, and reported node CPU and memory as 0
+// — while the same request as cluster-admin returned real usage, because an
+// admin passes whatever the resource is called.
 /// Get metrics for a specific node.
 /// Reads metrics published to storage by the kubelet.
 pub async fn get_node_metrics(
@@ -27,7 +44,6 @@ pub async fn get_node_metrics(
 
     let attrs = RequestAttributes::new(auth_ctx.user, "get", "nodes")
         .with_api_group("metrics.k8s.io")
-        .with_subresource("metrics")
         .with_name(&name);
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
@@ -75,9 +91,8 @@ pub async fn list_node_metrics(
 ) -> Result<Json<List<NodeMetrics>>> {
     debug!("Listing node metrics");
 
-    let attrs = RequestAttributes::new(auth_ctx.user, "list", "nodes")
-        .with_api_group("metrics.k8s.io")
-        .with_subresource("metrics");
+    let attrs =
+        RequestAttributes::new(auth_ctx.user, "list", "nodes").with_api_group("metrics.k8s.io");
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
         return Err(rusternetes_common::Error::Forbidden(reason));
@@ -133,7 +148,6 @@ pub async fn get_pod_metrics(
     let attrs = RequestAttributes::new(auth_ctx.user, "get", "pods")
         .with_api_group("metrics.k8s.io")
         .with_namespace(&namespace)
-        .with_subresource("metrics")
         .with_name(&name);
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
@@ -214,8 +228,7 @@ pub async fn list_pod_metrics(
     // Check authorization
     let attrs = RequestAttributes::new(auth_ctx.user, "list", "pods")
         .with_api_group("metrics.k8s.io")
-        .with_namespace(&namespace)
-        .with_subresource("metrics");
+        .with_namespace(&namespace);
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
         return Err(rusternetes_common::Error::Forbidden(reason));
@@ -297,9 +310,8 @@ pub async fn list_all_pod_metrics(
     debug!("Listing pod metrics across all namespaces");
 
     // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "list", "pods")
-        .with_api_group("metrics.k8s.io")
-        .with_subresource("metrics");
+    let attrs =
+        RequestAttributes::new(auth_ctx.user, "list", "pods").with_api_group("metrics.k8s.io");
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
         return Err(rusternetes_common::Error::Forbidden(reason));
