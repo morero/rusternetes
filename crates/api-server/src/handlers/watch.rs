@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{interval, timeout};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Kubernetes watch event types
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +155,27 @@ pub fn query_is_watch(query: &str) -> bool {
         .find(|(k, _)| *k == "watch")
         .and_then(|(_, v)| parse_k8s_bool(v))
         .unwrap_or(false)
+}
+
+/// The `ERROR` frame that tells a watching client its stream has a gap.
+///
+/// `reason: Expired` with code 410 is what a client-go informer reacts to by
+/// discarding its cache and re-LISTing. Any other shape here leaves the client
+/// believing it is still in sync.
+pub(crate) fn expired_error_frame(message: &str) -> String {
+    let frame = serde_json::json!({
+        "type": "ERROR",
+        "object": {
+            "kind": "Status",
+            "apiVersion": "v1",
+            "metadata": {},
+            "status": "Failure",
+            "message": message,
+            "reason": "Expired",
+            "code": 410,
+        }
+    });
+    format!("{}\n", serde_json::to_string(&frame).unwrap_or_default())
 }
 
 /// Check if a query param map indicates a watch request
@@ -681,18 +702,42 @@ where
                                 }
                             }
                             Some(Err(e)) => {
+                                // A gap is not transient: the events are gone.
+                                // Tell the client so it re-lists, instead of
+                                // leaving it convinced it is still in sync.
+                                if let Error::Gone(ref why) = e {
+                                    warn!("Watch gap, ending stream: {}", why);
+                                    let _ = tx.send(Ok(expired_error_frame(why))).await;
+                                    return;
+                                }
                                 // Empty watch responses and transient errors are normal —
                                 // etcd sends keep-alive responses with no events. Don't break.
                                 debug!("Watch stream transient error (continuing): {}", e);
                                 continue;
                             }
                             None => {
-                                // Watch stream ended — resubscribe from cache.
-                                // Small delay to prevent tight loop if channel keeps closing.
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                                let new_rx = state.watch_cache.subscribe(&prefix).await;
-                                watch_stream = Box::pin(crate::watch_cache::broadcast_to_stream(new_rx));
-                                continue;
+                                // The stream ended: the broadcast sender for
+                                // this prefix was dropped. Resubscribing here —
+                                // which is what this used to do — resumes the
+                                // client's watch across a window in which events
+                                // were published to a channel nobody held, so the
+                                // client silently misses them and never learns to
+                                // re-list. Same failure as a swallowed lag, by a
+                                // different route.
+                                //
+                                // 410 Gone is the contract for "this watch cannot
+                                // be continued"; the client reconnects from its
+                                // own resourceVersion, which is the only party
+                                // that knows where it got to.
+                                warn!(
+                                    "Watch stream ended; closing it with 410 Gone so the client re-lists"
+                                );
+                                let _ = tx
+                                    .send(Ok(expired_error_frame(
+                                        "watch stream ended and cannot be continued",
+                                    )))
+                                    .await;
+                                return;
                             }
                         }
                     }
@@ -1182,18 +1227,42 @@ where
                                 }
                             }
                             Some(Err(e)) => {
+                                // A gap is not transient: the events are gone.
+                                // Tell the client so it re-lists, instead of
+                                // leaving it convinced it is still in sync.
+                                if let Error::Gone(ref why) = e {
+                                    warn!("Watch gap, ending stream: {}", why);
+                                    let _ = tx.send(Ok(expired_error_frame(why))).await;
+                                    return;
+                                }
                                 // Empty watch responses and transient errors are normal —
                                 // etcd sends keep-alive responses with no events. Don't break.
                                 debug!("Watch stream transient error (continuing): {}", e);
                                 continue;
                             }
                             None => {
-                                // Watch stream ended — resubscribe from cache.
-                                // Small delay to prevent tight loop if channel keeps closing.
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                                let new_rx = state.watch_cache.subscribe(&prefix).await;
-                                watch_stream = Box::pin(crate::watch_cache::broadcast_to_stream(new_rx));
-                                continue;
+                                // The stream ended: the broadcast sender for
+                                // this prefix was dropped. Resubscribing here —
+                                // which is what this used to do — resumes the
+                                // client's watch across a window in which events
+                                // were published to a channel nobody held, so the
+                                // client silently misses them and never learns to
+                                // re-list. Same failure as a swallowed lag, by a
+                                // different route.
+                                //
+                                // 410 Gone is the contract for "this watch cannot
+                                // be continued"; the client reconnects from its
+                                // own resourceVersion, which is the only party
+                                // that knows where it got to.
+                                warn!(
+                                    "Watch stream ended; closing it with 410 Gone so the client re-lists"
+                                );
+                                let _ = tx
+                                    .send(Ok(expired_error_frame(
+                                        "watch stream ended and cannot be continued",
+                                    )))
+                                    .await;
+                                return;
                             }
                         }
                     }
@@ -2624,15 +2693,42 @@ pub async fn watch_cluster_scoped_json(
                                 }
                             }
                             Some(Err(e)) => {
+                                // A gap is not transient: the events are gone.
+                                // Tell the client so it re-lists, instead of
+                                // leaving it convinced it is still in sync.
+                                if let Error::Gone(ref why) = e {
+                                    warn!("Watch gap, ending stream: {}", why);
+                                    let _ = tx.send(Ok(expired_error_frame(why))).await;
+                                    return;
+                                }
+                                // Empty watch responses and transient errors are normal —
+                                // etcd sends keep-alive responses with no events. Don't break.
                                 debug!("Watch stream transient error (continuing): {}", e);
                                 continue;
                             }
                             None => {
-                                // Watch stream ended — resubscribe from cache
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                                let new_rx = state_for_reconnect.watch_cache.subscribe(&prefix_for_reconnect).await;
-                                watch_stream = Box::pin(crate::watch_cache::broadcast_to_stream(new_rx));
-                                continue;
+                                // The stream ended: the broadcast sender for
+                                // this prefix was dropped. Resubscribing here —
+                                // which is what this used to do — resumes the
+                                // client's watch across a window in which events
+                                // were published to a channel nobody held, so the
+                                // client silently misses them and never learns to
+                                // re-list. Same failure as a swallowed lag, by a
+                                // different route.
+                                //
+                                // 410 Gone is the contract for "this watch cannot
+                                // be continued"; the client reconnects from its
+                                // own resourceVersion, which is the only party
+                                // that knows where it got to.
+                                warn!(
+                                    "Watch stream ended; closing it with 410 Gone so the client re-lists"
+                                );
+                                let _ = tx
+                                    .send(Ok(expired_error_frame(
+                                        "watch stream ended and cannot be continued",
+                                    )))
+                                    .await;
+                                return;
                             }
                         }
                     }
@@ -2816,15 +2912,42 @@ pub async fn watch_namespaced_json(
                                 }
                             }
                             Some(Err(e)) => {
+                                // A gap is not transient: the events are gone.
+                                // Tell the client so it re-lists, instead of
+                                // leaving it convinced it is still in sync.
+                                if let Error::Gone(ref why) = e {
+                                    warn!("Watch gap, ending stream: {}", why);
+                                    let _ = tx.send(Ok(expired_error_frame(why))).await;
+                                    return;
+                                }
+                                // Empty watch responses and transient errors are normal —
+                                // etcd sends keep-alive responses with no events. Don't break.
                                 debug!("Watch stream transient error (continuing): {}", e);
                                 continue;
                             }
                             None => {
-                                // Watch stream ended — resubscribe from cache
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                                let new_rx = state_for_reconnect.watch_cache.subscribe(&prefix_for_reconnect).await;
-                                watch_stream = Box::pin(crate::watch_cache::broadcast_to_stream(new_rx));
-                                continue;
+                                // The stream ended: the broadcast sender for
+                                // this prefix was dropped. Resubscribing here —
+                                // which is what this used to do — resumes the
+                                // client's watch across a window in which events
+                                // were published to a channel nobody held, so the
+                                // client silently misses them and never learns to
+                                // re-list. Same failure as a swallowed lag, by a
+                                // different route.
+                                //
+                                // 410 Gone is the contract for "this watch cannot
+                                // be continued"; the client reconnects from its
+                                // own resourceVersion, which is the only party
+                                // that knows where it got to.
+                                warn!(
+                                    "Watch stream ended; closing it with 410 Gone so the client re-lists"
+                                );
+                                let _ = tx
+                                    .send(Ok(expired_error_frame(
+                                        "watch stream ended and cannot be continued",
+                                    )))
+                                    .await;
+                                return;
                             }
                         }
                     }

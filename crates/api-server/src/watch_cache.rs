@@ -4,12 +4,13 @@
 //! to all subscribed client watches. This avoids creating N etcd watches
 //! for N clients, which overwhelms etcd and exhausts HTTP/2 stream limits.
 
+use rusternetes_common::Error;
 use rusternetes_storage::StorageBackend;
 use rusternetes_storage::{Storage, WatchEvent, WatchStream};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Maximum number of events to retain in the history ring buffer per prefix
 /// K8s default watch cache capacity is 1000 events.
@@ -230,8 +231,29 @@ pub fn broadcast_to_stream(mut rx: broadcast::Receiver<CachedWatchEvent>) -> Wat
                     yield Ok(event);
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    debug!("Watch stream lagged by {} events, continuing", n);
-                    continue;
+                    // The subscriber fell behind and the channel dropped `n`
+                    // events for it. Continuing here — which is what this used
+                    // to do — hands the client a stream that silently skipped
+                    // events it will never learn about, so its cache stays
+                    // wrong for as long as the watch lives. That is how
+                    // kube-state-metrics came to export several copies of one
+                    // EndpointSlice, each with the creationTimestamp of a
+                    // recreation whose DELETE it never saw.
+                    //
+                    // The API contract for a gap is a 410 Gone with
+                    // reason=Expired, which makes the client re-LIST and
+                    // rebuild. Ending the stream with that error is the only
+                    // honest option: the events are gone and cannot be
+                    // replayed from a broadcast channel.
+                    warn!(
+                        "Watch stream lagged by {} events; ending it with 410 Gone \
+                         so the client re-lists",
+                        n
+                    );
+                    yield Err(Error::Gone(format!(
+                        "too old resource version: watch fell behind by {n} events"
+                    )));
+                    break;
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     break;
@@ -278,8 +300,29 @@ pub fn broadcast_to_stream_with_history(
                     yield Ok(event);
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    debug!("Watch stream lagged by {} events, continuing", n);
-                    continue;
+                    // The subscriber fell behind and the channel dropped `n`
+                    // events for it. Continuing here — which is what this used
+                    // to do — hands the client a stream that silently skipped
+                    // events it will never learn about, so its cache stays
+                    // wrong for as long as the watch lives. That is how
+                    // kube-state-metrics came to export several copies of one
+                    // EndpointSlice, each with the creationTimestamp of a
+                    // recreation whose DELETE it never saw.
+                    //
+                    // The API contract for a gap is a 410 Gone with
+                    // reason=Expired, which makes the client re-LIST and
+                    // rebuild. Ending the stream with that error is the only
+                    // honest option: the events are gone and cannot be
+                    // replayed from a broadcast channel.
+                    warn!(
+                        "Watch stream lagged by {} events; ending it with 410 Gone \
+                         so the client re-lists",
+                        n
+                    );
+                    yield Err(Error::Gone(format!(
+                        "too old resource version: watch fell behind by {n} events"
+                    )));
+                    break;
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     break;
@@ -288,4 +331,82 @@ pub fn broadcast_to_stream_with_history(
         }
     };
     Box::pin(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+
+    fn added(key: &str) -> CachedWatchEvent {
+        CachedWatchEvent {
+            event: WatchEventData::Added(key.into(), Arc::new("{}".into())),
+            revision: 1,
+        }
+    }
+
+    /// A subscriber that falls behind must be told, not quietly skipped.
+    ///
+    /// The old behaviour logged the lag at debug and continued, so the client
+    /// kept a stream it believed was complete and never re-listed. That is how
+    /// kube-state-metrics ended up exporting several copies of one
+    /// EndpointSlice: the DELETEs for the earlier ones fell in a lag window.
+    #[tokio::test]
+    async fn a_lagged_watch_ends_with_gone_instead_of_skipping_events() {
+        let (tx, rx) = broadcast::channel(2);
+        // Overrun the channel before anything reads from it.
+        for i in 0..8 {
+            let _ = tx.send(added(&format!("/registry/pods/default/p{i}")));
+        }
+        drop(tx);
+
+        let mut stream = broadcast_to_stream(rx);
+        let first = stream
+            .next()
+            .await
+            .expect("the stream must yield the lag, not end silently");
+        match first {
+            Err(Error::Gone(message)) => {
+                assert!(
+                    message.contains("fell behind"),
+                    "unhelpful gap message: {message}"
+                );
+            }
+            other => panic!("expected Gone for a lagged subscriber, got {other:?}"),
+        }
+        // And it stops there: the remaining events cannot be replayed, so
+        // continuing would resume a stream with a hole in it.
+        assert!(
+            stream.next().await.is_none(),
+            "the stream continued past a gap"
+        );
+    }
+
+    /// The ordinary path is unaffected: events a subscriber keeps up with are
+    /// delivered in order and the stream ends when the sender is dropped.
+    #[tokio::test]
+    async fn a_subscriber_that_keeps_up_sees_every_event() {
+        let (tx, rx) = broadcast::channel(16);
+        for i in 0..3 {
+            let _ = tx.send(added(&format!("/registry/pods/default/p{i}")));
+        }
+        drop(tx);
+
+        let mut stream = broadcast_to_stream(rx);
+        let mut keys = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item.expect("no gap was created") {
+                WatchEvent::Added(key, _) => keys.push(key),
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        assert_eq!(
+            keys,
+            vec![
+                "/registry/pods/default/p0",
+                "/registry/pods/default/p1",
+                "/registry/pods/default/p2"
+            ]
+        );
+    }
 }
