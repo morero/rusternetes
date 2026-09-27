@@ -108,6 +108,29 @@ impl ObjectMeta {
         }
     }
 
+    /// Carry an existing object's identity onto a freshly-built replacement
+    /// that is about to overwrite it.
+    ///
+    /// A controller that rebuilds its desired object each reconcile gets a new
+    /// `uid` and `creationTimestamp` from [`ObjectMeta::new`], and writing that
+    /// over a live object changes its identity in place. In Kubernetes both
+    /// fields are immutable: a watcher is entitled to treat a `uid` as naming
+    /// one object for its whole life, and stores keyed by `uid` — which
+    /// kube-state-metrics' is — accumulate one stale entry per reconcile when
+    /// it changes under them. The result reaches the operator as duplicate
+    /// time series: several copies of one EndpointSlice, each carrying the
+    /// creationTimestamp of a reconcile whose object no longer exists.
+    ///
+    /// `resourceVersion` is carried too because an update needs it, and
+    /// carrying it separately is how the identity came to be dropped: the call
+    /// sites all remembered the field the write would fail without, and forgot
+    /// the two it would silently corrupt.
+    pub fn preserve_identity_from(&mut self, existing: &ObjectMeta) {
+        self.uid.clone_from(&existing.uid);
+        self.creation_timestamp = existing.creation_timestamp;
+        self.resource_version.clone_from(&existing.resource_version);
+    }
+
     pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
         self.namespace = Some(namespace.into());
         self
@@ -1016,5 +1039,48 @@ mod tests {
     fn phase_rejects_unknown_non_empty_variants() {
         let r: Result<Phase, _> = serde_json::from_str(r#""NotAPhase""#);
         assert!(r.is_err(), "unknown non-empty variant must error");
+    }
+    /// An update must not change what the object *is*.
+    ///
+    /// The endpointslice controller rebuilt its desired slice each reconcile
+    /// and carried only `resourceVersion` across, so every update wrote a fresh
+    /// uuid and `creationTimestamp` over a live object. Watchers saw MODIFIED
+    /// events whose objects had different uids each time — a contradiction —
+    /// and any store keyed by uid kept every past version.
+    #[test]
+    fn preserving_identity_keeps_uid_and_creation_timestamp() {
+        let mut existing = ObjectMeta::new("guts-kube-state-metrics");
+        existing.resource_version = Some("233074".to_string());
+        let original_uid = existing.uid.clone();
+        let original_created = existing.creation_timestamp;
+
+        // What a controller builds from scratch on the next reconcile.
+        let mut desired = ObjectMeta::new("guts-kube-state-metrics");
+        assert_ne!(
+            desired.uid, original_uid,
+            "ObjectMeta::new must mint a fresh uid, or this test proves nothing"
+        );
+
+        desired.preserve_identity_from(&existing);
+
+        assert_eq!(desired.uid, original_uid, "uid changed under an update");
+        assert_eq!(desired.creation_timestamp, original_created);
+        assert_eq!(desired.resource_version, Some("233074".to_string()));
+    }
+
+    /// The name is the caller's to set; identity preservation must not reach
+    /// beyond the fields that are actually immutable.
+    #[test]
+    fn preserving_identity_leaves_the_rest_of_the_desired_object_alone() {
+        let existing = ObjectMeta::new("old-name");
+        let mut desired = ObjectMeta::new("new-name");
+        desired.namespace = Some("guts-system".to_string());
+        desired.labels = Some([("k".to_string(), "v".to_string())].into_iter().collect());
+
+        desired.preserve_identity_from(&existing);
+
+        assert_eq!(desired.name, "new-name");
+        assert_eq!(desired.namespace.as_deref(), Some("guts-system"));
+        assert_eq!(desired.labels.as_ref().unwrap()["k"], "v");
     }
 }

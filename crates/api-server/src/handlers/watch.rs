@@ -2612,9 +2612,6 @@ pub async fn watch_cluster_scoped_json(
     let should_send_initial =
         send_initial_events || requested_rv.as_deref() == Some("0") || requested_rv.is_none();
 
-    let prefix_for_reconnect = prefix.clone();
-    let state_for_reconnect = state.clone();
-
     tokio::spawn(async move {
         let mut latest_resource_version: Option<String> = Some(current_rev_str);
 
@@ -2830,9 +2827,6 @@ pub async fn watch_namespaced_json(
     // event that already happened. Sending current state as ADDED ensures the
     // client sees the latest status (e.g. CRD Established=True condition).
     let should_send_initial = true;
-
-    let prefix_for_reconnect = prefix.clone();
-    let state_for_reconnect = state.clone();
 
     tokio::spawn(async move {
         let mut latest_resource_version: Option<String> = Some(current_rev_str);

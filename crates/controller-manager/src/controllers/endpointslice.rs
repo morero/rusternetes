@@ -381,7 +381,7 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                     if existing.endpoints == slice.endpoints && existing.ports == slice.ports {
                         continue;
                     }
-                    slice.metadata.resource_version = existing.metadata.resource_version;
+                    slice.metadata.preserve_identity_from(&existing.metadata);
                     match self.storage.update(&slice_key, &slice).await {
                         Ok(_) => {
                             debug!("Updated mirrored EndpointSlice {}/{}", ns, slice_name);
@@ -546,7 +546,7 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                         if existing.endpoints == slice.endpoints && existing.ports == slice.ports {
                             continue;
                         }
-                        slice.metadata.resource_version = existing.metadata.resource_version;
+                        slice.metadata.preserve_identity_from(&existing.metadata);
                         let _ = self.storage.update(&slice_key, &slice).await;
                     }
                     Err(_) => {
@@ -830,7 +830,7 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                     if existing.endpoints == slice.endpoints && existing.ports == slice.ports {
                         continue;
                     }
-                    slice.metadata.resource_version = existing.metadata.resource_version;
+                    slice.metadata.preserve_identity_from(&existing.metadata);
                     match self.storage.update(&slice_key, &slice).await {
                         Ok(_) => {
                             info!(

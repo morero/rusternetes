@@ -326,7 +326,7 @@ impl<S: Storage + 'static> EndpointsController<S> {
                 return Ok(());
             }
             // Preserve resource version for update
-            endpoints.metadata.resource_version = existing.metadata.resource_version;
+            endpoints.metadata.preserve_identity_from(&existing.metadata);
         }
 
         // Try to update first, if it doesn't exist, create it
