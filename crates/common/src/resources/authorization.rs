@@ -15,6 +15,18 @@ pub struct SubjectAccessReview {
     pub api_version: String,
     #[serde(default = "default_kind_subject_access_review")]
     pub kind: String,
+    /// Defaulted, not required. A review is a non-persisted REQUEST object:
+    /// it is POSTed to ask a question and never stored, so upstream accepts
+    /// one with no `metadata` at all and clients — including client-go's
+    /// dynamic client — routinely send none.
+    ///
+    /// Requiring it rejected every such request with a deserialization error,
+    /// surfaced to the caller as a 422 that client-go renders as "the server
+    /// rejected our request due to an error in our request" — text that names
+    /// neither the field nor the object. Found from the far end: a module
+    /// asking whether a user may install something got that sentence and
+    /// nothing else.
+    #[serde(default)]
     pub metadata: ObjectMeta,
     pub spec: SubjectAccessReviewSpec,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -200,6 +212,18 @@ pub struct SelfSubjectAccessReview {
     pub api_version: String,
     #[serde(default = "default_kind_self_subject_access_review")]
     pub kind: String,
+    /// Defaulted, not required. A review is a non-persisted REQUEST object:
+    /// it is POSTed to ask a question and never stored, so upstream accepts
+    /// one with no `metadata` at all and clients — including client-go's
+    /// dynamic client — routinely send none.
+    ///
+    /// Requiring it rejected every such request with a deserialization error,
+    /// surfaced to the caller as a 422 that client-go renders as "the server
+    /// rejected our request due to an error in our request" — text that names
+    /// neither the field nor the object. Found from the far end: a module
+    /// asking whether a user may install something got that sentence and
+    /// nothing else.
+    #[serde(default)]
     pub metadata: ObjectMeta,
     pub spec: SelfSubjectAccessReviewSpec,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -239,6 +263,18 @@ pub struct LocalSubjectAccessReview {
     pub api_version: String,
     #[serde(default = "default_kind_local_subject_access_review")]
     pub kind: String,
+    /// Defaulted, not required. A review is a non-persisted REQUEST object:
+    /// it is POSTed to ask a question and never stored, so upstream accepts
+    /// one with no `metadata` at all and clients — including client-go's
+    /// dynamic client — routinely send none.
+    ///
+    /// Requiring it rejected every such request with a deserialization error,
+    /// surfaced to the caller as a 422 that client-go renders as "the server
+    /// rejected our request due to an error in our request" — text that names
+    /// neither the field nor the object. Found from the far end: a module
+    /// asking whether a user may install something got that sentence and
+    /// nothing else.
+    #[serde(default)]
     pub metadata: ObjectMeta,
     pub spec: SubjectAccessReviewSpec,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -265,6 +301,18 @@ pub struct SelfSubjectRulesReview {
     pub api_version: String,
     #[serde(default = "default_kind_self_subject_rules_review")]
     pub kind: String,
+    /// Defaulted, not required. A review is a non-persisted REQUEST object:
+    /// it is POSTed to ask a question and never stored, so upstream accepts
+    /// one with no `metadata` at all and clients — including client-go's
+    /// dynamic client — routinely send none.
+    ///
+    /// Requiring it rejected every such request with a deserialization error,
+    /// surfaced to the caller as a 422 that client-go renders as "the server
+    /// rejected our request due to an error in our request" — text that names
+    /// neither the field nor the object. Found from the far end: a module
+    /// asking whether a user may install something got that sentence and
+    /// nothing else.
+    #[serde(default)]
     pub metadata: ObjectMeta,
     pub spec: SelfSubjectRulesReviewSpec,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -470,5 +518,55 @@ mod tests {
         let json = serde_json::to_string(&ssrr).unwrap();
         assert!(json.contains("authorization.k8s.io/v1"));
         assert!(json.contains("SelfSubjectRulesReview"));
+    }
+    /// A review is a non-persisted request object; upstream accepts one with no
+    /// `metadata`, and client-go's dynamic client sends none.
+    ///
+    /// Requiring it turned every such POST into a deserialization error, which
+    /// reached the caller as a 422 rendered by client-go as "the server
+    /// rejected our request due to an error in our request" — naming neither
+    /// the field nor the object. The real message ("missing field `metadata`")
+    /// was only visible by POSTing by hand.
+    #[test]
+    fn a_review_without_metadata_deserializes() {
+        let body = r#"{
+            "apiVersion": "authorization.k8s.io/v1",
+            "kind": "SubjectAccessReview",
+            "spec": {
+                "user": "alice@example.com",
+                "groups": ["admin"],
+                "resourceAttributes": {
+                    "namespace": "tenant-acme",
+                    "verb": "create",
+                    "group": "platform.ertia.io",
+                    "resource": "cataloginstalls"
+                }
+            }
+        }"#;
+        let review: SubjectAccessReview =
+            serde_json::from_str(body).expect("a review with no metadata must deserialize");
+        assert_eq!(review.spec.user.as_deref(), Some("alice@example.com"));
+        let attrs = review
+            .spec
+            .resource_attributes
+            .as_ref()
+            .expect("resourceAttributes");
+        assert_eq!(attrs.resource.as_deref(), Some("cataloginstalls"));
+        assert_eq!(attrs.namespace.as_deref(), Some("tenant-acme"));
+    }
+
+    /// The same for the other three, each of which had the same requirement.
+    #[test]
+    fn every_review_kind_accepts_an_absent_metadata() {
+        serde_json::from_str::<SelfSubjectAccessReview>(
+            r#"{"spec":{"resourceAttributes":{"verb":"get","resource":"pods"}}}"#,
+        )
+        .expect("SelfSubjectAccessReview");
+        serde_json::from_str::<LocalSubjectAccessReview>(
+            r#"{"spec":{"user":"a","resourceAttributes":{"verb":"get","resource":"pods"}}}"#,
+        )
+        .expect("LocalSubjectAccessReview");
+        serde_json::from_str::<SelfSubjectRulesReview>(r#"{"spec":{"namespace":"default"}}"#)
+            .expect("SelfSubjectRulesReview");
     }
 }
