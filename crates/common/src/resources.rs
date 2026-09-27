@@ -21,6 +21,7 @@ pub mod ingress;
 pub mod ingressclass;
 pub mod ipaddress;
 pub mod metrics;
+pub mod node_stats;
 pub mod namespace;
 pub mod networking;
 pub mod node;
@@ -127,6 +128,7 @@ pub use ingress::{
 };
 pub use ingressclass::{IngressClass, IngressClassParametersReference, IngressClassSpec};
 pub use ipaddress::{IPAddress, IPAddressSpec, ParentReference};
+pub use node_stats::{node_stats_summary_key, FsStats, NodeStats, NodeStatsSummary};
 pub use metrics::{
     ContainerMetrics, NodeMetrics, NodeMetricsMetadata, PodMetrics, PodMetricsMetadata,
 };

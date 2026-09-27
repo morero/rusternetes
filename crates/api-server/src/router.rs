@@ -1166,6 +1166,16 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
                 .put(handlers::status::update_cluster_status)
                 .patch(handlers::status::update_cluster_status),
         )
+        // Kubelet endpoints served NATIVELY from storage, ahead of the generic
+        // proxy below. A static path beats the wildcard in the router's matcher,
+        // so this list is the authoritative answer to "which kubelet endpoints
+        // work here" — everything absent from it genuinely proxies, and fails
+        // honestly because this platform runs no kubelet HTTP server. See
+        // handlers/node_stats.rs.
+        .route(
+            "/api/v1/nodes/:name/proxy/stats/summary",
+            get(handlers::node_stats::get_node_stats_summary),
+        )
         .route(
             "/api/v1/nodes/:name/proxy/*path",
             get(handlers::proxy::proxy_node)

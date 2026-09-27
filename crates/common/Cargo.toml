@@ -6,6 +6,8 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+# statvfs, for the node filesystem stats the kubelet publishes (node_stats.rs).
+libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true

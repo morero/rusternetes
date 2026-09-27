@@ -830,6 +830,7 @@ impl Kubelet {
 
         // Collect and publish node metrics to storage
         self.publish_node_metrics().await;
+        self.publish_node_stats_summary().await;
 
         // If eviction is needed, trigger pod eviction
         if !active_signals.is_empty() {
@@ -900,6 +901,49 @@ impl Kubelet {
         }
 
         Ok(())
+    }
+
+    /// Publish the node's filesystem stats, which `metrics.k8s.io` cannot carry
+    /// — `NodeMetrics.usage` is cpu and memory only, by upstream's schema.
+    ///
+    /// Written to storage rather than served from an HTTP listener on this
+    /// process, because that is how every other kubelet-collected figure
+    /// reaches a client here: the kubelet publishes, the api-server serves. The
+    /// api-server answers `nodes/proxy/stats/summary` from this, on a route of
+    /// its own so that which kubelet endpoints are native and which are
+    /// genuinely proxied stays greppable.
+    ///
+    /// A filesystem it cannot read is left absent rather than reported as zero.
+    /// "No disk usage" and "disk usage unknown" are different answers, and a
+    /// consumer showing 0% because nobody could look is the more damaging one.
+    async fn publish_node_stats_summary(&self) {
+        use rusternetes_common::resources::{
+            node_stats_summary_key, FsStats, NodeStats, NodeStatsSummary,
+        };
+
+        let path = std::path::Path::new(self.runtime.volumes_base_path());
+        let fs = FsStats::for_path(path);
+        if fs.is_none() {
+            debug!(
+                "node stats: cannot stat {} — reporting no filesystem rather than zero",
+                path.display()
+            );
+        }
+        let summary = NodeStatsSummary {
+            node: NodeStats {
+                node_name: self.node_name.clone(),
+                start_time: chrono::Utc::now(),
+                fs,
+            },
+        };
+        let key = node_stats_summary_key(&self.node_name);
+        let result = match self.storage.get::<NodeStatsSummary>(&key).await {
+            Ok(_) => self.storage.update(&key, &summary).await.map(|_| ()),
+            Err(_) => self.storage.create(&key, &summary).await.map(|_| ()),
+        };
+        if let Err(e) = result {
+            debug!("Failed to publish node stats summary: {}", e);
+        }
     }
 
     /// Collect container metrics from the runtime and write NodeMetrics to storage.

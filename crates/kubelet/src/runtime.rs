@@ -724,6 +724,7 @@ fn should_fully_cleanup_pod(pod_has_running_container: bool, pod_still_exists: b
 }
 
 impl ContainerRuntime {
+
     /// Labels to attach to every container this runtime creates, so it can
     /// later recognize (and only ever act on) its own containers rather
     /// than anything else present on the Docker daemon.
