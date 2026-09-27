@@ -1,3 +1,4 @@
+use axum::response::IntoResponse;
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
     extract::{Path, Query, State},
@@ -76,7 +77,22 @@ pub async fn list_volumeattributesclasses(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<List<VolumeAttributesClass>>> {
+) -> Result<axum::response::Response> {
+    // A watch request answered with a List is how a client ends up reporting
+    // "unable to decode to metav1.WatchEvent" from somewhere else entirely.
+    if let Some(response) =
+        crate::handlers::watch::maybe_watch_cluster_scoped::<VolumeAttributesClass>(
+            &state,
+            &auth_ctx,
+            "volumeattributesclasses",
+            "storage.k8s.io",
+            &params,
+        )
+        .await?
+    {
+        return Ok(response);
+    }
+
     debug!("Listing all VolumeAttributesClasses");
 
     let attrs = RequestAttributes::new(auth_ctx.user, "list", "volumeattributesclasses")
@@ -90,13 +106,13 @@ pub async fn list_volumeattributesclasses(
     }
 
     let prefix = build_prefix("volumeattributesclasses", None);
-    let mut vacs = state.storage.list(&prefix).await?;
+    let mut vacs: Vec<VolumeAttributesClass> = state.storage.list(&prefix).await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut vacs, &params)?;
 
     let list = List::new("VolumeAttributesClassList", "storage.k8s.io/v1", vacs);
-    Ok(Json(list))
+    Ok(Json(list).into_response())
 }
 
 pub async fn update_volumeattributesclass(

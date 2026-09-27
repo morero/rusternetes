@@ -1,3 +1,4 @@
+use axum::response::IntoResponse;
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
     body::Bytes,
@@ -80,7 +81,21 @@ pub async fn list_csinodes(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<List<CSINode>>> {
+) -> Result<axum::response::Response> {
+    // A watch request answered with a List is how a client ends up reporting
+    // "unable to decode to metav1.WatchEvent" from somewhere else entirely.
+    if let Some(response) = crate::handlers::watch::maybe_watch_cluster_scoped::<CSINode>(
+        &state,
+        &auth_ctx,
+        "csinodes",
+        "storage.k8s.io",
+        &params,
+    )
+    .await?
+    {
+        return Ok(response);
+    }
+
     debug!("Listing all CSINodes");
 
     let attrs =
@@ -94,13 +109,13 @@ pub async fn list_csinodes(
     }
 
     let prefix = build_prefix("csinodes", None);
-    let mut nodes = state.storage.list(&prefix).await?;
+    let mut nodes: Vec<CSINode> = state.storage.list(&prefix).await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut nodes, &params)?;
 
     let list = List::new("CSINodeList", "storage.k8s.io/v1", nodes);
-    Ok(Json(list))
+    Ok(Json(list).into_response())
 }
 
 pub async fn update_csinode(

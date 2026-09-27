@@ -144,12 +144,96 @@ pub fn parse_k8s_bool(v: &str) -> Option<bool> {
     }
 }
 
+/// Check whether a raw query string asks to watch.
+///
+/// For callers that hold the URI rather than a parsed param map — the response
+/// layers, which run before and after a handler and never see its extractors.
+pub fn query_is_watch(query: &str) -> bool {
+    query
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| *k == "watch")
+        .and_then(|(_, v)| parse_k8s_bool(v))
+        .unwrap_or(false)
+}
+
 /// Check if a query param map indicates a watch request
 pub fn is_watch_request(params: &std::collections::HashMap<String, String>) -> bool {
     params
         .get("watch")
         .and_then(|v| parse_k8s_bool(v))
         .unwrap_or(false)
+}
+
+/// If this request asks to watch, serve the watch and return it; otherwise
+/// `None` and the caller lists as usual.
+///
+/// Exists because a list handler that forgets the watch branch does not fail —
+/// it answers a watch request with a **List**, and the client reports `unable to
+/// decode to metav1.WatchEvent` from somewhere else entirely. Found on
+/// `volumeattachments`, `csidrivers` and `clusterroles`, each breaking an
+/// informer in kube-state-metrics and cert-manager; around twenty list handlers
+/// had no branch at all.
+///
+/// One call per handler, so adding watch support cannot be half-done:
+///
+/// ```ignore
+/// if let Some(response) =
+///     maybe_watch_cluster_scoped::<VolumeAttachment>(&state, &auth_ctx, "volumeattachments",
+///                                                    "storage.k8s.io", &params).await?
+/// {
+///     return Ok(response);
+/// }
+/// ```
+pub async fn maybe_watch_cluster_scoped<T>(
+    state: &Arc<ApiServerState>,
+    auth_ctx: &crate::middleware::AuthContext,
+    resource_type: &str,
+    api_group: &str,
+    params: &std::collections::HashMap<String, String>,
+) -> rusternetes_common::Result<Option<axum::response::Response>>
+where
+    T: Serialize + DeserializeOwned + Send + Sync + 'static + Clone + HasMetadata,
+{
+    if !is_watch_request(params) {
+        return Ok(None);
+    }
+    watch_cluster_scoped::<T>(
+        state.clone(),
+        auth_ctx.clone(),
+        resource_type,
+        api_group,
+        watch_params_from_query(params),
+    )
+    .await
+    .map(Some)
+}
+
+/// Namespaced twin of [`maybe_watch_cluster_scoped`].
+pub async fn maybe_watch_namespaced<T>(
+    state: &Arc<ApiServerState>,
+    auth_ctx: &crate::middleware::AuthContext,
+    namespace: &str,
+    resource_type: &str,
+    api_group: &str,
+    params: &std::collections::HashMap<String, String>,
+) -> rusternetes_common::Result<Option<axum::response::Response>>
+where
+    T: Serialize + DeserializeOwned + Send + Sync + 'static + Clone + HasMetadata,
+{
+    if !is_watch_request(params) {
+        return Ok(None);
+    }
+    watch_namespaced::<T>(
+        state.clone(),
+        auth_ctx.clone(),
+        namespace.to_string(),
+        resource_type,
+        api_group,
+        watch_params_from_query(params),
+    )
+    .await
+    .map(Some)
 }
 
 /// Convert query parameters to WatchParams
@@ -1594,7 +1678,13 @@ impl_has_metadata!(
     rusternetes_common::resources::IngressClass,
     rusternetes_common::resources::CSIStorageCapacity,
     rusternetes_common::resources::CustomResource,
-    rusternetes_common::resources::VolumeSnapshot
+    rusternetes_common::resources::VolumeSnapshot,
+    rusternetes_common::resources::VolumeSnapshotClass,
+    rusternetes_common::resources::VolumeSnapshotContent,
+    rusternetes_common::resources::VolumeAttachment,
+    rusternetes_common::resources::VolumeAttributesClass,
+    rusternetes_common::resources::CSIDriver,
+    rusternetes_common::resources::CSINode
 );
 
 // Concrete handler functions for specific resources

@@ -181,7 +181,24 @@ pub async fn delete_servicecidr(
 pub async fn list_servicecidrs(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
+    // A watch request answered with a List is how a client ends up reporting
+    // "unable to decode to metav1.WatchEvent" from somewhere else entirely.
+    // This handler took no `Query` extractor at all, so `?watch=true` could
+    // not even be seen, let alone honored.
+    if let Some(response) = crate::handlers::watch::maybe_watch_cluster_scoped::<ServiceCIDR>(
+        &state,
+        &auth_ctx,
+        "servicecidrs",
+        "networking.k8s.io",
+        &params,
+    )
+    .await?
+    {
+        return Ok(response);
+    }
+
     debug!("Listing ServiceCIDRs");
 
     // Check authorization

@@ -1,3 +1,4 @@
+use axum::response::IntoResponse;
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
     extract::{Path, Query, State},
@@ -76,7 +77,21 @@ pub async fn list_csidrivers(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<List<CSIDriver>>> {
+) -> Result<axum::response::Response> {
+    // A watch request answered with a List is how a client ends up reporting
+    // "unable to decode to metav1.WatchEvent" from somewhere else entirely.
+    if let Some(response) = crate::handlers::watch::maybe_watch_cluster_scoped::<CSIDriver>(
+        &state,
+        &auth_ctx,
+        "csidrivers",
+        "storage.k8s.io",
+        &params,
+    )
+    .await?
+    {
+        return Ok(response);
+    }
+
     debug!("Listing all CSIDrivers");
 
     let attrs = RequestAttributes::new(auth_ctx.user, "list", "csidrivers")
@@ -90,13 +105,13 @@ pub async fn list_csidrivers(
     }
 
     let prefix = build_prefix("csidrivers", None);
-    let mut drivers = state.storage.list(&prefix).await?;
+    let mut drivers: Vec<CSIDriver> = state.storage.list(&prefix).await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut drivers, &params)?;
 
     let list = List::new("CSIDriverList", "storage.k8s.io/v1", drivers);
-    Ok(Json(list))
+    Ok(Json(list).into_response())
 }
 
 pub async fn update_csidriver(

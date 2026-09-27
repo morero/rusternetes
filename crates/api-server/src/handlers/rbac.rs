@@ -669,7 +669,21 @@ pub async fn list_clusterroles(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<List<ClusterRole>>> {
+) -> Result<axum::response::Response> {
+    // A watch request answered with a List is how a client ends up reporting
+    // "unable to decode to metav1.WatchEvent" from somewhere else entirely.
+    if let Some(response) = crate::handlers::watch::maybe_watch_cluster_scoped::<ClusterRole>(
+        &state,
+        &auth_ctx,
+        "clusterroles",
+        "rbac.authorization.k8s.io",
+        &params,
+    )
+    .await?
+    {
+        return Ok(response);
+    }
+
     debug!("Listing clusterroles");
 
     // Check authorization
@@ -684,7 +698,7 @@ pub async fn list_clusterroles(
     }
 
     let prefix = build_prefix("clusterroles", None);
-    let mut clusterroles = state.storage.list(&prefix).await?;
+    let mut clusterroles: Vec<ClusterRole> = state.storage.list(&prefix).await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut clusterroles, &params)?;
@@ -694,7 +708,7 @@ pub async fn list_clusterroles(
         "rbac.authorization.k8s.io/v1",
         clusterroles,
     );
-    Ok(Json(list))
+    Ok(Json(list).into_response())
 }
 
 // ClusterRoleBinding handlers
@@ -870,7 +884,22 @@ pub async fn list_clusterrolebindings(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<List<ClusterRoleBinding>>> {
+) -> Result<axum::response::Response> {
+    // A watch request answered with a List is how a client ends up reporting
+    // "unable to decode to metav1.WatchEvent" from somewhere else entirely.
+    if let Some(response) =
+        crate::handlers::watch::maybe_watch_cluster_scoped::<ClusterRoleBinding>(
+            &state,
+            &auth_ctx,
+            "clusterrolebindings",
+            "rbac.authorization.k8s.io",
+            &params,
+        )
+        .await?
+    {
+        return Ok(response);
+    }
+
     debug!("Listing clusterrolebindings");
 
     // Check authorization
@@ -885,7 +914,7 @@ pub async fn list_clusterrolebindings(
     }
 
     let prefix = build_prefix("clusterrolebindings", None);
-    let mut clusterrolebindings = state.storage.list(&prefix).await?;
+    let mut clusterrolebindings: Vec<ClusterRoleBinding> = state.storage.list(&prefix).await?;
 
     // Apply field and label selector filtering
     crate::handlers::filtering::apply_selectors(&mut clusterrolebindings, &params)?;
@@ -895,7 +924,7 @@ pub async fn list_clusterrolebindings(
         "rbac.authorization.k8s.io/v1",
         clusterrolebindings,
     );
-    Ok(Json(list))
+    Ok(Json(list).into_response())
 }
 
 // DeleteCollection handlers for RBAC resources
