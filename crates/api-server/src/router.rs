@@ -2555,6 +2555,19 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             req
         },
     ))
+    // Outermost of the response layers: a handler cannot forget to honour
+    // `as=PartialObjectMetadata` if it does not participate in it. Before this
+    // existed, a client asking for metadata only — cert-manager's cainjector
+    // watching Secrets — got every `data` value back.
+    .layer(axum_middleware::from_fn(
+        handlers::partial_metadata::partial_object_metadata_middleware,
+    ))
+    // Inside the metadata projection: an HPA read through the v1 endpoint is
+    // converted to v1 first, and a metadata-only request then keeps just its
+    // metadata either way.
+    .layer(axum_middleware::from_fn(
+        handlers::autoscaling_convert::autoscaling_v1_middleware,
+    ))
     .layer(TraceLayer::new_for_http())
     .with_state(state)
 }
