@@ -763,6 +763,63 @@ fn get_api_group_names() -> Vec<(&'static str, &'static str)> {
 /// Returns a list of resource objects in the apidiscovery.k8s.io/v2 format.
 /// In v2, subresources are nested inside their parent resource's "subresources" array,
 /// NOT listed as separate top-level entries with slashes in the name.
+/// Every short name this server recognises, keyed by `(group, resource)`.
+///
+/// One table because there are two discovery documents carrying the same
+/// facts — the per-group `APIResourceList` at `/apis/<group>/<version>` and
+/// the aggregated `APIGroupDiscoveryList` at `/apis` — and they had drifted:
+/// the per-group documents declared short names and the aggregated one
+/// declared none at all.
+///
+/// Modern kubectl reads the aggregated document, so the effect was that every
+/// short name outside core v1 simply did not work. `kubectl get deploy`,
+/// `kubectl get hpa` and `kubectl get crds` all failed with "the server
+/// doesn't have a resource type", while `kubectl get deployments` worked and
+/// the per-group document cheerfully advertised `deploy`. Core v1 was
+/// unaffected because `/api/v1` is fetched separately, which is what made the
+/// failure look arbitrary.
+///
+/// `short_names_agree_between_both_discovery_documents` keeps the two in step.
+const SHORT_NAMES: &[(&str, &str, &[&str])] = &[
+    // Core (`/api/v1`).
+    ("", "namespaces", &["ns"]),
+    ("", "pods", &["po"]),
+    ("", "services", &["svc"]),
+    ("", "nodes", &["no"]),
+    ("", "configmaps", &["cm"]),
+    ("", "serviceaccounts", &["sa"]),
+    ("", "persistentvolumes", &["pv"]),
+    ("", "persistentvolumeclaims", &["pvc"]),
+    ("", "endpoints", &["ep"]),
+    ("", "events", &["ev"]),
+    ("", "resourcequotas", &["quota"]),
+    ("", "limitranges", &["limits"]),
+    ("", "replicationcontrollers", &["rc"]),
+    ("", "componentstatuses", &["cs"]),
+    ("apps", "deployments", &["deploy"]),
+    ("apps", "replicasets", &["rs"]),
+    ("apps", "statefulsets", &["sts"]),
+    ("apps", "daemonsets", &["ds"]),
+    ("batch", "cronjobs", &["cj"]),
+    ("networking.k8s.io", "ingresses", &["ing"]),
+    ("networking.k8s.io", "networkpolicies", &["netpol"]),
+    ("storage.k8s.io", "storageclasses", &["sc"]),
+    ("scheduling.k8s.io", "priorityclasses", &["pc"]),
+    ("certificates.k8s.io", "certificatesigningrequests", &["csr"]),
+    ("autoscaling", "horizontalpodautoscalers", &["hpa"]),
+    ("policy", "poddisruptionbudgets", &["pdb"]),
+    ("events.k8s.io", "events", &["ev"]),
+    ("apiextensions.k8s.io", "customresourcedefinitions", &["crd", "crds"]),
+];
+
+/// The short names for one resource, or `None` if it has none.
+pub(crate) fn short_names_for(group: &str, resource: &str) -> Option<&'static [&'static str]> {
+    SHORT_NAMES
+        .iter()
+        .find(|(g, r, _)| *g == group && *r == resource)
+        .map(|(_, _, names)| *names)
+}
+
 fn get_aggregated_resources_for_group(group: &str, version: &str) -> Vec<serde_json::Value> {
     // Helper to build a subresource entry (nested under parent)
     let sub = |name: &str, kind: &str, verbs: &[&str]| -> serde_json::Value {
@@ -819,7 +876,10 @@ fn get_aggregated_resources_for_group(group: &str, version: &str) -> Vec<serde_j
                namespaced: bool,
                verbs: &[&str],
                subresources: Vec<serde_json::Value>| {
-        res_with_short(name, singular, kind, namespaced, verbs, subresources, None)
+        // Consults the shared table rather than defaulting to none, which is
+        // what left the aggregated document without short names at all.
+        let short = short_names_for(group, name).map(|names| names.to_vec());
+        res_with_short(name, singular, kind, namespaced, verbs, subresources, short)
     };
 
     let all_verbs: &[&str] = &[
@@ -3795,6 +3855,98 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("accept", HeaderValue::from_static("application/json"));
         assert!(!wants_aggregated_discovery(&headers));
+    }
+
+    /// The two discovery documents must agree about short names.
+    ///
+    /// They had not: the per-group `APIResourceList` declared `deploy`, `hpa`,
+    /// `crds` and two dozen more, and the aggregated `APIGroupDiscoveryList`
+    /// declared none. kubectl reads the aggregated one, so every short name
+    /// outside core v1 failed with "the server doesn't have a resource type"
+    /// while the per-group document said otherwise — a disagreement no test
+    /// could see, because each document was only ever checked against itself.
+    #[test]
+    fn short_names_agree_between_both_discovery_documents() {
+        // Each group whose per-group document declares short names, with the
+        // version the aggregated builder is asked for.
+        let groups = [
+            ("", "v1"),
+            ("apps", "v1"),
+            ("batch", "v1"),
+            ("networking.k8s.io", "v1"),
+            ("storage.k8s.io", "v1"),
+            ("scheduling.k8s.io", "v1"),
+            ("certificates.k8s.io", "v1"),
+            ("autoscaling", "v2"),
+            ("policy", "v1"),
+            ("events.k8s.io", "v1"),
+            ("apiextensions.k8s.io", "v1"),
+        ];
+
+        let mut checked = 0;
+        for (group, version) in groups {
+            for entry in get_aggregated_resources_for_group(group, version) {
+                let resource = entry["resource"].as_str().unwrap_or_default();
+                let expected = short_names_for(group, resource);
+                let actual: Option<Vec<&str>> = entry
+                    .get("shortNames")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect());
+
+                match (expected, actual) {
+                    (Some(expected), Some(actual)) => {
+                        assert_eq!(
+                            expected.to_vec(),
+                            actual,
+                            "{group}/{resource}: aggregated short names disagree with the table"
+                        );
+                        checked += 1;
+                    }
+                    (Some(expected), None) => panic!(
+                        "{group}/{resource}: the table declares {expected:?} but the \
+                         aggregated document carries none — this is the exact bug that \
+                         made `kubectl get deploy` fail"
+                    ),
+                    (None, Some(actual)) => panic!(
+                        "{group}/{resource}: the aggregated document declares {actual:?} \
+                         but the table has no entry"
+                    ),
+                    (None, None) => {}
+                }
+            }
+        }
+        assert!(
+            checked >= 20,
+            "only {checked} resources carried short names; the table has \
+             {} entries, so the aggregated builder is not consulting it",
+            SHORT_NAMES.len()
+        );
+    }
+
+    /// The three that sent me looking, named individually so a regression
+    /// reads as the symptom rather than as a count.
+    #[test]
+    fn the_short_names_people_actually_type_are_served() {
+        for (group, version, resource, short) in [
+            ("apps", "v1", "deployments", "deploy"),
+            ("autoscaling", "v2", "horizontalpodautoscalers", "hpa"),
+            ("apiextensions.k8s.io", "v1", "customresourcedefinitions", "crds"),
+        ] {
+            let entry = get_aggregated_resources_for_group(group, version)
+                .into_iter()
+                .find(|e| e["resource"] == resource)
+                .unwrap_or_else(|| panic!("{group}/{resource} missing from aggregated discovery"));
+            let names: Vec<&str> = entry["shortNames"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{group}/{resource} carries no shortNames"))
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            assert!(
+                names.contains(&short),
+                "{group}/{resource} does not offer {short:?}, only {names:?}"
+            );
+        }
     }
 
     #[test]
