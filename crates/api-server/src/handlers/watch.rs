@@ -716,28 +716,38 @@ where
                                 continue;
                             }
                             None => {
-                                // The stream ended: the broadcast sender for
-                                // this prefix was dropped. Resubscribing here —
-                                // which is what this used to do — resumes the
-                                // client's watch across a window in which events
-                                // were published to a channel nobody held, so the
-                                // client silently misses them and never learns to
-                                // re-list. Same failure as a swallowed lag, by a
-                                // different route.
+                                // The stream ended because the broadcast sender
+                                // for this prefix was dropped — an INTERNAL
+                                // detail of the watch cache, not a gap in the
+                                // client's stream. No event was lost, so
+                                // resubscribing is correct and the client is
+                                // told nothing, exactly as before.
                                 //
-                                // 410 Gone is the contract for "this watch cannot
-                                // be continued"; the client reconnects from its
-                                // own resourceVersion, which is the only party
-                                // that knows where it got to.
-                                warn!(
-                                    "Watch stream ended; closing it with 410 Gone so the client re-lists"
-                                );
-                                let _ = tx
-                                    .send(Ok(expired_error_frame(
-                                        "watch stream ended and cannot be continued",
-                                    )))
+                                // This deliberately does NOT send 410. An
+                                // earlier version of this code did, on the
+                                // theory that resuming a stream server-side is
+                                // the same failure as swallowing a lag. It is
+                                // not, and the difference matters: a lag means
+                                // events were DISCARDED and the client's cache
+                                // is wrong, while a dropped sender means the
+                                // fan-out was rebuilt with nothing missed.
+                                //
+                                // Closing here instead broke every controller
+                                // on this cluster. The sender is dropped
+                                // routinely, so every watch terminated within
+                                // seconds; kube-rs reported "watch stream
+                                // failed: error reading a body from connection"
+                                // and `bundle-operator` stopped reconciling
+                                // entirely while reporting a healthy pod.
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                let new_rx = state
+                                    .watch_cache
+                                    .subscribe(&prefix)
                                     .await;
-                                return;
+                                watch_stream = Box::pin(
+                                    crate::watch_cache::broadcast_to_stream(new_rx),
+                                );
+                                continue;
                             }
                         }
                     }
@@ -1241,28 +1251,38 @@ where
                                 continue;
                             }
                             None => {
-                                // The stream ended: the broadcast sender for
-                                // this prefix was dropped. Resubscribing here —
-                                // which is what this used to do — resumes the
-                                // client's watch across a window in which events
-                                // were published to a channel nobody held, so the
-                                // client silently misses them and never learns to
-                                // re-list. Same failure as a swallowed lag, by a
-                                // different route.
+                                // The stream ended because the broadcast sender
+                                // for this prefix was dropped — an INTERNAL
+                                // detail of the watch cache, not a gap in the
+                                // client's stream. No event was lost, so
+                                // resubscribing is correct and the client is
+                                // told nothing, exactly as before.
                                 //
-                                // 410 Gone is the contract for "this watch cannot
-                                // be continued"; the client reconnects from its
-                                // own resourceVersion, which is the only party
-                                // that knows where it got to.
-                                warn!(
-                                    "Watch stream ended; closing it with 410 Gone so the client re-lists"
-                                );
-                                let _ = tx
-                                    .send(Ok(expired_error_frame(
-                                        "watch stream ended and cannot be continued",
-                                    )))
+                                // This deliberately does NOT send 410. An
+                                // earlier version of this code did, on the
+                                // theory that resuming a stream server-side is
+                                // the same failure as swallowing a lag. It is
+                                // not, and the difference matters: a lag means
+                                // events were DISCARDED and the client's cache
+                                // is wrong, while a dropped sender means the
+                                // fan-out was rebuilt with nothing missed.
+                                //
+                                // Closing here instead broke every controller
+                                // on this cluster. The sender is dropped
+                                // routinely, so every watch terminated within
+                                // seconds; kube-rs reported "watch stream
+                                // failed: error reading a body from connection"
+                                // and `bundle-operator` stopped reconciling
+                                // entirely while reporting a healthy pod.
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                let new_rx = state
+                                    .watch_cache
+                                    .subscribe(&prefix)
                                     .await;
-                                return;
+                                watch_stream = Box::pin(
+                                    crate::watch_cache::broadcast_to_stream(new_rx),
+                                );
+                                continue;
                             }
                         }
                     }
@@ -2612,6 +2632,9 @@ pub async fn watch_cluster_scoped_json(
     let should_send_initial =
         send_initial_events || requested_rv.as_deref() == Some("0") || requested_rv.is_none();
 
+    let prefix_for_reconnect = prefix.clone();
+    let state_for_reconnect = state.clone();
+
     tokio::spawn(async move {
         let mut latest_resource_version: Option<String> = Some(current_rev_str);
 
@@ -2704,28 +2727,38 @@ pub async fn watch_cluster_scoped_json(
                                 continue;
                             }
                             None => {
-                                // The stream ended: the broadcast sender for
-                                // this prefix was dropped. Resubscribing here —
-                                // which is what this used to do — resumes the
-                                // client's watch across a window in which events
-                                // were published to a channel nobody held, so the
-                                // client silently misses them and never learns to
-                                // re-list. Same failure as a swallowed lag, by a
-                                // different route.
+                                // The stream ended because the broadcast sender
+                                // for this prefix was dropped — an INTERNAL
+                                // detail of the watch cache, not a gap in the
+                                // client's stream. No event was lost, so
+                                // resubscribing is correct and the client is
+                                // told nothing, exactly as before.
                                 //
-                                // 410 Gone is the contract for "this watch cannot
-                                // be continued"; the client reconnects from its
-                                // own resourceVersion, which is the only party
-                                // that knows where it got to.
-                                warn!(
-                                    "Watch stream ended; closing it with 410 Gone so the client re-lists"
-                                );
-                                let _ = tx
-                                    .send(Ok(expired_error_frame(
-                                        "watch stream ended and cannot be continued",
-                                    )))
+                                // This deliberately does NOT send 410. An
+                                // earlier version of this code did, on the
+                                // theory that resuming a stream server-side is
+                                // the same failure as swallowing a lag. It is
+                                // not, and the difference matters: a lag means
+                                // events were DISCARDED and the client's cache
+                                // is wrong, while a dropped sender means the
+                                // fan-out was rebuilt with nothing missed.
+                                //
+                                // Closing here instead broke every controller
+                                // on this cluster. The sender is dropped
+                                // routinely, so every watch terminated within
+                                // seconds; kube-rs reported "watch stream
+                                // failed: error reading a body from connection"
+                                // and `bundle-operator` stopped reconciling
+                                // entirely while reporting a healthy pod.
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                let new_rx = state_for_reconnect
+                                    .watch_cache
+                                    .subscribe(&prefix_for_reconnect)
                                     .await;
-                                return;
+                                watch_stream = Box::pin(
+                                    crate::watch_cache::broadcast_to_stream(new_rx),
+                                );
+                                continue;
                             }
                         }
                     }
@@ -2828,6 +2861,9 @@ pub async fn watch_namespaced_json(
     // client sees the latest status (e.g. CRD Established=True condition).
     let should_send_initial = true;
 
+    let prefix_for_reconnect = prefix.clone();
+    let state_for_reconnect = state.clone();
+
     tokio::spawn(async move {
         let mut latest_resource_version: Option<String> = Some(current_rev_str);
 
@@ -2920,28 +2956,38 @@ pub async fn watch_namespaced_json(
                                 continue;
                             }
                             None => {
-                                // The stream ended: the broadcast sender for
-                                // this prefix was dropped. Resubscribing here —
-                                // which is what this used to do — resumes the
-                                // client's watch across a window in which events
-                                // were published to a channel nobody held, so the
-                                // client silently misses them and never learns to
-                                // re-list. Same failure as a swallowed lag, by a
-                                // different route.
+                                // The stream ended because the broadcast sender
+                                // for this prefix was dropped — an INTERNAL
+                                // detail of the watch cache, not a gap in the
+                                // client's stream. No event was lost, so
+                                // resubscribing is correct and the client is
+                                // told nothing, exactly as before.
                                 //
-                                // 410 Gone is the contract for "this watch cannot
-                                // be continued"; the client reconnects from its
-                                // own resourceVersion, which is the only party
-                                // that knows where it got to.
-                                warn!(
-                                    "Watch stream ended; closing it with 410 Gone so the client re-lists"
-                                );
-                                let _ = tx
-                                    .send(Ok(expired_error_frame(
-                                        "watch stream ended and cannot be continued",
-                                    )))
+                                // This deliberately does NOT send 410. An
+                                // earlier version of this code did, on the
+                                // theory that resuming a stream server-side is
+                                // the same failure as swallowing a lag. It is
+                                // not, and the difference matters: a lag means
+                                // events were DISCARDED and the client's cache
+                                // is wrong, while a dropped sender means the
+                                // fan-out was rebuilt with nothing missed.
+                                //
+                                // Closing here instead broke every controller
+                                // on this cluster. The sender is dropped
+                                // routinely, so every watch terminated within
+                                // seconds; kube-rs reported "watch stream
+                                // failed: error reading a body from connection"
+                                // and `bundle-operator` stopped reconciling
+                                // entirely while reporting a healthy pod.
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                let new_rx = state_for_reconnect
+                                    .watch_cache
+                                    .subscribe(&prefix_for_reconnect)
                                     .await;
-                                return;
+                                watch_stream = Box::pin(
+                                    crate::watch_cache::broadcast_to_stream(new_rx),
+                                );
+                                continue;
                             }
                         }
                     }
