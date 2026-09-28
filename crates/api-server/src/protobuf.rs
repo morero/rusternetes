@@ -162,10 +162,7 @@ impl ProtoRegistry {
                 fields: HashMap::from([
                     (1, ("holderIdentity".into(), FieldType::String)),
                     (2, ("leaseDurationSeconds".into(), FieldType::Int)),
-                    (
-                        3,
-                        ("acquireTime".into(), FieldType::Message("Time".into())),
-                    ),
+                    (3, ("acquireTime".into(), FieldType::Message("Time".into()))),
                     (4, ("renewTime".into(), FieldType::Message("Time".into()))),
                     (5, ("leaseTransitions".into(), FieldType::Int)),
                     (6, ("strategy".into(), FieldType::String)),
@@ -225,6 +222,191 @@ impl ProtoRegistry {
                     (1, ("uid".into(), FieldType::String)),
                     (2, ("resourceVersion".into(), FieldType::String)),
                 ]),
+            },
+        );
+
+        // ========== authorization.k8s.io/v1 types ==========
+        //
+        // These are the request types a typed client POSTs, and they were
+        // missing — which is why `kubectl auth can-i` failed against this
+        // server with:
+        //
+        //   missing field `spec` at line 1 column 87
+        //
+        // an error naming a field that WAS present. kubectl sends these as
+        // protobuf (unlike the `Accept` header, a request body's content type
+        // is not negotiated), the registry had no schema for the kind, and the
+        // fallback path reconstructed a JSON object from TypeMeta alone —
+        // exactly 87 characters, with the spec dropped. The body was fine; the
+        // registry could not read it and said something else.
+        //
+        // A review is a non-persisted request object, so `status` is included
+        // only because the client sends an empty one.
+        schemas.insert(
+            "SelfSubjectAccessReview".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "spec".into(),
+                            FieldType::Message("SelfSubjectAccessReviewSpec".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "status".into(),
+                            FieldType::Message("SubjectAccessReviewStatus".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "SelfSubjectAccessReviewSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "resourceAttributes".into(),
+                            FieldType::Message("ResourceAttributes".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "nonResourceAttributes".into(),
+                            FieldType::Message("NonResourceAttributes".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        // SubjectAccessReview and LocalSubjectAccessReview differ only in the
+        // endpoint that accepts them; the message is the same shape.
+        for kind in ["SubjectAccessReview", "LocalSubjectAccessReview"] {
+            schemas.insert(
+                kind.into(),
+                MessageSchema {
+                    fields: HashMap::from([
+                        (
+                            1,
+                            ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                        ),
+                        (
+                            2,
+                            (
+                                "spec".into(),
+                                FieldType::Message("SubjectAccessReviewSpec".into()),
+                            ),
+                        ),
+                        (
+                            3,
+                            (
+                                "status".into(),
+                                FieldType::Message("SubjectAccessReviewStatus".into()),
+                            ),
+                        ),
+                    ]),
+                },
+            );
+        }
+        schemas.insert(
+            "SubjectAccessReviewSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "resourceAttributes".into(),
+                            FieldType::Message("ResourceAttributes".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "nonResourceAttributes".into(),
+                            FieldType::Message("NonResourceAttributes".into()),
+                        ),
+                    ),
+                    (3, ("user".into(), FieldType::String)),
+                    // Repeated, so that a review about someone in several
+                    // groups keeps all of them — collapsing to the last would
+                    // silently narrow who is being asked about.
+                    (
+                        4,
+                        (
+                            "groups".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (5, ("extra".into(), FieldType::StringMap)),
+                    (6, ("uid".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ResourceAttributes".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("namespace".into(), FieldType::String)),
+                    (2, ("verb".into(), FieldType::String)),
+                    (3, ("group".into(), FieldType::String)),
+                    (4, ("version".into(), FieldType::String)),
+                    (5, ("resource".into(), FieldType::String)),
+                    (6, ("subresource".into(), FieldType::String)),
+                    (7, ("name".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "NonResourceAttributes".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("path".into(), FieldType::String)),
+                    (2, ("verb".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "SubjectAccessReviewStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("allowed".into(), FieldType::Bool)),
+                    (2, ("reason".into(), FieldType::String)),
+                    (3, ("evaluationError".into(), FieldType::String)),
+                    (4, ("denied".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "SelfSubjectRulesReview".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "spec".into(),
+                            FieldType::Message("SelfSubjectRulesReviewSpec".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "SelfSubjectRulesReviewSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("namespace".into(), FieldType::String))]),
             },
         );
 
@@ -804,7 +986,10 @@ impl ProtoRegistry {
                     ),
                     (
                         3,
-                        ("secretRef".into(), FieldType::Message("SecretEnvSource".into())),
+                        (
+                            "secretRef".into(),
+                            FieldType::Message("SecretEnvSource".into()),
+                        ),
                     ),
                 ]),
             },
@@ -1278,7 +1463,13 @@ impl ProtoRegistry {
             MessageSchema {
                 fields: HashMap::from([
                     (1, ("minAvailable".into(), FieldType::IntOrString)),
-                    (2, ("selector".into(), FieldType::Message("LabelSelector".into()))),
+                    (
+                        2,
+                        (
+                            "selector".into(),
+                            FieldType::Message("LabelSelector".into()),
+                        ),
+                    ),
                     (3, ("maxUnavailable".into(), FieldType::IntOrString)),
                     (4, ("unhealthyPodEvictionPolicy".into(), FieldType::String)),
                 ]),
@@ -2885,7 +3076,13 @@ impl ProtoRegistry {
         MessageSchema {
             fields: HashMap::from([
                 (1, ("name".into(), FieldType::String)),
-                (2, ("__volumeSource".into(), FieldType::FlattenedMessage("VolumeSource".into()))),
+                (
+                    2,
+                    (
+                        "__volumeSource".into(),
+                        FieldType::FlattenedMessage("VolumeSource".into()),
+                    ),
+                ),
             ]),
         }
     }
@@ -2898,9 +3095,27 @@ impl ProtoRegistry {
     fn volume_source_schema() -> MessageSchema {
         MessageSchema {
             fields: HashMap::from([
-                (1, ("hostPath".into(), FieldType::Message("HostPathVolumeSource".into()))),
-                (2, ("emptyDir".into(), FieldType::Message("EmptyDirVolumeSource".into()))),
-                (6, ("secret".into(), FieldType::Message("SecretVolumeSource".into()))),
+                (
+                    1,
+                    (
+                        "hostPath".into(),
+                        FieldType::Message("HostPathVolumeSource".into()),
+                    ),
+                ),
+                (
+                    2,
+                    (
+                        "emptyDir".into(),
+                        FieldType::Message("EmptyDirVolumeSource".into()),
+                    ),
+                ),
+                (
+                    6,
+                    (
+                        "secret".into(),
+                        FieldType::Message("SecretVolumeSource".into()),
+                    ),
+                ),
                 (
                     10,
                     (
@@ -2908,9 +3123,27 @@ impl ProtoRegistry {
                         FieldType::Message("PersistentVolumeClaimVolumeSource".into()),
                     ),
                 ),
-                (16, ("downwardAPI".into(), FieldType::Message("DownwardAPIVolumeSource".into()))),
-                (19, ("configMap".into(), FieldType::Message("ConfigMapVolumeSource".into()))),
-                (26, ("projected".into(), FieldType::Message("ProjectedVolumeSource".into()))),
+                (
+                    16,
+                    (
+                        "downwardAPI".into(),
+                        FieldType::Message("DownwardAPIVolumeSource".into()),
+                    ),
+                ),
+                (
+                    19,
+                    (
+                        "configMap".into(),
+                        FieldType::Message("ConfigMapVolumeSource".into()),
+                    ),
+                ),
+                (
+                    26,
+                    (
+                        "projected".into(),
+                        FieldType::Message("ProjectedVolumeSource".into()),
+                    ),
+                ),
             ]),
         }
     }
@@ -3052,7 +3285,13 @@ impl ProtoRegistry {
     fn volume_projection_schema() -> MessageSchema {
         MessageSchema {
             fields: HashMap::from([
-                (1, ("secret".into(), FieldType::Message("SecretProjection".into()))),
+                (
+                    1,
+                    (
+                        "secret".into(),
+                        FieldType::Message("SecretProjection".into()),
+                    ),
+                ),
                 (
                     2,
                     (
@@ -4045,7 +4284,8 @@ mod tests {
             (38, "schedulingGates"),
             (39, "resourceClaims"),
         ] {
-            let actual = schema.fields
+            let actual = schema
+                .fields
                 .get(&number)
                 .unwrap_or_else(|| panic!("PodSpec field {number} ({name}) is missing"));
             assert_eq!(
@@ -4055,7 +4295,6 @@ mod tests {
             );
         }
     }
-
 
     /// ServiceSpec protobuf field numbers, pinned against upstream
     /// `kubernetes/api/core/v1/generated.proto` — the same kind of pin as
@@ -4138,7 +4377,10 @@ mod tests {
     fn service_port_carries_app_protocol() {
         let registry = super::ProtoRegistry::new();
         let schema = registry.schemas.get("ServicePort").unwrap();
-        assert_eq!(schema.fields.get(&6).map(|f| f.0.as_str()), Some("appProtocol"));
+        assert_eq!(
+            schema.fields.get(&6).map(|f| f.0.as_str()),
+            Some("appProtocol")
+        );
     }
 
     use super::*;
@@ -4267,7 +4509,10 @@ mod tests {
             "must decode the real holderIdentity, not a CRD-shaped 'group' field; got {:?}",
             val
         );
-        assert_eq!(val.get("leaseDurationSeconds"), Some(&Value::Number(15.into())));
+        assert_eq!(
+            val.get("leaseDurationSeconds"),
+            Some(&Value::Number(15.into()))
+        );
         assert_eq!(val.get("leaseTransitions"), Some(&Value::Number(3.into())));
         // The CRD-fallback bug's telltale signature: these fields must never
         // appear on a decoded LeaseSpec.
@@ -4371,7 +4616,10 @@ mod tests {
             "must decode the real verbs, not a CRD-shaped fallback; got {:?}",
             val
         );
-        assert_eq!(rules[0].get("resources"), Some(&serde_json::json!(["secrets"])));
+        assert_eq!(
+            rules[0].get("resources"),
+            Some(&serde_json::json!(["secrets"]))
+        );
         // The CRD-fallback bug's telltale signature: these fields must never
         // appear on a decoded Role.
         assert!(val.get("group").is_none());
@@ -4612,5 +4860,117 @@ mod tests {
         let first = &containers.as_array().unwrap()[0];
         assert_eq!(first.get("name"), Some(&Value::String("test".into())));
         assert_eq!(first.get("image"), Some(&Value::String("nginx".into())));
+    }
+}
+
+#[cfg(test)]
+mod authorization_review_tests {
+    use super::ProtoRegistry;
+    use serde_json::Value;
+
+    /// The exact bytes `kubectl auth can-i get pods` puts on the wire,
+    /// captured with `kubectl -v=8` against this server.
+    ///
+    /// Verbatim, not built by an encoder written here: a decoder tested
+    /// against its own encoder agrees with itself and proves nothing about
+    /// what kubectl sends. These are the bytes that produced "missing field
+    /// `spec` at line 1 column 87".
+    const KUBECTL_CAN_I_GET_PODS: &[u8] = &[
+        0x6b, 0x38, 0x73, 0x00, 0x0a, 0x32, 0x0a, 0x17, 0x61, 0x75, 0x74, 0x68, 0x6f, 0x72, 0x69,
+        0x7a, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x2e, 0x6b, 0x38, 0x73, 0x2e, 0x69, 0x6f, 0x2f, 0x76,
+        0x31, 0x12, 0x17, 0x53, 0x65, 0x6c, 0x66, 0x53, 0x75, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x41,
+        0x63, 0x63, 0x65, 0x73, 0x73, 0x52, 0x65, 0x76, 0x69, 0x65, 0x77, 0x12, 0x3c, 0x0a, 0x10,
+        0x0a, 0x00, 0x12, 0x00, 0x1a, 0x00, 0x22, 0x00, 0x2a, 0x00, 0x32, 0x00, 0x38, 0x00, 0x42,
+        0x00, 0x12, 0x1e, 0x0a, 0x1c, 0x0a, 0x07, 0x64, 0x65, 0x66, 0x61, 0x75, 0x6c, 0x74, 0x12,
+        0x03, 0x67, 0x65, 0x74, 0x1a, 0x00, 0x22, 0x00, 0x2a, 0x04, 0x70, 0x6f, 0x64, 0x73, 0x32,
+        0x00, 0x3a, 0x00, 0x1a, 0x08, 0x08, 0x00, 0x12, 0x00, 0x1a, 0x00, 0x20, 0x00, 0x1a, 0x00,
+        0x22, 0x00,
+    ];
+
+    /// The regression. Before the authorization schemas were registered, the
+    /// registry did not know this kind, the fallback reconstructed JSON from
+    /// TypeMeta alone — 87 characters, no spec — and `kubectl auth can-i`
+    /// failed with an error naming a field the client had sent.
+    #[test]
+    fn kubectl_auth_can_i_decodes_with_its_spec_intact() {
+        let registry = ProtoRegistry::new();
+        let json = registry
+            .decode_k8s_resource(KUBECTL_CAN_I_GET_PODS)
+            .expect("the registry must know SelfSubjectAccessReview");
+        let value: Value =
+            serde_json::from_slice(&json).expect("the decode must produce valid JSON");
+
+        let attrs = value
+            .get("spec")
+            .and_then(|s| s.get("resourceAttributes"))
+            .expect("the spec and its resourceAttributes must survive the decode");
+        assert_eq!(
+            attrs.get("namespace").and_then(Value::as_str),
+            Some("default")
+        );
+        assert_eq!(attrs.get("verb").and_then(Value::as_str), Some("get"));
+        assert_eq!(attrs.get("resource").and_then(Value::as_str), Some("pods"));
+    }
+
+    /// Field numbers are the whole contract here — nothing on the wire
+    /// carries a name, so a transposed pair decodes silently into the wrong
+    /// question. This pins `verb` and `resource` specifically, because
+    /// swapping them would ask whether the user may "pods" a "get".
+    #[test]
+    fn resource_attribute_field_numbers_are_not_transposed() {
+        let registry = ProtoRegistry::new();
+        let json = registry
+            .decode_k8s_resource(KUBECTL_CAN_I_GET_PODS)
+            .unwrap();
+        let text = String::from_utf8(json).unwrap();
+        assert!(
+            text.contains(r#""verb":"get""#),
+            "verb must be the verb, got: {text}"
+        );
+        assert!(
+            text.contains(r#""resource":"pods""#),
+            "resource must be the resource, got: {text}"
+        );
+    }
+
+    /// A review carries user-supplied groups; each occurrence is one group.
+    #[test]
+    fn subject_access_review_groups_are_repeated() {
+        let registry = ProtoRegistry::new();
+        let mut spec = Vec::new();
+        for group in ["system:authenticated", "dev"] {
+            spec.push(0x22); // field 4, wire type 2
+            spec.push(group.len() as u8);
+            spec.extend_from_slice(group.as_bytes());
+        }
+        let decoded = registry
+            .decode_message("SubjectAccessReviewSpec", &spec)
+            .expect("the spec schema must be registered");
+        let groups = decoded
+            .get("groups")
+            .and_then(Value::as_array)
+            .expect("groups must decode as a list");
+        assert_eq!(groups.len(), 2, "both groups must survive: {decoded}");
+    }
+
+    /// The other three review kinds must be known too — a typed client POSTs
+    /// each of them, and an unknown kind is what caused this bug.
+    #[test]
+    fn every_review_kind_is_registered() {
+        let registry = ProtoRegistry::new();
+        for kind in [
+            "SubjectAccessReview",
+            "LocalSubjectAccessReview",
+            "SelfSubjectRulesReview",
+            "SelfSubjectAccessReviewSpec",
+            "SubjectAccessReviewSpec",
+            "ResourceAttributes",
+            "NonResourceAttributes",
+        ] {
+            assert!(
+                registry.decode_message(kind, &[]).is_some(),
+                "{kind} has no schema; a protobuf body of this type would lose its fields"
+            );
+        }
     }
 }
