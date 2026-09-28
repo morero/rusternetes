@@ -1,12 +1,12 @@
 use crate::kubelet::effective_restart_policy;
 use anyhow::{Context, Result};
-use bollard::Docker;
 use bollard::container::{
     Config, CreateContainerOptions, InspectContainerOptions, ListContainersOptions,
     RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
 };
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
+use bollard::Docker;
 use chrono::Utc;
 use futures_util::StreamExt;
 use rusternetes_common::resources::{
@@ -14,7 +14,7 @@ use rusternetes_common::resources::{
     LifecycleHandler, PersistentVolume, PersistentVolumeClaim, Pod, PodSpec, Probe, Secret,
     TCPSocketAction,
 };
-use rusternetes_storage::{Storage, build_key};
+use rusternetes_storage::{build_key, Storage};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -724,7 +724,6 @@ fn should_fully_cleanup_pod(pod_has_running_container: bool, pod_still_exists: b
 }
 
 impl ContainerRuntime {
-
     /// Labels to attach to every container this runtime creates, so it can
     /// later recognize (and only ever act on) its own containers rather
     /// than anything else present on the Docker daemon.
@@ -6992,13 +6991,14 @@ impl ContainerRuntime {
                         .as_deref()
                         .and_then(rusternetes_common::time::parse_external);
 
-                    // Preserve last_state from existing pod status for restart tracking
-                    let prev_last_state = pod
+                    // What this container's status said last time we looked.
+                    let prev_status = pod
                         .status
                         .as_ref()
                         .and_then(|s| s.container_statuses.as_ref())
-                        .and_then(|statuses| statuses.iter().find(|cs| cs.name == container.name))
-                        .and_then(|cs| cs.last_state.clone());
+                        .and_then(|statuses| statuses.iter().find(|cs| cs.name == container.name));
+                    let prev_last_state = prev_status.and_then(|cs| cs.last_state.clone());
+                    let prev_state = prev_status.and_then(|cs| cs.state.clone());
 
                     let container_state = if running {
                         Some(ContainerState::Running {
@@ -7139,8 +7139,15 @@ impl ContainerRuntime {
                         name: container.name.clone(),
                         ready,
                         restart_count,
-                        state: container_state,
-                        last_state: prev_last_state,
+                        state: container_state.clone(),
+                        // A restart's previous termination, so that "why did
+                        // this restart?" has an answer. See
+                        // `next_last_state`.
+                        last_state: next_last_state(
+                            prev_state.as_ref(),
+                            container_state.as_ref(),
+                            prev_last_state,
+                        ),
                         image: Some(container.image.clone()),
                         image_id: inspect.image.clone().map(|img| {
                             if img.starts_with("sha256:") {
@@ -9534,10 +9541,10 @@ mod image_pull_claim_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContainerRuntime, NamespaceModes, apply_fsgroup_to_path, bound_pv_name,
-        effective_probe_host, effective_sub_path_expr, effective_termination_message_path,
-        namespace_modes, security_opts_for, should_fully_cleanup_pod, token_mount_is_stranded,
-        token_needs_rotation, write_file_if_changed,
+        apply_fsgroup_to_path, bound_pv_name, effective_probe_host, effective_sub_path_expr,
+        effective_termination_message_path, namespace_modes, security_opts_for,
+        should_fully_cleanup_pod, token_mount_is_stranded, token_needs_rotation,
+        write_file_if_changed, ContainerRuntime, NamespaceModes,
     };
     use rusternetes_common::resources::pod::PodSecurityContext as PodLevelSecurityContext;
     use rusternetes_common::resources::{
@@ -13742,5 +13749,182 @@ mod tests {
             false,
         );
         assert_eq!(modes.pid_mode.as_deref(), Some("container:mypod_pause"));
+    }
+}
+
+/// The `lastState` a container status should carry, given what its status said
+/// last time and what it says now.
+///
+/// # Why this is not just "keep what was there"
+///
+/// It used to be exactly that. For a regular container `last_state` was read
+/// from the previous status and written straight back, and never assigned
+/// anywhere — so it began as `None` and stayed `None` for the process's
+/// lifetime. `restartCount` still climbed, because that comes from Docker's
+/// own counter, which produced the worst possible pairing: a container
+/// visibly restarting fourteen times with nothing, anywhere, saying what
+/// killed it. Init containers already recorded this; regular ones never did.
+///
+/// # Why the transition is the only chance
+///
+/// Docker's `inspect` reports the CURRENT state only. Once a container has
+/// been restarted, the previous termination is gone from the runtime — so it
+/// has to be captured at the moment the status stops being terminated, or it
+/// cannot be recovered at all. That is why this is driven by the transition
+/// and not by, say, noticing the restart count went up.
+fn next_last_state(
+    previous: Option<&ContainerState>,
+    current: Option<&ContainerState>,
+    carried: Option<ContainerState>,
+) -> Option<ContainerState> {
+    match (previous, current) {
+        // Restarted: it was terminated, and now it is not.
+        (Some(prev @ ContainerState::Terminated { .. }), Some(now))
+            if !matches!(now, ContainerState::Terminated { .. }) =>
+        {
+            Some(prev.clone())
+        }
+        // Terminated again as a DIFFERENT container: the earlier one ended and
+        // was replaced, so the earlier termination is the previous one.
+        (
+            Some(
+                prev @ ContainerState::Terminated {
+                    container_id: was, ..
+                },
+            ),
+            Some(ContainerState::Terminated {
+                container_id: now, ..
+            }),
+        ) if was != now => Some(prev.clone()),
+        // Nothing new to record — keep whatever was there. This was once the
+        // whole rule; it is now the fallback.
+        _ => carried,
+    }
+}
+
+#[cfg(test)]
+mod last_state_tests {
+    use super::next_last_state;
+    use rusternetes_common::resources::ContainerState;
+
+    fn terminated(exit_code: i32, id: &str) -> ContainerState {
+        ContainerState::Terminated {
+            exit_code,
+            signal: None,
+            reason: Some(if exit_code == 137 {
+                "OOMKilled".to_string()
+            } else {
+                "Error".to_string()
+            }),
+            message: None,
+            started_at: None,
+            finished_at: None,
+            container_id: Some(format!("docker://{id}")),
+        }
+    }
+
+    fn running() -> ContainerState {
+        ContainerState::Running { started_at: None }
+    }
+
+    /// The bug, stated as a test: a container that was terminated and is now
+    /// running has restarted, and what killed it must survive into
+    /// `lastState`. Before this, `restartCount` climbed while `lastState`
+    /// stayed empty, so a restart loop was visible and unexplainable.
+    #[test]
+    fn a_restart_records_what_killed_it() {
+        let last = next_last_state(Some(&terminated(137, "a")), Some(&running()), None)
+            .expect("a restart must record its previous termination");
+        match last {
+            ContainerState::Terminated {
+                exit_code, reason, ..
+            } => {
+                assert_eq!(exit_code, 137);
+                assert_eq!(reason.as_deref(), Some("OOMKilled"));
+            }
+            other => panic!("expected a terminated last state, got {other:?}"),
+        }
+    }
+
+    /// A clean exit is recorded too. `lastState` answers "what happened
+    /// before", and "it finished successfully and was restarted anyway" is an
+    /// answer — arguably a more interesting one than a crash.
+    #[test]
+    fn a_clean_exit_is_recorded_as_well_as_a_crash() {
+        let last = next_last_state(Some(&terminated(0, "a")), Some(&running()), None);
+        assert!(matches!(
+            last,
+            Some(ContainerState::Terminated { exit_code: 0, .. })
+        ));
+    }
+
+    /// A container that has not restarted must not invent a `lastState`.
+    #[test]
+    fn a_container_that_never_restarted_has_no_last_state() {
+        assert!(next_last_state(Some(&running()), Some(&running()), None).is_none());
+        assert!(next_last_state(None, Some(&running()), None).is_none());
+    }
+
+    /// Still terminated, same container: nothing new happened, so nothing is
+    /// recorded. Recording here would make a container that exited once look
+    /// like it had exited twice.
+    #[test]
+    fn staying_terminated_records_nothing_new() {
+        let prev = terminated(1, "a");
+        let now = terminated(1, "a");
+        assert!(next_last_state(Some(&prev), Some(&now), None).is_none());
+    }
+
+    /// Terminated, replaced, terminated again: the EARLIER termination is the
+    /// previous one. This is the crash-loop case, where both states are
+    /// terminated and only the container id distinguishes them.
+    #[test]
+    fn a_replaced_container_records_the_earlier_termination() {
+        let prev = terminated(137, "first");
+        let now = terminated(1, "second");
+        let last = next_last_state(Some(&prev), Some(&now), None)
+            .expect("a replacement must record the earlier termination");
+        match last {
+            ContainerState::Terminated {
+                exit_code,
+                container_id,
+                ..
+            } => {
+                assert_eq!(exit_code, 137);
+                assert_eq!(container_id.as_deref(), Some("docker://first"));
+            }
+            other => panic!("expected the earlier termination, got {other:?}"),
+        }
+    }
+
+    /// Once recorded, it survives later polls that observe nothing new —
+    /// otherwise the explanation would appear for one poll and vanish.
+    #[test]
+    fn a_recorded_last_state_is_not_lost_on_the_next_poll() {
+        let carried = terminated(137, "a");
+        let last = next_last_state(Some(&running()), Some(&running()), Some(carried));
+        assert!(matches!(
+            last,
+            Some(ContainerState::Terminated { exit_code: 137, .. })
+        ));
+    }
+
+    /// A fresh termination replaces an older carried one: `lastState` is the
+    /// PREVIOUS state, not the first one ever seen.
+    #[test]
+    fn a_newer_termination_replaces_an_older_carried_one() {
+        let carried = terminated(1, "old");
+        let last = next_last_state(
+            Some(&terminated(137, "recent")),
+            Some(&running()),
+            Some(carried),
+        )
+        .unwrap();
+        match last {
+            ContainerState::Terminated { container_id, .. } => {
+                assert_eq!(container_id.as_deref(), Some("docker://recent"));
+            }
+            other => panic!("expected the recent termination, got {other:?}"),
+        }
     }
 }
