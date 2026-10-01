@@ -679,6 +679,54 @@ pub(crate) fn apply_spec_defaults_json(resource_type: &str, json: &mut serde_jso
 }
 
 #[cfg(test)]
+mod spec_defaults_json_tests {
+    use super::apply_spec_defaults_json;
+
+    /// The bug this exists to prevent: a `Patch::Apply` of a Deployment
+    /// routes to `generic_patch`, not `apply.rs`, and that copy of the SSA
+    /// path did not default. Objects were stored with no `spec.strategy` at
+    /// all — 27 of 32 Deployments on a live install — and
+    /// kube-state-metrics crash-looped reading
+    /// `strategy.rollingUpdate.maxUnavailable` off the nil
+    /// (`nil value for IntOrString`, live, 2026-09-30). Same shape as the
+    /// Service port protocol bug below.
+    #[test]
+    fn a_deployment_applied_without_a_strategy_gets_one() {
+        let mut json = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "guts-kube-state-metrics", "namespace": "guts-system"},
+            "spec": {
+                "selector": {"matchLabels": {"app": "ksm"}},
+                "template": {
+                    "metadata": {"labels": {"app": "ksm"}},
+                    "spec": {"containers": [{"name": "ksm", "image": "ksm:v2"}]}
+                }
+            }
+        });
+
+        apply_spec_defaults_json("deployments", &mut json);
+
+        let ru = &json["spec"]["strategy"]["rollingUpdate"];
+        assert_eq!(json["spec"]["strategy"]["type"], "RollingUpdate");
+        assert_eq!(ru["maxUnavailable"], "25%");
+        assert_eq!(ru["maxSurge"], "25%");
+        assert_eq!(json["spec"]["revisionHistoryLimit"], 10);
+        assert_eq!(json["spec"]["progressDeadlineSeconds"], 600);
+    }
+
+    /// A kind with no defaulter must come back byte-identical rather than
+    /// round-tripped through some nearest-match type.
+    #[test]
+    fn an_unknown_resource_type_is_left_alone() {
+        let original = serde_json::json!({"spec": {"anything": 1}});
+        let mut json = original.clone();
+        apply_spec_defaults_json("widgets", &mut json);
+        assert_eq!(json, original);
+    }
+}
+
+#[cfg(test)]
 mod service_default_tests {
     use super::apply_service_port_defaults;
     use rusternetes_common::resources::ServiceSpec;

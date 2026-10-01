@@ -128,6 +128,22 @@ where
                     if is_create {
                         ensure_metadata_defaults_on_create(&mut applied_json);
                     }
+                    // The same defaulting `apply.rs` does on its own SSA path.
+                    // This is the copy a typed client's `Patch::Apply`
+                    // actually reaches — the router sends every apps/v1 PATCH
+                    // here, not to `apply.rs` — so until now an object applied
+                    // this way was stored with none of its spec defaults.
+                    //
+                    // Live cost: 27 of 32 Deployments had no `spec.strategy`
+                    // at all, and kube-state-metrics crash-looped on
+                    // `nil value for IntOrString` reading
+                    // `strategy.rollingUpdate.maxUnavailable` — the same shape
+                    // as the Service port protocol bug recorded in
+                    // `defaults::service_default_tests`.
+                    crate::handlers::defaults::apply_spec_defaults_json(
+                        resource_type,
+                        &mut applied_json,
+                    );
                     // Set the last-applied-configuration annotation
                     if let Some(metadata) = applied_json.get_mut("metadata") {
                         if let Some(obj) = metadata.as_object_mut() {
@@ -240,6 +256,11 @@ where
             }
         }
     }
+
+    // Default the patch result too. Placed AFTER the generation block on
+    // purpose: a default is not user intent, so filling one in must not look
+    // like a spec change and bump `metadata.generation`.
+    crate::handlers::defaults::apply_spec_defaults_json(resource_type, &mut patched_json);
 
     // Convert back to resource type — use lenient deserialization
     let mut patched_resource: T = serde_json::from_value(patched_json.clone()).map_err(|e| {
@@ -451,6 +472,13 @@ where
                     if is_create {
                         ensure_metadata_defaults_on_create(&mut applied_json);
                     }
+                    // Defaults, for the same reason as the namespaced path
+                    // above: this handler is where a typed client's
+                    // `Patch::Apply` lands.
+                    crate::handlers::defaults::apply_spec_defaults_json(
+                        resource_type,
+                        &mut applied_json,
+                    );
                     // Set the last-applied-configuration annotation
                     if let Some(metadata) = applied_json.get_mut("metadata") {
                         if let Some(obj) = metadata.as_object_mut() {
