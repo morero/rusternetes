@@ -169,13 +169,42 @@ fn service_host_entries_from(
     for ep in endpoints {
         let name = &ep.metadata.name;
         let namespace = ep.metadata.namespace.as_deref().unwrap_or("default");
-        let Some(ip) = ep
-            .subsets
-            .iter()
-            .filter_map(|s| s.addresses.as_ref())
-            .flatten()
-            .map(|a| a.ip.as_str())
-            .find(|ip| !ip.is_empty())
+        let first_non_empty = |addrs: fn(
+            &rusternetes_common::resources::endpoints::EndpointSubset,
+        ) -> Option<
+            &Vec<rusternetes_common::resources::endpoints::EndpointAddress>,
+        >| {
+            ep.subsets
+                .iter()
+                .filter_map(addrs)
+                .flatten()
+                .map(|a| a.ip.as_str())
+                .find(|ip| !ip.is_empty())
+        };
+        // A ready address if there is one, else a not-ready one.
+        //
+        // Falling back is what keeps the NAME resolving while a backend is
+        // still starting. Real Kubernetes always resolves it: CoreDNS answers
+        // from the Service's ClusterIP the moment the Service exists, and
+        // readiness only decides whether anything answers on the far end. A
+        // client there sees a refused connection, which every client retries.
+        //
+        // Omitting the line instead — what this did — makes the lookup fall
+        // through to the host's upstream resolver and come back NXDOMAIN,
+        // `no such host`. That is not the same failure: it reads as a
+        // misconfigured name rather than an absent backend, resolvers cache
+        // it, and a client that resolves once at startup never recovers.
+        // Live, on one install: guts-controller-manager failed 32 OIDC
+        // reconciles against guts-rauthy and dropped 3 inventory pushes to
+        // guts-observe-ingest, every one of them a service whose Endpoints
+        // existed with the pod's address sitting in notReadyAddresses.
+        //
+        // The not-ready pod's IP is the right answer to give: it is the
+        // address that is about to serve, and the file is rewritten every
+        // sync, so a pod replaced before it became ready corrects itself on
+        // the next pass.
+        let Some(ip) = first_non_empty(|s| s.addresses.as_ref())
+            .or_else(|| first_non_empty(|s| s.not_ready_addresses.as_ref()))
         else {
             continue;
         };
@@ -10223,6 +10252,81 @@ mod tests {
         let entries = service_host_entries_from(&eps, "default", "cluster.local");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "172.19.0.9");
+    }
+
+    /// Endpoints whose only address is still coming up.
+    fn not_ready_endpoints_for(
+        name: &str,
+        namespace: &str,
+        ip: &str,
+    ) -> rusternetes_common::resources::endpoints::Endpoints {
+        use rusternetes_common::resources::endpoints::{
+            EndpointAddress, EndpointSubset, Endpoints,
+        };
+        let mut ep = Endpoints::new(
+            name,
+            vec![EndpointSubset {
+                addresses: None,
+                not_ready_addresses: Some(vec![EndpointAddress {
+                    ip: ip.to_string(),
+                    hostname: None,
+                    node_name: None,
+                    target_ref: None,
+                }]),
+                ports: None,
+            }],
+        );
+        ep.metadata.namespace = Some(namespace.to_string());
+        ep
+    }
+
+    #[test]
+    fn a_service_whose_backend_is_not_ready_yet_still_resolves() {
+        // The name must resolve while the backend starts, so the caller gets a
+        // refused connection it will retry instead of NXDOMAIN it will not.
+        // This is the distinction against the test above: UNBACKED contributes
+        // nothing, NOT YET READY contributes the address that is about to
+        // serve. Live: guts-observe-ingest sat in notReadyAddresses for ~90s
+        // and three inventory pushes died on `no such host` rather than
+        // waiting out a connection refusal.
+        let eps = vec![not_ready_endpoints_for(
+            "guts-observe-ingest",
+            "guts-system",
+            "172.19.0.19",
+        )];
+        let entries = service_host_entries_from(&eps, "guts-system", "cluster.local");
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].0, "172.19.0.19");
+        assert!(
+            entries[0]
+                .1
+                .contains(&"guts-observe-ingest.guts-system.svc.cluster.local".to_string()),
+            "{entries:?}"
+        );
+    }
+
+    #[test]
+    fn a_ready_address_wins_over_a_not_ready_one() {
+        use rusternetes_common::resources::endpoints::{
+            EndpointAddress, EndpointSubset, Endpoints,
+        };
+        let addr = |ip: &str| EndpointAddress {
+            ip: ip.to_string(),
+            hostname: None,
+            node_name: None,
+            target_ref: None,
+        };
+        let mut ep = Endpoints::new(
+            "rolling",
+            vec![EndpointSubset {
+                addresses: Some(vec![addr("172.19.0.5")]),
+                not_ready_addresses: Some(vec![addr("172.19.0.6")]),
+                ports: None,
+            }],
+        );
+        ep.metadata.namespace = Some("default".to_string());
+        let entries = service_host_entries_from(&[ep], "default", "cluster.local");
+        assert_eq!(entries[0].0, "172.19.0.5", "{entries:?}");
     }
 
     #[test]
