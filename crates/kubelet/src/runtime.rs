@@ -4662,13 +4662,21 @@ impl ContainerRuntime {
                                 }
                             }
                             Err(e) => {
-                                let optional = cm_ref.optional.unwrap_or(false);
-                                if !optional {
-                                    warn!(
-                                        "Failed to get ConfigMap {} for envFrom: {}",
-                                        cm_ref.name, e
-                                    );
+                                // Required means required, as for `env`'s own
+                                // key references below.
+                                if cm_ref.optional != Some(true) {
+                                    return Err(anyhow::anyhow!(
+                                        "CreateContainerConfigError: configmap \"{}\" not found in namespace {} for envFrom in container {}: {}",
+                                        cm_ref.name,
+                                        namespace,
+                                        container.name,
+                                        e
+                                    ));
                                 }
+                                debug!(
+                                    "Optional ConfigMap {} for envFrom unavailable, injecting nothing: {}",
+                                    cm_ref.name, e
+                                );
                             }
                         }
                     }
@@ -4688,13 +4696,19 @@ impl ContainerRuntime {
                                 }
                             }
                             Err(e) => {
-                                let optional = secret_ref.optional.unwrap_or(false);
-                                if !optional {
-                                    warn!(
-                                        "Failed to get Secret {} for envFrom: {}",
-                                        secret_ref.name, e
-                                    );
+                                if secret_ref.optional != Some(true) {
+                                    return Err(anyhow::anyhow!(
+                                        "CreateContainerConfigError: secret \"{}\" not found in namespace {} for envFrom in container {}: {}",
+                                        secret_ref.name,
+                                        namespace,
+                                        container.name,
+                                        e
+                                    ));
                                 }
+                                debug!(
+                                    "Optional Secret {} for envFrom unavailable, injecting nothing: {}",
+                                    secret_ref.name, e
+                                );
                             }
                         }
                     }
@@ -4732,7 +4746,24 @@ impl ContainerRuntime {
                     continue;
                 }
 
-                // Value from ConfigMap, Secret, or Downward API
+                // Value from ConfigMap, Secret, or Downward API.
+                //
+                // A reference that will not resolve and is not marked
+                // `optional` fails container creation, the way the real
+                // kubelet does: the pod waits in
+                // `CreateContainerConfigError` and starts once the object
+                // exists. Warning and omitting the variable instead — what
+                // this did before — starts the workload with the variable
+                // simply absent, and an application cannot tell that from
+                // "deliberately unset".
+                //
+                // Live cost: guts-controller-manager read an ingest
+                // credential from a Secret its own Release's binding
+                // creates. The container started 17 seconds before that
+                // Secret existed, logged "collector disabled" once, and ran
+                // for the rest of the install pushing no Node, Pod or Event
+                // inventory at all — a decision it takes at startup and
+                // never revisits, so nothing recovered it.
                 if let Some(value_from) = &env_var.value_from {
                     // ConfigMap reference
                     if let Some(configmap_ref) = &value_from.config_map_key_ref {
@@ -4743,8 +4774,22 @@ impl ContainerRuntime {
                             Ok(value) => {
                                 env_list.push(format!("{}={}", env_var.name, value));
                             }
+                            Err(e) if configmap_ref.optional == Some(true) => {
+                                debug!(
+                                    "Optional ConfigMap value for {} unavailable, leaving unset: {}",
+                                    env_var.name, e
+                                );
+                            }
                             Err(e) => {
-                                warn!("Failed to get ConfigMap value for {}: {}", env_var.name, e);
+                                return Err(anyhow::anyhow!(
+                                    "CreateContainerConfigError: couldn't find key {} in ConfigMap {}/{} for env var {} in container {}: {}",
+                                    configmap_ref.key,
+                                    namespace,
+                                    configmap_ref.name,
+                                    env_var.name,
+                                    container.name,
+                                    e
+                                ));
                             }
                         }
                         continue;
@@ -4759,8 +4804,22 @@ impl ContainerRuntime {
                             Ok(value) => {
                                 env_list.push(format!("{}={}", env_var.name, value));
                             }
+                            Err(e) if secret_ref.optional == Some(true) => {
+                                debug!(
+                                    "Optional Secret value for {} unavailable, leaving unset: {}",
+                                    env_var.name, e
+                                );
+                            }
                             Err(e) => {
-                                warn!("Failed to get Secret value for {}: {}", env_var.name, e);
+                                return Err(anyhow::anyhow!(
+                                    "CreateContainerConfigError: couldn't find key {} in Secret {}/{} for env var {} in container {}: {}",
+                                    secret_ref.key,
+                                    namespace,
+                                    secret_ref.name,
+                                    env_var.name,
+                                    container.name,
+                                    e
+                                ));
                             }
                         }
                         continue;

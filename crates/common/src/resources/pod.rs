@@ -839,6 +839,11 @@ pub struct VolumeDevice {
 pub struct ConfigMapKeySelector {
     pub name: String,
     pub key: String,
+    /// Whether the ConfigMap or its key must exist. Absent or `false` means
+    /// it must: the container does not start until it does. See
+    /// `SecretKeySelector::optional`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optional: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -846,6 +851,16 @@ pub struct ConfigMapKeySelector {
 pub struct SecretKeySelector {
     pub name: String,
     pub key: String,
+    /// Whether the Secret or its key must exist.
+    ///
+    /// Absent or `false` means it must, and Kubernetes holds the container in
+    /// `CreateContainerConfigError` until it does rather than starting it
+    /// without the variable. That guarantee is the whole point of the field:
+    /// a workload declaring a required env var is entitled to assume it is
+    /// set, and code that reads one and degrades quietly when it is empty has
+    /// no other way to tell "not configured" from "not created yet".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optional: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1750,6 +1765,37 @@ pub struct PodResourceClaimStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `optional` decides whether an unresolvable env reference is fatal, so
+    /// the kubelet cannot read it off a struct that drops it: a selector
+    /// without the field parses every reference as required, and an
+    /// `optional: true` one — the form used for a genuinely absent Secret —
+    /// would wedge its container in `CreateContainerConfigError` forever.
+    /// Both selectors carried `name` and `key` only until the kubelet began
+    /// honouring the flag (live, 2026-09-30).
+    #[test]
+    fn env_key_selectors_carry_optional() {
+        let secret: SecretKeySelector = serde_json::from_value(serde_json::json!({
+            "name": "guts-controller-manager-ingest",
+            "key": "tenant-keys",
+            "optional": true,
+        }))
+        .expect("must deserialize SecretKeySelector");
+        assert_eq!(secret.optional, Some(true));
+
+        let configmap: ConfigMapKeySelector = serde_json::from_value(serde_json::json!({
+            "name": "settings",
+            "key": "level",
+        }))
+        .expect("must deserialize ConfigMapKeySelector");
+        // Absent, not false: only an explicit `true` may weaken the
+        // must-exist guarantee.
+        assert_eq!(configmap.optional, None);
+
+        // And an absent flag must not reappear on the wire as `null`.
+        let json = serde_json::to_value(&configmap).expect("must serialize");
+        assert!(json.get("optional").is_none(), "{json}");
+    }
 
     /// Real K8s JSON fully capitalizes these acronyms ("hostPID"/"hostIPC"),
     /// which `PodSpec`'s struct-level `rename_all = "camelCase"` alone would
